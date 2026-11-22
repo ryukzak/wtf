@@ -297,7 +297,7 @@ impl RepoView {
         if !preferences::summaries() || self.summaries.contains_key(&key) {
             return;
         }
-        let commits: Vec<Commit> = self.header_commits().into_iter().cloned().collect();
+        let commits = self.header_commits();
         // The header's commits are a run, newest first, as the diff covers.
         let (Some(newest), Some(oldest)) = (commits.first(), commits.last()) else {
             return;
@@ -330,17 +330,26 @@ impl RepoView {
 
     /// The commits the diff covers: all listed ones, or every one from the
     /// newest picked to the oldest, as `commit_range` diffs them.
-    fn header_commits(&self) -> Vec<&Commit> {
-        let (Some(&newest), Some(&oldest)) =
-            (self.narrowed.iter().min(), self.narrowed.iter().max())
-        else {
-            return self.commits.iter().collect();
+    fn header_commits(&self) -> Vec<Commit> {
+        // A snapshot keeps the last header while the next commits load or a
+        // step waits to narrow to its commit, so the message changes once.
+        if self.snapshot_mode && (self.commits_task.is_some() || self.pending_commit.is_some()) {
+            return self.snapshot.header.borrow().clone();
+        }
+        let commits: Vec<Commit> = match (self.narrowed.iter().min(), self.narrowed.iter().max()) {
+            (Some(&newest), Some(&oldest)) => self
+                .commits
+                .get(newest..=oldest)
+                .into_iter()
+                .flatten()
+                .cloned()
+                .collect(),
+            _ => self.commits.clone(),
         };
-        self.commits
-            .get(newest..=oldest)
-            .into_iter()
-            .flatten()
-            .collect()
+        if self.snapshot_mode {
+            self.snapshot.header.replace(commits.clone());
+        }
+        commits
     }
 
     /// The one-file or all-files and structural or text switches, reading
@@ -372,6 +381,18 @@ impl RepoView {
             .flex_col()
             .items_center()
             .gap(px(STRIP_GAP))
+            // Changes or a snapshot: what the review shows, first.
+            .child(
+                group()
+                    .child(option("Changes", !self.snapshot_mode).on_click(
+                        cx.listener(|this, _, window, cx| {
+                            this.set_snapshot_mode(false, window, cx)
+                        }),
+                    ))
+                    .child(option("Snapshot", self.snapshot_mode).on_click(
+                        cx.listener(|this, _, window, cx| this.set_snapshot_mode(true, window, cx)),
+                    )),
+            )
             .child(
                 group()
                     .child(layout("File by file", ChangesLayout::OneFile))
@@ -388,7 +409,8 @@ impl RepoView {
     /// scrolls away.
     fn summary_bar(&self, theme: &Theme) -> impl IntoElement {
         // The newest commit's first line: in bold when it is the only one.
-        let (summary, bold) = match self.header_commits()[..] {
+        let commits = self.header_commits();
+        let (summary, bold) = match &commits[..] {
             [] => ("Uncommitted changes".to_string(), true),
             [commit] => (commit.summary.clone(), true),
             [commit, ..] => match self.summary() {
@@ -423,7 +445,7 @@ impl RepoView {
 
     /// What the diff shows, above it: the selected commit's message, or the
     /// subjects of several, next to the layout and diff mode toggles.
-    fn commit_header(
+    pub(super) fn commit_header(
         &self,
         theme: &Theme,
         window: &Window,
@@ -435,7 +457,7 @@ impl RepoView {
         let now = now_seconds();
 
         let mut description = div().flex().flex_col().gap(px(4.)).min_w_0();
-        match commits[..] {
+        match &commits[..] {
             [] => {}
             [commit] => {
                 let editable = self.reword_worktree(&commit.id).is_some();
@@ -494,7 +516,8 @@ impl RepoView {
                 };
                 let sha = commit.id.clone();
                 let copied = self.copied.as_deref() == Some(commit.id.as_str());
-                description = description.child(message).child(
+                // Who and when first, then the message.
+                description = description.child(
                     div()
                         .flex()
                         .gap(px(8.))
@@ -517,8 +540,9 @@ impl RepoView {
                                         }),
                                 )
                                 .child(format!(
-                                    " · {} · {}",
+                                    " · {} · {} ({})",
                                     commit.author,
+                                    local_datetime(commit.time),
                                     relative_time(commit.time, now)
                                 )),
                         )
@@ -546,8 +570,9 @@ impl RepoView {
                             None => line,
                         }),
                 );
+                description = description.child(message);
             }
-            ref several => {
+            several => {
                 // A summary from the model leads, when summaries are on; the
                 // commits' own subjects show while it is written, when it
                 // failed, or when asked for.
@@ -648,7 +673,7 @@ impl RepoView {
                             .gap(px(8.))
                             .text_xs()
                             .text_color(theme.secondary)
-                            .child(aggregate(several, now))
+                            .child(aggregate(&several.iter().collect::<Vec<_>>(), now))
                             .when(summarizing, |line| line.child("· ✦ Summarizing…"))
                             .children(failed.map(|error| {
                                 div().truncate().child(format!("· no summary: {error}"))

@@ -25,7 +25,7 @@ use crate::workspace::{
 
 use crate::repo_view::{
     CommandPalette, Fetch, GoTo, Minimize, OpenRepository, StructuralDiff, TextDiff, ToggleConsole,
-    ToggleSidePanel,
+    ToggleSidePanel, ToggleSnapshot,
 };
 
 fn main() {
@@ -91,6 +91,7 @@ fn main() {
             KeyBinding::new("ctrl-`", ToggleConsole, None),
             KeyBinding::new("alt-cmd-1", StructuralDiff, None),
             KeyBinding::new("alt-cmd-2", TextDiff, None),
+            KeyBinding::new("alt-cmd-3", ToggleSnapshot, None),
             KeyBinding::new("cmd-m", Minimize, None),
             KeyBinding::new("cmd-t", NewTab, None),
             KeyBinding::new("cmd-w", CloseTab, None),

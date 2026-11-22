@@ -15,7 +15,6 @@ pub(super) fn short_age(time: i64, now: i64) -> String {
     }
 }
 
-/// A short "3 days ago" style age.
 pub(super) fn relative_time(time: i64, now: i64) -> String {
     let seconds = (now - time).max(0);
     let (count, unit) = match seconds {

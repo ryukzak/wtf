@@ -10,6 +10,8 @@ wtf_core = { path = "../core" }
 # runtime_shaders compiles the Metal shaders at startup, so the full Xcode is not needed.
 alacritty_terminal = "0.26"
 futures = "0.3"
+# The local time zone, for commit dates.
+libc = "0.2"
 gpui = { version = "0.2", default-features = false, features = ["font-kit", "runtime_shaders"] }
 # To stop the window moving while a tab is dragged in the title bar.
 objc = "0.2"

@@ -113,10 +113,50 @@ actions!(
         OpenWorktreeWith,
         ShowOneFile,
         ShowAllFiles,
+        ToggleSnapshot,
         Minimize,
         Zoom,
     ]
 );
+
+/// What a file's history was read for: folder, line tip, state and file.
+type HistoryKey = (String, String, String, String);
+
+/// The repository as it is after the selection, shown in Snapshot mode:
+/// every file, and the one open.
+#[derive(Default)]
+struct Snapshot {
+    /// The state listed, its files, and a state being listed.
+    revision: Option<Revision>,
+    files: Vec<String>,
+    loading: Option<Revision>,
+    /// The file open, and its text as last read: at which state, and
+    /// whether it is there.
+    path: Option<String>,
+    text: Option<(Revision, String, Result<String, String>)>,
+    text_loading: Option<(Revision, String)>,
+    /// A worktree's files changed on disk: read them again.
+    stale: bool,
+    filter: String,
+    only_changed: bool,
+    /// Folders open in the tree: by a click, or on the way to a file opened.
+    /// Only a click closes one.
+    open_folders: HashSet<String>,
+    /// The commits that changed the open file along the selected line, newest
+    /// first, for what they were read (folder, line tip, state, file), and
+    /// which of them the shown state stands at.
+    history: Option<(HistoryKey, Vec<String>, Option<usize>)>,
+    history_loading: Option<HistoryKey>,
+    /// A commit stepped to that the graph does not reach yet.
+    pending: Option<String>,
+    /// The commits the header last showed, kept while the next ones load.
+    header: RefCell<Vec<Commit>>,
+    /// The change marks and tints last shown, kept while the next ones load.
+    marks: RefCell<HashMap<String, String>>,
+    tints: RefCell<Option<(String, Rc<HashSet<u32>>)>>,
+    /// Code colors of the open text, for the appearance they were made for.
+    colors: RefCell<Option<(bool, Rc<syntax::Colors>)>>,
+}
 
 /// How the diff pane shows the changed files.
 #[derive(Clone, Copy, PartialEq)]
@@ -200,6 +240,8 @@ enum Border {
     Dock,
     Sidebar,
     Commits,
+    /// The commit header over a snapshot's file.
+    SnapshotHeader,
 }
 
 /// The panels the strip at the right edge opens, one at a time.
@@ -305,6 +347,14 @@ pub struct RepoView {
     stash_flags: [bool; popups::STASH_FLAGS.len()],
     stash_focus: FocusHandle,
     goto_focus: FocusHandle,
+    /// Snapshot mode: the review shows whole files as they are after the
+    /// selection, the Files panel the whole tree.
+    snapshot_mode: bool,
+    snapshot: Snapshot,
+    /// Reading the files, the open file, and its history.
+    snapshot_tasks: [Option<Task<()>>; 3],
+    snapshot_scroll: UniformListScrollHandle,
+    snapshot_filter_focus: FocusHandle,
     /// The last commands used to open a worktree, newest first.
     open_with: Vec<String>,
     /// Shell commands run from the palette, newest first.
@@ -432,6 +482,10 @@ pub struct RepoView {
     terminal: Option<Entity<TerminalView>>,
     /// Set by dragging the graph's border; otherwise the graph fits its rows.
     graph_height: Option<f32>,
+    /// The commit header's height over a snapshot's file, as dragged; and
+    /// where a drag of its edge began, with the height then.
+    snapshot_header_height: Option<f32>,
+    header_drag: Option<(f32, f32)>,
     dragging: Option<Border>,
     commits_width: f32,
 
@@ -485,6 +539,11 @@ impl RepoView {
             stash_flags: [true, false, false],
             stash_focus: cx.focus_handle(),
             goto_focus: cx.focus_handle(),
+            snapshot_mode: false,
+            snapshot: Snapshot::default(),
+            snapshot_tasks: [None, None, None],
+            snapshot_scroll: UniformListScrollHandle::new(),
+            snapshot_filter_focus: cx.focus_handle(),
             prune: None,
             prune_focus: cx.focus_handle(),
             open_with: popups::load_recent("open-with"),
@@ -562,6 +621,8 @@ impl RepoView {
             dock_height: DOCK_HEIGHT,
             terminal: None,
             graph_height: None,
+            snapshot_header_height: None,
+            header_drag: None,
             dragging: None,
             commits_width: 300.,
             refresh_task: None,
@@ -1146,7 +1207,12 @@ impl RepoView {
         self.selected_nodes = selected;
         self.narrowed.clear();
         self.commit_anchor = None;
-        self.commits.clear();
+        // A snapshot keeps the last commits and files in view until the new
+        // ones come, so stepping through versions does not flash.
+        if !self.snapshot_mode {
+            self.commits.clear();
+            self.files.clear();
+        }
         self.commits_task = None;
         self.pending_commit = None;
         // A commit waiting for the model's message goes only where it was
@@ -1171,7 +1237,6 @@ impl RepoView {
                 self.drafts.insert(path, previous);
             }
         }
-        self.files.clear();
         self.select_file(None, cx);
         if self.range.is_none() && !self.selected_nodes.is_empty() {
             self.error_message = Some("Select nodes on one line of history.".to_string());
@@ -1194,6 +1259,7 @@ impl RepoView {
         self.commits_task = Some(cx.spawn(async move |this, cx| {
             let result = load.await;
             this.update(cx, |this, cx| {
+                this.commits_task = None;
                 match result {
                     Ok(commits) => this.commits = commits,
                     Err(error) => this.error_message = Some(message(error)),
@@ -1282,7 +1348,9 @@ impl RepoView {
     }
 
     fn reload_files(&mut self, cx: &mut Context<Self>) {
-        self.files.clear();
+        if !self.snapshot_mode {
+            self.files.clear();
+        }
         self.select_file(None, cx);
         self.load_files(None, cx);
         cx.notify();
@@ -1290,7 +1358,16 @@ impl RepoView {
 
     /// Loads the changed files, keeping `keep` selected if it is still there.
     fn load_files(&mut self, keep: Option<String>, cx: &mut Context<Self>) {
+        // A snapshot's open file is the one whose changes load, for its tints.
+        let keep = match self.snapshot_mode {
+            true => self.snapshot.path.clone().or(keep),
+            false => keep,
+        };
         let range = commit_range(&self.commits, &self.narrowed).or_else(|| self.range.clone());
+        // A worktree's files change on disk; a commit's never do.
+        if let Some((_, Revision::Worktree(_))) = &range {
+            self.snapshot.stale = true;
+        }
         let (Some(repo_path), Some((base, tip))) = (self.repo_path.clone(), range) else {
             return;
         };
@@ -1316,6 +1393,7 @@ impl RepoView {
         self.files_task = Some(cx.spawn(async move |this, cx| {
             let result = load.await;
             this.update(cx, |this, cx| {
+                this.files_task = None;
                 match result {
                     Ok((files, split)) => {
                         this.files = files;
@@ -1385,6 +1463,10 @@ impl RepoView {
     }
 
     fn set_changes_layout(&mut self, layout: ChangesLayout, cx: &mut Context<Self>) {
+        // A snapshot shows one file at a time: all files leave it.
+        if layout == ChangesLayout::AllFiles {
+            self.snapshot_mode = false;
+        }
         if self.changes_layout != layout {
             self.changes_layout = layout;
             // File by file picks files in the files panel.
@@ -1567,6 +1649,12 @@ impl RepoView {
         let y = f32::from(event.position.y);
         let max = (height - MIN_MAIN_HEIGHT).max(MIN_PANEL_HEIGHT);
         match border {
+            Border::SnapshotHeader => {
+                if let Some((from, start)) = self.header_drag {
+                    let lines = HEADER_LINE * preferences::ui_size();
+                    self.snapshot_header_height = Some((start + y - from).clamp(2. * lines, max));
+                }
+            }
             Border::Dock => {
                 self.dock_height = (height - y - STATUS_HEIGHT).clamp(MIN_PANEL_HEIGHT, max)
             }
@@ -1730,6 +1818,46 @@ impl RepoView {
         if self.repo_path.is_none() {
             let hint = "Open a Git repository to review its commits.";
             return placeholder("No repository", Some(hint.into()), theme);
+        }
+        if self.snapshot_mode {
+            let view = self.snapshot_view(theme, cx);
+            // The message keeps one height, four lines unless dragged, so
+            // the file under it stays put from version to version.
+            let height = self
+                .snapshot_header_height
+                .unwrap_or(2. * HEADER_PADDING + 4. * HEADER_LINE * preferences::ui_size());
+            return div()
+                .flex()
+                .flex_col()
+                .size_full()
+                .when(self.range.is_some(), |pane| {
+                    pane.child(
+                        div()
+                            .id("snapshot-header")
+                            .flex_none()
+                            .h(px(height))
+                            .overflow_y_scroll()
+                            .child(self.commit_header(theme, window, cx)),
+                    )
+                    .child(
+                        border_handle("snapshot-header-border", theme).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                this.dragging = Some(Border::SnapshotHeader);
+                                this.header_drag = Some((f32::from(event.position.y), height));
+                                cx.stop_propagation();
+                            }),
+                        ),
+                    )
+                })
+                .children(
+                    self.snapshot
+                        .path
+                        .clone()
+                        .map(|path| self.file_steps_bar(&path, theme, cx)),
+                )
+                .child(div().flex_1().min_h_0().child(view))
+                .into_any_element();
         }
         if self.is_stacked() {
             if self.is_loading_stacked {
@@ -1912,7 +2040,10 @@ impl RepoView {
                     .h_full()
                     .bg(theme.background)
                     .text_sm()
-                    .child(self.file_list(cx))
+                    .map(|panel| match self.snapshot_mode {
+                        true => panel.child(self.snapshot_list(theme, window, cx)),
+                        false => panel.child(self.file_list(cx)),
+                    })
                     .into_any_element(),
             ),
             None => None,
@@ -1987,6 +2118,25 @@ fn commit_range(commits: &[Commit], selected: &[usize]) -> Option<(Option<String
     Some((oldest.parent.clone(), Revision::Commit(newest.id.clone())))
 }
 
+/// A short "3 days ago" style age.
+/// A time as the clock here showed it: `2026-09-14 15:32`.
+fn local_datetime(time: i64) -> String {
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let seconds: libc::time_t = time;
+    // SAFETY: localtime_r writes only into `tm`, which outlives the call.
+    if unsafe { libc::localtime_r(&seconds, &mut tm) }.is_null() {
+        return String::new();
+    }
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min
+    )
+}
+
 /// The height of a commit list row.
 const LIST_ITEM_HEIGHT: f32 = 40.;
 
@@ -1995,6 +2145,7 @@ impl Render for RepoView {
         let theme = Theme::for_appearance(window.appearance());
         window.set_window_title(&self.title());
         self.request_summary(cx);
+        self.sync_snapshot(cx);
         self.sync_log(cx);
         div()
             .track_focus(&self.focus)
@@ -2020,6 +2171,10 @@ impl Render for RepoView {
                 if let Some(path) = this.command_path() {
                     this.open_stash_picker(path, window, cx);
                 }
+            }))
+            .on_action(cx.listener(|this, _: &ToggleSnapshot, window, cx| {
+                let on = !this.snapshot_mode;
+                this.set_snapshot_mode(on, window, cx)
             }))
             .on_action(cx.listener(|this, _: &OpenWorktreeWith, window, cx| {
                 this.open_worktree_with(None, window, cx)
@@ -2186,7 +2341,10 @@ impl Render for RepoView {
                                             .flex_1()
                                             .min_w_0()
                                             .h_full()
-                                            .children(self.file_stepper(&theme, cx))
+                                            // A snapshot picks its file in the tree.
+                                            .when(!self.snapshot_mode, |pane| {
+                                                pane.children(self.file_stepper(&theme, cx))
+                                            })
                                             .child(
                                                 div()
                                                     .flex_1()
@@ -2225,8 +2383,802 @@ impl Render for RepoView {
     }
 }
 
+/// The folders of a snapshot's files, each with whether a file in it changed.
+fn snapshot_folders(entries: &[ChangedFile]) -> HashMap<String, bool> {
+    let mut folders: HashMap<String, bool> = HashMap::new();
+    for entry in entries {
+        let path = entry.path();
+        let mut at = 0;
+        while let Some(slash) = path[at..].find('/') {
+            at += slash + 1;
+            let changed = folders.entry(path[..at].to_string()).or_default();
+            *changed |= !entry.status.is_empty();
+        }
+    }
+    folders
+}
+
 /// Space between the side strip's boxes, and above the first.
 const STRIP_GAP: f32 = 6.;
+
+impl RepoView {
+    /// Switches between the changes and the snapshot; a snapshot opens on
+    /// the file in view, or the first changed one.
+    fn set_snapshot_mode(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
+        // A snapshot shows one file at a time.
+        if on {
+            self.set_changes_layout(ChangesLayout::OneFile, cx);
+        }
+        self.snapshot_mode = on;
+        if on && self.snapshot.path.is_none() {
+            let first = self
+                .selected_file
+                .and_then(|i| self.files.get(i))
+                .or_else(|| self.files.first())
+                .map(|file| file.path().to_string());
+            if let Some(path) = first {
+                self.open_snapshot_file(path);
+            }
+        }
+        if !on {
+            self.focus.focus(window);
+        }
+        self.update_menus(cx);
+        cx.notify();
+    }
+
+    /// The state a snapshot shows: after the commits picked in the list,
+    /// else after the selection, or a worktree's files on disk.
+    fn snapshot_revision(&self) -> Option<Revision> {
+        // A commit stepped to is shown at once, before the list narrows.
+        if let Some(id) = &self.pending_commit {
+            return Some(Revision::Commit(id.clone()));
+        }
+        commit_range(&self.commits, &self.narrowed)
+            .or_else(|| self.range.clone())
+            .map(|(_, tip)| tip)
+    }
+
+    /// Lists the snapshot's files and reads the open one, when the state
+    /// or the file changed, or a worktree's files did. What was read last
+    /// stays in view meanwhile.
+    fn sync_snapshot(&mut self, cx: &mut Context<Self>) {
+        if !self.snapshot_mode {
+            return;
+        }
+        let (Some(repo), Some(revision)) = (self.repo_path.clone(), self.snapshot_revision())
+        else {
+            return;
+        };
+        let stale = std::mem::take(&mut self.snapshot.stale);
+        let listed = self.snapshot.revision.as_ref() == Some(&revision) && !stale;
+        if !listed && self.snapshot.loading.as_ref() != Some(&revision) {
+            self.snapshot.loading = Some(revision.clone());
+            let (repo, wanted, listing) = (repo.clone(), revision.clone(), revision.clone());
+            let load = cx
+                .background_executor()
+                .spawn(async move { wtf_core::snapshot_files(&repo, &wanted) });
+            self.snapshot_tasks[0] = Some(cx.spawn(async move |this, cx| {
+                let files = load.await;
+                this.update(cx, |this, cx| {
+                    if this.snapshot.loading.as_ref() == Some(&listing) {
+                        this.snapshot.loading = None;
+                        this.snapshot.files = files.unwrap_or_default();
+                        this.snapshot.revision = Some(listing);
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }));
+        }
+        let Some(path) = self.snapshot.path.clone() else {
+            return;
+        };
+        // A commit stepped to beyond the graph is selected once it is in.
+        if let Some(id) = self.snapshot.pending.clone()
+            && let Some(node) = self.node_of_commit(&id)
+        {
+            self.snapshot.pending = None;
+            self.select_commit(node, id, cx);
+        }
+        self.sync_history(&repo, &revision, &path, cx);
+        let wanted = (revision.clone(), path.clone());
+        let read = self
+            .snapshot
+            .text
+            .as_ref()
+            .is_some_and(|(r, p, _)| (r, p) == (&wanted.0, &wanted.1))
+            && !stale;
+        if read || self.snapshot.text_loading.as_ref() == Some(&wanted) {
+            return;
+        }
+        self.snapshot.text_loading = Some(wanted.clone());
+        let load = cx
+            .background_executor()
+            .spawn(async move { wtf_core::snapshot_file(&repo, &revision, &path) });
+        self.snapshot_tasks[1] = Some(cx.spawn(async move |this, cx| {
+            let text = load.await.map_err(message);
+            this.update(cx, |this, cx| {
+                if this.snapshot.text_loading.as_ref() == Some(&wanted) {
+                    this.snapshot.text_loading = None;
+                    let (revision, path) = wanted;
+                    this.keep_reading_position(&path, &text);
+                    this.snapshot.text = Some((revision, path, text));
+                    this.snapshot.colors.replace(None);
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+    }
+
+    /// Whether the snapshot's text of `path` is of the state now selected.
+    fn snapshot_text_is_current(&self, path: &str) -> bool {
+        let revision = self.snapshot_revision();
+        self.snapshot
+            .text
+            .as_ref()
+            .is_some_and(|(r, p, _)| p == path && Some(r) == revision.as_ref())
+    }
+
+    /// The lines of `path`, as it is after the selection, that the selection
+    /// added or changed: from the diff the review loaded for it.
+    fn changed_lines(&self, path: &str) -> HashSet<u32> {
+        let index = self
+            .files
+            .iter()
+            .position(|file| file.path() == path);
+        let diff = match index {
+            Some(i) if self.selected_file == Some(i) && self.diff.is_some() => self.diff.as_ref(),
+            Some(i) => self
+                .stacked_diffs
+                .get(i)
+                .and_then(|diff| diff.as_ref().ok()),
+            None => None,
+        };
+        diff.into_iter()
+            .flat_map(|diff| &diff.rows)
+            .filter(|row| diff_view::is_change(row))
+            .filter_map(|row| row.right.as_ref().map(|side| side.line_number))
+            .collect()
+    }
+
+    /// Reads which commits changed the open file along the selected line,
+    /// when the file, the line or the state changed.
+    fn sync_history(
+        &mut self,
+        repo: &str,
+        revision: &Revision,
+        path: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let (dir, at) = match revision {
+            Revision::Commit(id) => (repo.to_string(), id.clone()),
+            Revision::Worktree(worktree) => (worktree.clone(), "HEAD".to_string()),
+        };
+        // Stepping through the file's own history keeps the line it was read
+        // along, so its count holds; selecting elsewhere reads it anew.
+        let kept_tip = self
+            .snapshot
+            .history
+            .as_ref()
+            .filter(|((d, _, _, p), history, _)| *d == dir && p == path && history.contains(&at))
+            .map(|((_, tip, _, _), _, _)| tip.clone());
+        let tip = kept_tip
+            .or_else(|| self.line_tip())
+            .unwrap_or_else(|| at.clone());
+        let key: HistoryKey = (dir, tip, at, path.to_string());
+        let read = self
+            .snapshot
+            .history
+            .as_ref()
+            .is_some_and(|(k, _, _)| *k == key);
+        if read || self.snapshot.history_loading.as_ref() == Some(&key) {
+            return;
+        }
+        self.snapshot.history_loading = Some(key.clone());
+        let wanted = key.clone();
+        let load = cx.background_executor().spawn(async move {
+            let (dir, tip, at, file) = wanted;
+            wtf_core::file_history(&dir, &tip, &at, &file)
+        });
+        self.snapshot_tasks[2] = Some(cx.spawn(async move |this, cx| {
+            let result = load.await;
+            this.update(cx, |this, cx| {
+                if this.snapshot.history_loading.as_ref() == Some(&key) {
+                    this.snapshot.history_loading = None;
+                    let (history, at) = result.unwrap_or_default();
+                    this.snapshot.history = Some((key, history, at));
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+    }
+
+    /// The newest commit of the selected node's line: its lane followed to
+    /// its end, so later changes to the file can be stepped to.
+    fn line_tip(&self) -> Option<String> {
+        let (mut at, node) = self.single_node()?;
+        if node.kind == wtf_core::NodeKind::Uncommitted {
+            return None;
+        }
+        while let Some(next) = self.graph.nodes.iter().position(|child| {
+            child.kind != wtf_core::NodeKind::Uncommitted
+                && child.lane == node.lane
+                && child.parents.first() == Some(&at)
+        }) {
+            at = next;
+        }
+        Some(self.graph.nodes[at].commits.last()?.id.clone())
+    }
+
+    /// The graph node holding a commit.
+    fn node_of_commit(&self, id: &str) -> Option<usize> {
+        self.graph.nodes.iter().position(|node| {
+            node.kind != wtf_core::NodeKind::Uncommitted
+                && node.commits.iter().any(|commit| commit.id == id)
+        })
+    }
+
+    /// The commits the open file changed in before and after the shown
+    /// state, and which change of how many it stands at.
+    fn file_steps(&self) -> Option<(Option<String>, Option<String>, usize, usize)> {
+        let (_, history, at) = self.snapshot.history.as_ref()?;
+        // Before the file's first change: the way on is to where it is added.
+        let Some(at) = *at else {
+            return Some((None, history.last().cloned(), 0, history.len()));
+        };
+        let current = match self.snapshot_revision()? {
+            Revision::Commit(id) => Some(id),
+            Revision::Worktree(_) => None,
+        };
+        let on_change = current.as_deref() == history.get(at).map(String::as_str);
+        let older = match on_change {
+            true => history.get(at + 1),
+            false => history.get(at),
+        };
+        let newer = match current {
+            Some(_) => at.checked_sub(1).and_then(|newer| history.get(newer)),
+            None => None,
+        };
+        Some((
+            older.cloned(),
+            newer.cloned(),
+            history.len() - at,
+            history.len(),
+        ))
+    }
+
+    /// Steps to the commit the open file changed in before or after this
+    /// state: selects it, so the graph and the commit list follow.
+    fn step_file(&mut self, older: bool, cx: &mut Context<Self>) {
+        let Some((before, after, _, _)) = self.file_steps() else {
+            return;
+        };
+        let Some(id) = (if older { before } else { after }) else {
+            return;
+        };
+        match self.node_of_commit(&id) {
+            Some(node) => self.select_commit(node, id, cx),
+            // Beyond the graph: its history comes in first.
+            None => {
+                self.snapshot.pending = Some(id);
+                if self.graph.older > 0 && !self.loading_older {
+                    self.loading_older = true;
+                    self.history += self.graph.older;
+                    self.start_refresh(cx);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// The bar over a snapshot's file: its path, and buttons to the commits
+    /// it changed in before and after.
+    fn file_steps_bar(&self, path: &str, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let steps = self.file_steps();
+        let (older, newer) = steps
+            .as_ref()
+            .map_or((false, false), |(o, n, _, _)| (o.is_some(), n.is_some()));
+        let button = |id: &'static str, label: &'static str, on: bool, older: bool| {
+            div()
+                .id(id)
+                .px(px(8.))
+                .py(px(2.))
+                .rounded(px(4.))
+                .border_1()
+                .border_color(theme.separator)
+                .when(!on, |button| {
+                    button.text_color(theme.secondary).opacity(0.5)
+                })
+                .when(on, |button| {
+                    button
+                        .cursor_pointer()
+                        .hover(|button| button.bg(theme.selection))
+                        .on_click(cx.listener(move |this, _, _, cx| this.step_file(older, cx)))
+                })
+                .child(label)
+        };
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(8.))
+            .px(px(12.))
+            .py(px(6.))
+            .border_b_1()
+            .border_color(theme.separator)
+            .text_sm()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child(path.to_string()),
+            )
+            .children(steps.as_ref().map(|(_, _, at, of)| {
+                div().text_xs().text_color(theme.secondary).child(match at {
+                    0 => "not added yet".to_string(),
+                    at => format!("change {at} of {of}"),
+                })
+            }))
+            .child(button("file-older", "◀ Older change", older, true))
+            .child(button("file-newer", "Newer change ▶", newer, false))
+            .into_any_element()
+    }
+
+    /// Before another version of the open file replaces the one shown, moves
+    /// the view so the line at its top stays there: carried through what
+    /// changed between them, so the reader keeps their place.
+    fn keep_reading_position(&self, path: &str, text: &Result<String, String>) {
+        let (Some((_, shown, Ok(old))), Ok(new)) = (&self.snapshot.text, text) else {
+            return;
+        };
+        if shown != path || old == new {
+            return;
+        }
+        let handle = &self.snapshot_scroll.0.borrow().base_handle;
+        let offset = handle.offset();
+        let row = diff_view::row_height();
+        let scrolled = f32::from(-offset.y).max(0.);
+        let top = (scrolled / row) as usize;
+        let within = scrolled - top as f32 * row;
+        let carried = wtf_core::carry_line(old, new, top);
+        handle.set_offset(point(offset.x, px(-(carried as f32 * row + within))));
+    }
+
+    /// Opens a file in the snapshot, with the folders on the way to it.
+    fn open_snapshot_file(&mut self, path: String) {
+        let mut at = 0;
+        while let Some(slash) = path[at..].find('/') {
+            at += slash + 1;
+            self.snapshot.open_folders.insert(path[..at].to_string());
+        }
+        self.snapshot.path = Some(path);
+    }
+
+    /// The selection's changes by path: how each file changed.
+    fn changed_paths(&self) -> HashMap<String, String> {
+        if self.files_task.is_some() {
+            return self.snapshot.marks.borrow().clone();
+        }
+        let marks: HashMap<String, String> = self
+            .files
+            .iter()
+            .map(|file| (file.path().to_string(), file.status.clone()))
+            .collect();
+        self.snapshot.marks.replace(marks.clone());
+        marks
+    }
+
+    /// The snapshot's files as the tree lists them, filtered, with how the
+    /// selection changed them; files it deleted are listed too.
+    fn snapshot_entries(&self) -> Vec<ChangedFile> {
+        let changed = self.changed_paths();
+        let filter = self.snapshot.filter.trim().to_lowercase();
+        let deleted = changed
+            .iter()
+            .filter(|(_, status)| status.as_str() == "D")
+            .map(|(path, _)| path.clone());
+        // The open file stays listed, there or not, so it is never lost.
+        let open = self.snapshot.path.clone();
+        let mut paths: Vec<String> = self
+            .snapshot
+            .files
+            .iter()
+            .cloned()
+            .chain(deleted)
+            .chain(open)
+            .collect();
+        paths.sort();
+        paths.dedup();
+        paths
+            .into_iter()
+            .filter(|path| {
+                let open = self.snapshot.path.as_ref() == Some(path);
+                open || filter.is_empty() || path.to_lowercase().contains(&filter)
+            })
+            .filter(|path| {
+                let open = self.snapshot.path.as_ref() == Some(path);
+                open || !self.snapshot.only_changed || changed.contains_key(path)
+            })
+            .map(|path| ChangedFile {
+                status: changed.get(&path).cloned().unwrap_or_default(),
+                old_path: None,
+                new_path: Some(path),
+                old_id: String::new(),
+                new_id: String::new(),
+                worktree: None,
+            })
+            .collect()
+    }
+
+    /// Folders of the snapshot tree that are closed: those without changes,
+    /// unless opened, and those with changes the user closed. A filter
+    /// opens them all.
+    fn snapshot_closed(&self, entries: &[ChangedFile]) -> HashSet<String> {
+        if !self.snapshot.filter.trim().is_empty() {
+            return HashSet::new();
+        }
+        // Folders open and close by hand only, so stepping through versions
+        // leaves the tree as it is: closed at first, but for the way to the
+        // open file. A click turns one from how it starts.
+        snapshot_folders(entries)
+            .into_keys()
+            .filter(|folder| !self.snapshot.open_folders.contains(folder))
+            .collect()
+    }
+
+    /// The Files panel in Snapshot mode: a filter, and the whole tree with
+    /// the selection's changes marked.
+    fn snapshot_list(&self, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let focused = self.snapshot_filter_focus.is_focused(window);
+        let only = self.snapshot.only_changed;
+        let count = {
+            let entries = self.snapshot_entries();
+            file_tree(&entries, None, &self.snapshot_closed(&entries)).len()
+        };
+        let list = uniform_list(
+            "snapshot-files",
+            count,
+            cx.processor(|this, range: std::ops::Range<usize>, window, cx| {
+                let theme = Theme::for_appearance(window.appearance());
+                let entries = this.snapshot_entries();
+                let rows = file_tree(&entries, None, &this.snapshot_closed(&entries));
+                range
+                    .filter_map(|k| rows.get(k).map(|row| (k, row)))
+                    .map(|(k, row)| {
+                        let item = div()
+                            .id(("snapshot-row", k))
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .w_full()
+                            .h(px(FILE_ROW_HEIGHT))
+                            .pr(px(8.))
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .cursor_pointer()
+                            .hover(|item| item.bg(theme.selection.opacity(0.5)));
+                        let indent = |depth: usize| px(8. + depth as f32 * 14.);
+                        match row {
+                            TreeRow::Dir { key, label, depth } => {
+                                let closed = this.snapshot_closed(&entries).contains(key);
+                                // Something changed inside: a mark, the
+                                // folder stays as it is.
+                                let changed = snapshot_folders(&entries)
+                                    .get(key)
+                                    .copied()
+                                    .unwrap_or(false);
+                                let key = key.clone();
+                                item.pl(indent(*depth))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if !this.snapshot.open_folders.remove(&key) {
+                                            this.snapshot.open_folders.insert(key.clone());
+                                        }
+                                        cx.notify();
+                                    }))
+                                    .child(panel_chevron(!closed, &theme))
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .text_color(theme.secondary)
+                                            .child(label.clone()),
+                                    )
+                                    .when(changed, |item| {
+                                        item.child(
+                                            div()
+                                                .flex_none()
+                                                .size(px(6.))
+                                                .rounded(px(3.))
+                                                .bg(theme.accent),
+                                        )
+                                    })
+                            }
+                            TreeRow::File { index, name, depth } => {
+                                let file = &entries[*index];
+                                let path = file.path().to_string();
+                                let open = this.snapshot.path.as_deref() == Some(path.as_str());
+                                let deleted = file.status == "D";
+                                let missing = this.snapshot.revision.is_some()
+                                    && !deleted
+                                    && !this.snapshot.files.contains(&path);
+                                item.pl(indent(*depth))
+                                    .when(open, |item| item.bg(theme.selection))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.open_snapshot_file(path.clone());
+                                        this.snapshot_scroll.scroll_to_item(0, ScrollStrategy::Top);
+                                        // Its changes load too, for its tints.
+                                        let index = this
+                                            .files
+                                            .iter()
+                                            .position(|file| file.path() == path);
+                                        if index.is_some() && this.selected_file != index {
+                                            this.select_file(index, cx);
+                                        }
+                                        cx.notify();
+                                    }))
+                                    .child(
+                                        div()
+                                            .w(px(10.))
+                                            .font_family(preferences::code_font())
+                                            .text_xs()
+                                            .text_color(theme.accent)
+                                            .child(file.status.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .truncate()
+                                            .when(file.status.is_empty(), |name| {
+                                                name.text_color(theme.secondary)
+                                            })
+                                            .when(deleted, |name| name.line_through())
+                                            .when(missing, |name| {
+                                                name.italic().text_color(theme.secondary)
+                                            })
+                                            .child(name.clone()),
+                                    )
+                            }
+                            TreeRow::Section(..) => item,
+                        }
+                    })
+                    .collect()
+            }),
+        )
+        .flex_1()
+        .py(px(4.));
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .p(px(6.))
+                    .border_b_1()
+                    .border_color(theme.separator)
+                    .child(
+                        div()
+                            .id("snapshot-filter")
+                            .track_focus(&self.snapshot_filter_focus)
+                            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                                let keystroke = &event.keystroke;
+                                match keystroke.key.as_str() {
+                                    "escape" => {
+                                        this.snapshot.filter.clear();
+                                        this.focus.focus(window);
+                                    }
+                                    "enter" => {}
+                                    _ if type_key(&mut this.snapshot.filter, keystroke, true, cx) => {}
+                                    _ => return,
+                                }
+                                cx.stop_propagation();
+                                cx.notify();
+                            }))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.snapshot_filter_focus.focus(window);
+                                cx.notify();
+                            }))
+                            .flex_1()
+                            .min_w_0()
+                            .h(px(24.))
+                            .flex()
+                            .items_center()
+                            .px(px(6.))
+                            .rounded(px(4.))
+                            .border_1()
+                            .border_color(if focused {
+                                theme.accent
+                            } else {
+                                theme.separator
+                            })
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(field_text(
+                                &self.snapshot.filter,
+                                "Filter files",
+                                focused,
+                                theme,
+                            )),
+                    )
+                    .child(
+                        div()
+                            .id("snapshot-only-changed")
+                            .flex_none()
+                            .px(px(6.))
+                            .h(px(24.))
+                            .flex()
+                            .items_center()
+                            .rounded(px(4.))
+                            .border_1()
+                            .border_color(theme.separator)
+                            .text_xs()
+                            .cursor_pointer()
+                            .when(only, |toggle| toggle.bg(theme.selection))
+                            .hover(|toggle| toggle.bg(theme.selection))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.snapshot.only_changed = !this.snapshot.only_changed;
+                                cx.notify();
+                            }))
+                            .child("Changed"),
+                    ),
+            )
+            .child(list)
+            .into_any_element()
+    }
+
+    /// The open file, whole, as it is in the snapshot; while another state
+    /// is read, the last one read stays.
+    fn snapshot_view(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let Some(revision) = self.snapshot_revision() else {
+            return placeholder("Nothing selected", None, theme);
+        };
+        let Some(path) = self.snapshot.path.clone() else {
+            let hint = "Pick a file in the Files panel (⌘R).";
+            return placeholder("No file open", Some(hint.into()), theme);
+        };
+        let text = match &self.snapshot.text {
+            Some((_, shown, text)) if *shown == path => text,
+            _ => return placeholder("Loading…", None, theme),
+        };
+        let listed = self.snapshot.revision.as_ref() == Some(&revision);
+        let missing = listed && !self.snapshot.files.contains(&path);
+        let text = match (text, missing) {
+            // The file stays open where it is missing: it is added later, or
+            // was deleted by here.
+            (_, true) => {
+                let not_yet = self
+                    .snapshot
+                    .history
+                    .as_ref()
+                    .is_some_and(|(_, history, at)| at.is_none() && !history.is_empty());
+                let (title, hint) = match not_yet {
+                    true => (
+                        "Doesn't exist yet",
+                        format!("{path} is added in a later commit: Newer change ▶ goes there."),
+                    ),
+                    false => (
+                        "Deleted",
+                        format!("{path} was deleted before this version."),
+                    ),
+                };
+                return placeholder(title, Some(hint), theme);
+            }
+            (Err(error), _) => return placeholder(&path, Some(error.clone()), theme),
+            (Ok(text), _) => text.clone(),
+        };
+        let lines: Rc<Vec<String>> = Rc::new(text.lines().map(str::to_string).collect());
+        let dark = theme.background.l < 0.5;
+        let colors = {
+            let cached = self.snapshot.colors.borrow().clone();
+            match cached {
+                Some((made_dark, colors)) if made_dark == dark => colors,
+                _ => {
+                    let diff = FileDiff {
+                        language: String::new(),
+                        rows: lines
+                            .iter()
+                            .enumerate()
+                            .map(|(i, line)| wtf_core::DiffRow {
+                                left: None,
+                                right: Some(wtf_core::DiffSide {
+                                    line_number: i as u32 + 1,
+                                    text: line.clone(),
+                                    changes: Vec::new(),
+                                }),
+                            })
+                            .collect(),
+                    };
+                    let colors = Rc::new(syntax::colors(&path, &diff, dark));
+                    self.snapshot.colors.replace(Some((dark, colors.clone())));
+                    colors
+                }
+            }
+        };
+        let foreground = theme.foreground;
+        let secondary = theme.secondary;
+        let inserted = theme.inserted;
+        // Lines the selection added or changed, from its diff of the file,
+        // when the state shown is the selection's own.
+        let fresh = self.snapshot_text_is_current(&path)
+            && self.files_task.is_none()
+            && !self.is_loading_stacked
+            && !self.is_loading_diff;
+        let kept = self.snapshot.tints.borrow().clone();
+        let changed: Rc<HashSet<u32>> = match (fresh, kept) {
+            (true, _) => {
+                let lines = Rc::new(self.changed_lines(&path));
+                self.snapshot
+                    .tints
+                    .replace(Some((path.clone(), lines.clone())));
+                lines
+            }
+            (false, Some((shown, lines))) if shown == path => lines,
+            (false, _) => Rc::new(HashSet::new()),
+        };
+        uniform_list(
+            "snapshot-text",
+            lines.len(),
+            cx.processor(move |_, range: std::ops::Range<usize>, _, _| {
+                range
+                    .map(|i| {
+                        let line = &lines[i];
+                        let spans = colors.right.get(&(i as u32 + 1));
+                        let highlights: Vec<_> = spans
+                            .into_iter()
+                            .flatten()
+                            .filter(|(range, _)| {
+                                range.end <= line.len()
+                                    && line.is_char_boundary(range.start)
+                                    && line.is_char_boundary(range.end)
+                            })
+                            .map(|(range, color)| {
+                                (
+                                    range.clone(),
+                                    HighlightStyle {
+                                        color: Some(*color),
+                                        ..Default::default()
+                                    },
+                                )
+                            })
+                            .collect();
+                        div()
+                            .flex()
+                            .w_full()
+                            .h(px(diff_view::row_height()))
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .when(changed.contains(&(i as u32 + 1)), |row| row.bg(inserted))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .w(px(diff_view::gutter_width()))
+                                    .pr(px(8.))
+                                    .text_right()
+                                    .text_color(secondary)
+                                    .child((i + 1).to_string()),
+                            )
+                            .child(
+                                div().text_color(foreground).child(
+                                    StyledText::new(line.clone()).with_highlights(highlights),
+                                ),
+                            )
+                    })
+                    .collect()
+            }),
+        )
+        .track_scroll(self.snapshot_scroll.clone())
+        .size_full()
+        .font_family(preferences::code_font())
+        .text_size(px(preferences::code_size()))
+        .line_height(px(diff_view::row_height()))
+        .into_any_element()
+    }
+}
 
 /// The cursor drawn in a text field.
 const CARET: &str = "▏";
@@ -2519,6 +3471,18 @@ mod tests {
             aggregate(&refs, now),
             "3 commits · Bot, Ann · 3 days ago – 1 day ago"
         );
+    }
+
+    #[test]
+    fn dates_read_as_local_date_and_time() {
+        // The hours depend on the time zone here; the shape does not.
+        let text = local_datetime(1_700_000_000);
+        let shape: String = text
+            .chars()
+            .map(|c| if c.is_ascii_digit() { '9' } else { c })
+            .collect();
+        assert_eq!(shape, "9999-99-99 99:99");
+        assert!(text.starts_with("2023-11-1"));
     }
 
     #[test]

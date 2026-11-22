@@ -37,6 +37,25 @@ pub fn fetch(repo: &str, prune: bool) -> Result<(), CoreError> {
     run_with_env(repo, &args, None, &[("GIT_TERMINAL_PROMPT", "0")]).map(|_| ())
 }
 
+/// An object's raw bytes, such as `HEAD:src/main.rs`, recorded like [`run`].
+pub fn show(dir: &str, object: &str) -> Result<Vec<u8>, CoreError> {
+    let started = Instant::now();
+    let args = ["show", object];
+    let line = console::shell_line("git", &args);
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .map_err(CoreError::new)?;
+    if !output.status.success() {
+        let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        console::record(dir, line, false, started, error.clone());
+        return Err(CoreError::new(error));
+    }
+    console::record(dir, line, true, started, String::new());
+    Ok(output.stdout)
+}
+
 /// Runs a git command that talks to a remote, such as `pull --rebase`, in
 /// `path`. As with [`fetch`], git asks no password.
 pub fn remote(path: &str, args: &[&str]) -> Result<(), CoreError> {

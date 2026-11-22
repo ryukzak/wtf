@@ -5,8 +5,11 @@ mod git;
 mod patch;
 mod summary;
 mod text;
+
+pub use text::carry_line;
 mod workflow;
 
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use attention::{Attention, Scope};
@@ -191,6 +194,85 @@ pub fn fetch(repo: &str, prune: bool, background: bool) -> Result<(), CoreError>
 /// Runs a pull or fetch, such as `["pull", "--rebase"]`, in a worktree.
 pub fn pull(path: &str, args: &[&str]) -> Result<(), CoreError> {
     git::remote(path, args)
+}
+
+/// The largest file a snapshot shows.
+const MAX_SNAPSHOT_FILE: usize = 2 * 1024 * 1024;
+
+/// Every file of the repository as it is at `revision`: in a commit's
+/// tree, or in a worktree, tracked or new and not ignored. Read quietly,
+/// with the refresh commands.
+pub fn snapshot_files(repo: &str, revision: &Revision) -> Result<Vec<String>, CoreError> {
+    console::as_refresh(|| {
+        let listing = match revision {
+            Revision::Commit(id) => git::run(repo, &["ls-tree", "-r", "--name-only", "-z", id])?,
+            Revision::Worktree(path) => git::run(
+                path,
+                &[
+                    "ls-files",
+                    "-z",
+                    "--cached",
+                    "--others",
+                    "--exclude-standard",
+                ],
+            )?,
+        };
+        let mut files: Vec<String> = listing
+            .split('\0')
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .collect();
+        // A worktree lists tracked files it has deleted too.
+        if let Revision::Worktree(path) = revision {
+            files.retain(|name| Path::new(path).join(name).exists());
+        }
+        files.sort();
+        files.dedup();
+        Ok(files)
+    })
+}
+
+/// A file's text as it is at `revision`; an error for binary files and very
+/// large ones.
+pub fn snapshot_file(repo: &str, revision: &Revision, file: &str) -> Result<String, CoreError> {
+    let bytes = match revision {
+        Revision::Commit(id) => console::as_refresh(|| git::show(repo, &format!("{id}:{file}")))?,
+        Revision::Worktree(path) => {
+            std::fs::read(Path::new(path).join(file)).map_err(CoreError::new)?
+        }
+    };
+    if bytes.len() > MAX_SNAPSHOT_FILE {
+        return Err(CoreError::new("Too large to show"));
+    }
+    if bytes.contains(&0) {
+        return Err(CoreError::new("Binary file"));
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// The commits that changed `file` on the line of history ending at `tip`,
+/// newest first, following renames, and where among them is the newest
+/// change at or before `at`. Read in `dir`, quietly.
+pub fn file_history(
+    dir: &str,
+    tip: &str,
+    at: &str,
+    file: &str,
+) -> Result<(Vec<String>, Option<usize>), CoreError> {
+    console::as_refresh(|| {
+        let log = |from: &str, limit: Option<&str>| -> Result<Vec<String>, CoreError> {
+            let mut args = vec!["log", "--format=%H", "--follow"];
+            args.extend(limit);
+            args.extend([from, "--", file]);
+            Ok(git::run(dir, &args)?.lines().map(str::to_string).collect())
+        };
+        let history = log(tip, None)?;
+        let last = log(at, Some("-1"))?;
+        let position = last
+            .first()
+            .and_then(|change| history.iter().position(|id| id == change));
+        Ok((history, position))
+    })
 }
 
 pub fn file_diff(

@@ -124,6 +124,22 @@ fn push_range(ranges: &mut Vec<TextRange>, start: usize, end: usize) {
     }
 }
 
+/// Where line `line` (from 0) of `old` is in `new`: the same line when it
+/// is kept, else where the change that replaced it begins.
+pub fn carry_line(old: &str, new: &str, line: usize) -> usize {
+    let diff = TextDiff::from_lines(old, new);
+    for op in diff.ops() {
+        let (tag, before, after) = op.as_tag_tuple();
+        if before.contains(&line) {
+            return match tag {
+                similar::DiffTag::Equal => after.start + (line - before.start),
+                _ => after.start,
+            };
+        }
+    }
+    new.lines().count().min(line)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,5 +212,18 @@ mod tests {
         let diff = diff(b"a\0b", b"a\0c");
         assert_eq!(diff.language, "Binary");
         assert!(diff.rows.is_empty());
+    }
+
+    #[test]
+    fn carries_a_line_across_versions() {
+        let old = "a\nb\nc\nd\n";
+        let new = "new\nnew\na\nb\nd\n";
+        assert_eq!(carry_line(old, new, 0), 2, "kept, two lines lower");
+        assert_eq!(carry_line(old, new, 3), 4);
+        assert_eq!(
+            carry_line(old, new, 2),
+            4,
+            "deleted: where the change begins"
+        );
     }
 }

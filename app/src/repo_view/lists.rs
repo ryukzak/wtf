@@ -105,7 +105,7 @@ impl RepoView {
     }
 
     /// The selected node when it is the only one.
-    fn single_node(&self) -> Option<(usize, &wtf_core::GraphNode)> {
+    pub(super) fn single_node(&self) -> Option<(usize, &wtf_core::GraphNode)> {
         let [selected] = self.selected_nodes[..] else {
             return None;
         };

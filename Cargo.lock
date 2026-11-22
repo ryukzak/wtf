@@ -7136,6 +7136,7 @@ dependencies = [
  "alacritty_terminal",
  "futures",
  "gpui",
+ "libc",
  "objc",
  "raw-window-handle",
  "syntect",

@@ -1198,6 +1198,64 @@ mod tests {
     }
 
     #[test]
+    fn snapshots_list_and_read_files_at_a_revision() {
+        let fixture = forked();
+        let path = fixture.path();
+        let master = fixture
+            .git(".", &["rev-parse", "master"])
+            .trim()
+            .to_string();
+        let feature = fixture
+            .git(".", &["rev-parse", "feature"])
+            .trim()
+            .to_string();
+        let at = |id: &str| crate::Revision::Commit(id.to_string());
+        assert_eq!(
+            crate::snapshot_files(&path, &at(&master)).unwrap(),
+            ["a.txt"]
+        );
+        assert_eq!(
+            crate::snapshot_files(&path, &at(&feature)).unwrap(),
+            ["a.txt", "b.txt"]
+        );
+        assert_eq!(
+            crate::snapshot_file(&path, &at(&feature), "b.txt").unwrap(),
+            "x\ny\n"
+        );
+        assert!(crate::snapshot_file(&path, &at(&master), "b.txt").is_err());
+        // A worktree: its files on disk, new ones included.
+        std::fs::write(format!("{path}/new.txt"), "n\n").unwrap();
+        let worktree = crate::Revision::Worktree(path.clone());
+        assert_eq!(
+            crate::snapshot_files(&path, &worktree).unwrap(),
+            ["a.txt", "new.txt"]
+        );
+        assert_eq!(
+            crate::snapshot_file(&path, &worktree, "new.txt").unwrap(),
+            "n\n"
+        );
+        std::fs::write(format!("{path}/bin"), [0u8, 1, 2]).unwrap();
+        assert!(crate::snapshot_file(&path, &worktree, "bin").is_err());
+    }
+
+    #[test]
+    fn a_file_history_knows_where_a_commit_stands() {
+        let fixture = Fixture::new();
+        fixture.commit(".", "a.txt", "1\n", "a1");
+        fixture.commit(".", "b.txt", "1\n", "b1");
+        fixture.commit(".", "a.txt", "2\n", "a2");
+        fixture.commit(".", "b.txt", "2\n", "b2");
+        let path = fixture.path();
+        let id = |rev: &str| fixture.git(".", &["rev-parse", rev]).trim().to_string();
+        let (history, at) = crate::file_history(&path, "HEAD", "HEAD~1", "a.txt").unwrap();
+        assert_eq!(history, [id("HEAD~1"), id("HEAD~3")]);
+        assert_eq!(at, Some(0), "a2 itself");
+        // A commit that left the file alone stands at the change before it.
+        let (_, at) = crate::file_history(&path, "HEAD", "HEAD~2", "a.txt").unwrap();
+        assert_eq!(at, Some(1), "b1 stands at a1");
+    }
+
+    #[test]
     fn a_lone_branch_shows_its_commits() {
         let fixture = Fixture::new();
         fixture.commit(".", "a.txt", "1\n", "c1");
