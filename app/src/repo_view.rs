@@ -19,7 +19,7 @@ use wtf_core::{
 use crate::console_view;
 use crate::diff_view;
 use crate::goto;
-use crate::graph_view::{self, Axis, WorktreeNames, WorktreeOrder};
+use crate::graph_view::{self, WorktreeNames, WorktreeOrder};
 use crate::menus::{
     self, AllAuthors, MenuState, ResetBranches, SetScope, SetTimeWindow, SetWorktreeNames,
     SetWorktreeOrder, ToggleAttentionPanel, ToggleAuthor, ToggleBranch, ToggleRemotes, ToggleTags,
@@ -80,9 +80,6 @@ actions!(
         OpenRepository,
         StructuralDiff,
         TextDiff,
-        TopologyView,
-        CompressedTimeView,
-        TimeView,
         ToggleCombineCommits,
         ToggleConsole,
         ToggleRefreshCommands,
@@ -91,6 +88,7 @@ actions!(
         CommandPalette,
         Prune,
         Fetch,
+        StashChanges,
         OpenWorktreeWith,
         ShowOneFile,
         ShowAllFiles,
@@ -381,7 +379,6 @@ pub struct RepoView {
     repo_path: Option<String>,
     graph: WorkflowGraph,
     graph_error: Option<String>,
-    axis: Axis,
     /// Linear runs of commits share a node.
     combine_commits: bool,
     attention: Attention,
@@ -402,6 +399,12 @@ pub struct RepoView {
     /// The Go To picker or the command palette, when open: the query, the
     /// highlighted result, and whether it lists commands.
     goto: Option<(String, usize, bool)>,
+    /// The Stash picker, open on a worktree: its path and the highlighted
+    /// row, the first one running the stash.
+    stash_picker: Option<(String, usize)>,
+    /// The flags the Stash picker has on, by their place in its list.
+    stash_flags: [bool; popups::STASH_FLAGS.len()],
+    stash_focus: FocusHandle,
     goto_focus: FocusHandle,
     /// The last commands used to open a worktree, newest first.
     open_with: Vec<String>,
@@ -586,7 +589,6 @@ impl RepoView {
             repo_path: None,
             graph: WorkflowGraph::default(),
             graph_error: None,
-            axis: Axis::Topological,
             combine_commits: true,
             attention: Attention::default(),
             graph_scroll: ScrollHandle::new(),
@@ -598,6 +600,9 @@ impl RepoView {
             prompt: None,
             prompt_focus: cx.focus_handle(),
             goto: None,
+            stash_picker: None,
+            stash_flags: [true, false, false],
+            stash_focus: cx.focus_handle(),
             goto_focus: cx.focus_handle(),
             prune: None,
             prune_focus: cx.focus_handle(),
@@ -925,7 +930,6 @@ impl RepoView {
             combine: self.combine_commits,
             names: self.worktree_names,
             order: self.worktree_order,
-            axis: self.axis,
             panel: self.side_panel == Some(SidePanel::Attention),
         };
         if self.menus_for.as_ref() != Some(&state) {
@@ -2859,13 +2863,6 @@ impl RepoView {
         }
     }
 
-    fn set_axis(&mut self, axis: Axis, cx: &mut Context<Self>) {
-        self.axis = axis;
-        self.scroll_graph_to_end = true;
-        self.update_menus(cx);
-        cx.notify();
-    }
-
     fn toggle_combine_commits(&mut self, cx: &mut Context<Self>) {
         self.combine_commits = !self.combine_commits;
         self.update_menus(cx);
@@ -2882,7 +2879,7 @@ impl RepoView {
         if let Some(error) = &self.graph_error {
             return placeholder("Cannot read the repository", Some(error.clone()), theme);
         }
-        let layout = graph_view::layout(&self.graph, self.axis, self.worktree_order);
+        let layout = graph_view::layout(&self.graph, self.worktree_order);
         // When the graph grows or shrinks, as attention changes, the view keeps
         // its distance from the newest work on the right instead of jumping.
         let previous = self.graph_width.replace(layout.width);
@@ -4550,6 +4547,11 @@ impl RepoView {
                         base: stash.base.clone(),
                     };
                     self.show_prompt(kind, String::new(), window);
+                }
+            }
+            Command::StashChanges => {
+                if let Target::Worktree { path, .. } = &target {
+                    self.open_stash_picker(path.clone(), window, cx);
                 }
             }
             Command::DropStash => {
@@ -6864,13 +6866,6 @@ impl Render for RepoView {
                 cx.listener(|this, _: &TextDiff, _, cx| this.set_diff_mode(DiffMode::Text, cx)),
             )
             .on_action(
-                cx.listener(|this, _: &TopologyView, _, cx| this.set_axis(Axis::Topological, cx)),
-            )
-            .on_action(cx.listener(|this, _: &CompressedTimeView, _, cx| {
-                this.set_axis(Axis::CompressedTime, cx)
-            }))
-            .on_action(cx.listener(|this, _: &TimeView, _, cx| this.set_axis(Axis::RealTime, cx)))
-            .on_action(
                 cx.listener(|this, _: &ToggleCombineCommits, _, cx| {
                     this.toggle_combine_commits(cx)
                 }),
@@ -6878,6 +6873,12 @@ impl Render for RepoView {
             .on_action(cx.listener(|this, _: &GoTo, window, cx| this.open_goto(false, window, cx)))
             .on_action(cx.listener(|this, _: &Prune, window, cx| this.open_prune(window, cx)))
             .on_action(cx.listener(|this, _: &Fetch, _, cx| this.fetch(false, cx)))
+            // Stashes the changes of the worktree commands run in.
+            .on_action(cx.listener(|this, _: &StashChanges, window, cx| {
+                if let Some(path) = this.command_path() {
+                    this.open_stash_picker(path, window, cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &OpenWorktreeWith, window, cx| {
                 this.open_worktree_with(None, window, cx)
             }))
@@ -7065,6 +7066,7 @@ impl Render for RepoView {
             .children(self.dropdown_view(&theme, cx))
             .children(self.prompt_view(&theme, window, cx))
             .children(self.goto_view(&theme, window, cx))
+            .children(self.stash_picker_view(&theme, window, cx))
             .children(self.prune_view(&theme, window, cx))
     }
 }
@@ -7098,6 +7100,176 @@ fn strip_option(id: &'static str, on: bool, theme: &Theme) -> Stateful<gpui::Div
         .cursor_pointer()
         .hover(|option| option.bg(theme.selection.opacity(0.5)))
         .when(on, |option| option.bg(theme.selection))
+}
+
+impl RepoView {
+    fn open_stash_picker(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.stash_picker = Some((path, 0));
+        self.stash_focus.focus(window);
+        cx.notify();
+    }
+
+    fn close_stash_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.stash_picker = None;
+        self.focus.focus(window);
+        cx.notify();
+    }
+
+    /// A row of the Stash picker taken: the first runs the stash with the
+    /// flags on, the others turn their flag on or off.
+    fn pick_stash_row(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((path, _)) = self.stash_picker.clone() else {
+            return;
+        };
+        if row == 0 {
+            let flags: Vec<&str> = popups::STASH_FLAGS
+                .iter()
+                .zip(self.stash_flags)
+                .filter(|(_, on)| *on)
+                .map(|((flag, _), _)| *flag)
+                .collect();
+            self.close_stash_picker(window, cx);
+            self.run_in_terminal(popups::stash_with(&path, &flags), window, cx);
+            return;
+        }
+        if let Some(flag) = self.stash_flags.get_mut(row - 1) {
+            *flag = !*flag;
+        }
+        if let Some((_, highlighted)) = &mut self.stash_picker {
+            *highlighted = row;
+        }
+        cx.notify();
+    }
+
+    fn stash_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((_, highlighted)) = &mut self.stash_picker else {
+            return;
+        };
+        let rows = popups::STASH_FLAGS.len() + 1;
+        match event.keystroke.key.as_str() {
+            "escape" => return self.close_stash_picker(window, cx),
+            "enter" => {
+                let row = *highlighted;
+                return self.pick_stash_row(row, window, cx);
+            }
+            "down" => *highlighted = (*highlighted + 1).min(rows - 1),
+            "up" => *highlighted = highlighted.saturating_sub(1),
+            _ => return,
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    /// The Stash picker, as Sublime Merge's: `stash` to run, then its flags
+    /// to turn on or off, each with what it does.
+    fn stash_picker_view(
+        &self,
+        theme: &Theme,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let (path, highlighted) = self.stash_picker.as_ref()?;
+        let highlighted = *highlighted;
+        let folder = std::path::Path::new(path)
+            .file_name()
+            .map_or(path.clone(), |name| name.to_string_lossy().into_owned());
+        let row = |k: usize, cx: &mut Context<Self>| {
+            div()
+                .id(("stash-row", k))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .h(px(28.))
+                .px(px(10.))
+                .rounded(px(4.))
+                .cursor_pointer()
+                .when(k == highlighted, |row| row.bg(theme.selection))
+                .hover(|row| row.bg(theme.selection.opacity(0.5)))
+                .on_click(
+                    cx.listener(move |this, _, window, cx| this.pick_stash_row(k, window, cx)),
+                )
+        };
+        let mut rows = vec![
+            row(0, cx)
+                .child(div().w(px(14.)))
+                .child(div().italic().child("stash"))
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .text_xs()
+                        .italic()
+                        .text_color(theme.secondary)
+                        .child(format!("Select to run in {folder}")),
+                ),
+        ];
+        for (k, (flag, about)) in popups::STASH_FLAGS.iter().enumerate() {
+            rows.push(
+                row(k + 1, cx)
+                    .child(
+                        div()
+                            .w(px(14.))
+                            .text_color(theme.accent)
+                            .child(if self.stash_flags[k] { "✓" } else { "" }),
+                    )
+                    .child(div().font_family(preferences::code_font()).child(*flag))
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .text_xs()
+                            .italic()
+                            .text_color(theme.secondary)
+                            .child(*about),
+                    ),
+            );
+        }
+        let width = f32::from(window.viewport_size().width);
+        let panel_width = GOTO_WIDTH.min(width - 32.);
+        let position = Point::new(px(((width - panel_width) / 2.).max(0.)), px(60.));
+        let panel = div()
+            .id("stash-picker")
+            .track_focus(&self.stash_focus)
+            .on_key_down(cx.listener(Self::stash_key))
+            .occlude()
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .w(px(panel_width))
+            .p(px(8.))
+            .rounded(px(8.))
+            .border_1()
+            .border_color(theme.separator)
+            .bg(theme.background)
+            .shadow_lg()
+            .text_sm()
+            .on_mouse_down_out(
+                cx.listener(|this, _, window, cx| this.close_stash_picker(window, cx)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .px(px(10.))
+                    .pb(px(6.))
+                    .mb(px(2.))
+                    .border_b_1()
+                    .border_color(theme.separator)
+                    .child(
+                        div()
+                            .px(px(6.))
+                            .rounded(px(4.))
+                            .bg(theme.selection)
+                            .child("Stash"),
+                    )
+                    .child(div().text_color(theme.secondary).child("Choose flags")),
+            )
+            .children(rows);
+        Some(
+            deferred(anchored().position(position).child(panel))
+                .with_priority(2)
+                .into_any_element(),
+        )
+    }
 }
 
 /// Text turned to read downwards, for the sidebar strip. GPUI draws text

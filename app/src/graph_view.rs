@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::Path;
 
 use gpui::{
@@ -149,13 +148,6 @@ fn bead_width() -> f32 {
     style().dot * 0.6
 }
 
-#[derive(Clone, Copy, PartialEq)]
-pub enum Axis {
-    Topological,
-    CompressedTime,
-    RealTime,
-}
-
 const PAD_X: f32 = 24.;
 /// What the mark says while it is being pulled.
 const HISTORY_HINT: &str = "Keep scrolling";
@@ -193,8 +185,6 @@ const SYMBOL_GAP: f32 = 6.;
 /// each further clean worktree on the same commit takes.
 const FRAME_PAD: f32 = 4.;
 const FRAME_STEP: f32 = 3.;
-const MIN_TIME_WIDTH: f32 = 900.;
-const TIME_WIDTH_PER_NODE: f32 = 36.;
 
 pub struct Layout {
     /// Horizontal extent and vertical center of each node.
@@ -214,16 +204,24 @@ pub struct Layout {
     /// Where each worktree's tag sits in the list; worktrees sharing a row
     /// sit side by side.
     pub list_x: Vec<Option<f32>>,
+    /// Stashes, each on a row of its own off the commit it was made on.
+    pub stashes: Vec<StashPlace>,
     pub width: f32,
     pub height: f32,
 }
 
-pub fn layout(graph: &WorkflowGraph, axis: Axis, order: WorktreeOrder) -> Layout {
-    let mut xs = match axis {
-        Axis::Topological => topological(graph),
-        Axis::CompressedTime => timed(graph, style().idle_gap()),
-        Axis::RealTime => timed(graph, i64::MAX),
-    };
+/// A stash's place: like a short branch, forking from its commit.
+pub struct StashPlace {
+    /// The node of the commit it was made on.
+    pub node: usize,
+    pub name: String,
+    /// The center of its mark.
+    pub x: f32,
+    pub y: f32,
+}
+
+pub fn layout(graph: &WorkflowGraph, order: WorktreeOrder) -> Layout {
+    let mut xs = topological(graph);
 
     // Worktrees sit as squares right after the node of their HEAD commit when
     // nothing follows it; otherwise later commits or a merge rail are in the
@@ -289,10 +287,24 @@ pub fn layout(graph: &WorkflowGraph, axis: Axis, order: WorktreeOrder) -> Layout
     // row; other lanes share rows where they do not overlap.
     // Worktrees off a commit with something after it get layout lanes of their
     // own, past the graph's lanes, so their rows never hold their commit.
-    let lane_count = graph.lane_count + detached.len();
+    // Stashes fork off their commits onto rows of their own too, as short
+    // branches do.
+    let stash_rows: Vec<(usize, String)> = graph
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| node.kind != NodeKind::Uncommitted)
+        .flat_map(|(i, node)| node.stashes.iter().map(move |name| (i, name.clone())))
+        .collect();
+    let stash_x: Vec<f32> = stash_rows
+        .iter()
+        .map(|&(p, _)| xs[p].1 + style().dot / 2. + FORK_GAP + symbol() / 2.)
+        .collect();
+    let lane_count = graph.lane_count + detached.len() + stash_rows.len();
     let own_lane = |worktree: usize| {
         graph.lane_count + detached.iter().position(|&w| w == worktree).unwrap_or(0)
     };
+    let stash_lane = |k: usize| graph.lane_count + detached.len() + k;
     let mut spans: Vec<Option<(f32, f32)>> = vec![None; lane_count];
     let widen = |spans: &mut Vec<Option<(f32, f32)>>, lane: usize, start: f32, end: f32| {
         let span = spans[lane].get_or_insert((start, end));
@@ -301,6 +313,10 @@ pub fn layout(graph: &WorkflowGraph, axis: Axis, order: WorktreeOrder) -> Layout
     for &worktree in &detached {
         let start = xs[graph.nodes[worktree].parents[0]].1;
         widen(&mut spans, own_lane(worktree), start, f32::INFINITY);
+    }
+    for (k, (parent, name)) in stash_rows.iter().enumerate() {
+        let end = stash_x[k] + symbol() / 2. + TAG_GAP + label_width(name);
+        widen(&mut spans, stash_lane(k), xs[*parent].1, end);
     }
     for (i, node) in graph.nodes.iter().enumerate() {
         if node.kind == NodeKind::Uncommitted {
@@ -352,7 +368,8 @@ pub fn layout(graph: &WorkflowGraph, axis: Axis, order: WorktreeOrder) -> Layout
             }
         }
     }
-    let mut lanes: Vec<(usize, (f32, f32))> = (1..lane_count)
+    // Stash rows are placed apart, above the main row.
+    let mut lanes: Vec<(usize, (f32, f32))> = (1..stash_lane(0))
         .filter_map(|lane| Some((lane, spans[lane]?)))
         .collect();
     // Worktree rows come right after merged branches, newest first by the chosen
@@ -379,6 +396,7 @@ pub fn layout(graph: &WorkflowGraph, axis: Axis, order: WorktreeOrder) -> Layout
         worktree_lane[lane] = true;
         times[lane].get_or_insert((parent.last_time, parent.last_time));
     }
+
     let time = |lane: usize| {
         let (first, last) = times[lane].unwrap_or_default();
         match order {
@@ -418,8 +436,35 @@ pub fn layout(graph: &WorkflowGraph, axis: Axis, order: WorktreeOrder) -> Layout
         row_of[lane] = row;
     }
 
-    let row_y =
-        |lane: usize| PAD_Y + row_of[lane] as f32 * style().row_height + style().row_height / 2.;
+    // Branches go down from the main row; stashes, set-aside work rather
+    // than history, go up: each takes the first row above with room for it,
+    // the nearest first.
+    let mut above: Vec<Vec<(f32, f32)>> = Vec::new();
+    let mut above_of = vec![0; stash_rows.len()];
+    for (k, row) in above_of.iter_mut().enumerate() {
+        let Some((start, end)) = spans[stash_lane(k)] else {
+            continue;
+        };
+        let free = |row: &Vec<(f32, f32)>| {
+            row.iter()
+                .all(|&(s, e)| end + ROW_GAP < s || e + ROW_GAP < start)
+        };
+        *row = match above.iter().position(free) {
+            Some(row) => row,
+            None => {
+                above.push(Vec::new());
+                above.len() - 1
+            }
+        };
+        above[*row].push((start, end));
+    }
+    let shift = above.len() as f32 * style().row_height;
+    let row_y = |lane: usize| {
+        PAD_Y + shift + row_of[lane] as f32 * style().row_height + style().row_height / 2.
+    };
+    let above_y = |row: usize| {
+        PAD_Y + shift - (row + 1) as f32 * style().row_height + style().row_height / 2.
+    };
     let nodes: Vec<(f32, f32, f32)> = graph
         .nodes
         .iter()
@@ -431,6 +476,16 @@ pub fn layout(graph: &WorkflowGraph, axis: Axis, order: WorktreeOrder) -> Layout
                 _ => node.lane,
             };
             (xs[i].0, xs[i].1, row_y(lane))
+        })
+        .collect();
+    let stashes: Vec<StashPlace> = stash_rows
+        .into_iter()
+        .enumerate()
+        .map(|(k, (node, name))| StashPlace {
+            node,
+            name,
+            x: stash_x[k],
+            y: above_y(above_of[k]),
         })
         .collect();
     // A row of squares after a commit gets one lead, from the commit; a
@@ -518,8 +573,9 @@ pub fn layout(graph: &WorkflowGraph, axis: Axis, order: WorktreeOrder) -> Layout
         column,
         leads,
         list_x,
+        stashes,
         width: column + list + PAD_X,
-        height: PAD_Y + rows.len() as f32 * style().row_height,
+        height: PAD_Y + shift + rows.len() as f32 * style().row_height,
     }
 }
 
@@ -534,6 +590,24 @@ fn own_row_branch<'a>(
         .contains(&worktree)
         .then(|| graph.nodes[worktree].branch.as_deref())
         .flatten()
+}
+
+/// A filled diamond of `size` points, drawn as an image: GPUI turns no box.
+fn diamond(color: Hsla, size: f32) -> impl IntoElement {
+    let rgba = gpui::Rgba::from(color);
+    let svg = format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 16 16"><path d="M8 1 L15 8 L8 15 L1 8 Z" fill="rgb({},{},{})" fill-opacity="{}"/></svg>"#,
+        (rgba.r * 255.) as u8,
+        (rgba.g * 255.) as u8,
+        (rgba.b * 255.) as u8,
+        rgba.a,
+    );
+    gpui::img(std::sync::Arc::new(gpui::Image::from_bytes(
+        gpui::ImageFormat::Svg,
+        svg.into_bytes(),
+    )))
+    .flex_none()
+    .size(px(size))
 }
 
 /// Where the tags of a node start: after its worktree symbols, if any.
@@ -552,7 +626,7 @@ fn label_width(name: &str) -> f32 {
 /// How wide a node's labels are, roughly, so nothing is drawn over them.
 fn labels_width(graph: &WorkflowGraph, node: &GraphNode) -> f32 {
     let notes: f32 = node.refs.iter().map(|name| extras_width(graph, name)).sum();
-    let names = node.refs.iter().chain(&node.tags).chain(&node.stashes);
+    let names = node.refs.iter().chain(&node.tags);
     names.map(|name| label_width(name)).sum::<f32>() + notes
 }
 
@@ -651,35 +725,6 @@ fn topological(graph: &WorkflowGraph) -> Vec<(f32, f32)> {
         xs.push((start, start + length));
     }
     xs
-}
-
-/// Positions by commit time, with idle gaps longer than `cap` shortened to it.
-fn timed(graph: &WorkflowGraph, cap: i64) -> Vec<(f32, f32)> {
-    let mut points: Vec<i64> = graph
-        .nodes
-        .iter()
-        .flat_map(|node| [node.first_time, node.last_time])
-        .collect();
-    points.sort_unstable();
-    points.dedup();
-
-    let mut offsets = HashMap::new();
-    let mut offset = 0.;
-    for (i, &time) in points.iter().enumerate() {
-        if i > 0 {
-            offset += (time - points[i - 1]).min(cap) as f64;
-        }
-        offsets.insert(time, offset);
-    }
-    let width = (graph.nodes.len() as f32 * TIME_WIDTH_PER_NODE).max(MIN_TIME_WIDTH);
-    let left = left_edge(graph);
-    let x = |time: i64| left + (offsets[&time] / offset.max(1.)) as f32 * width;
-
-    graph
-        .nodes
-        .iter()
-        .map(|node| (x(node.first_time), x(node.last_time)))
-        .collect()
 }
 
 /// What the graph shows of the user's state.
@@ -790,6 +835,22 @@ pub fn render(
             },
         });
     }
+    // A stash forks up from its commit, dashed: set aside, not history.
+    for place in &layout.stashes {
+        let (parent_start, parent_end, parent_y) = layout.nodes[place.node];
+        edges.push(Edge {
+            from: point(
+                px(parent_end + bar_gap(parent_start, parent_end)),
+                px(parent_y),
+            ),
+            to: point(px(place.x - symbol() / 2.), px(place.y)),
+            merge: false,
+            dashed: true,
+            strong: shown_stash == Some(place.name.as_str()),
+            lane: usize::MAX,
+            color: theme.secondary,
+        });
+    }
     // The hovered node's branch is drawn bold on top of everything else.
     let hovered_lane = hovered.map(|i| row_lane(graph, layout, i));
     let (bold, plain): (Vec<Edge>, Vec<Edge>) = edges
@@ -898,18 +959,19 @@ pub fn render(
                     true => frame.border_2().border_color(theme.accent),
                     false => frame.border_1().border_color(color),
                 })
-                .child(
-                    div()
-                        .size(px(style().dot - 2.))
-                        .rounded(px(style().dot))
-                        .bg(color),
-                )
+                // Work not yet committed: a diamond, no shape a commit has.
+                .child(diamond(color, style().dot + 1.))
         } else if end > start {
             let selection = is_selected.then_some(picked);
             beads(i, &node.commits, end - start, color, selection, theme, cx)
         } else {
+            // A commit is an upright ellipse, as each bead of a bar is.
+            let width = match worktree {
+                true => end - start + size,
+                false => (end - start + size).min(bead_width() * size / style().dot),
+            };
             div()
-                .w(px(end - start + size))
+                .w(px(width))
                 .h(px(size))
                 .rounded(px(if worktree { 2. } else { size / 2. }))
                 .map(|shape| match (is_selected, worktree && !dirty) {
@@ -1021,7 +1083,7 @@ pub fn render(
             continue;
         }
 
-        if node.refs.is_empty() && node.tags.is_empty() && node.stashes.is_empty() {
+        if node.refs.is_empty() && node.tags.is_empty() {
             continue;
         }
         // Branches get outlined tags.
@@ -1072,47 +1134,6 @@ pub fn render(
                 .text_color(theme.git_tag_text)
                 .child(name.clone());
             with_menu(label, ("git-tag", i * 100 + k), target, cx)
-        }));
-        // Stashes made on the node: a dashed-looking chip, opened by a click.
-        branches.extend(node.stashes.iter().enumerate().filter_map(|(k, name)| {
-            let stash = graph.stashes.iter().find(|stash| stash.name == *name)?;
-            let target = Target::Stash {
-                name: name.clone(),
-                id: stash.id.clone(),
-                message: stash.message.clone(),
-            };
-            let show = name.clone();
-            // The stash in the review area stands out in the accent color.
-            let shown = shown_stash == Some(name.as_str());
-            let label = div()
-                .flex_none()
-                .h(px(TAG_HEIGHT))
-                .flex()
-                .items_center()
-                .px(px(5.))
-                .rounded(px(3.))
-                .border_1()
-                .border_color(if shown { theme.accent } else { theme.secondary })
-                .bg(if shown {
-                    theme.selection
-                } else {
-                    theme.tag_background
-                })
-                .text_color(if shown {
-                    theme.foreground
-                } else {
-                    theme.secondary
-                })
-                .italic()
-                .child(name.clone());
-            Some(
-                div()
-                    .id(("stash-label", i * 100 + k))
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, _, cx| this.show_stash(&show, cx)))
-                    .child(with_menu(label, ("stash", i * 100 + k), target, cx))
-                    .into_any_element(),
-            )
         }));
         content = content.child(
             div()
@@ -1187,6 +1208,69 @@ pub fn render(
                     }))
                     .children(tags),
             );
+    }
+
+    // Each stash: a muted diamond, set-aside changes as a worktree's are,
+    // and its label; a click shows it, a right click offers its menu.
+    for (k, place) in layout.stashes.iter().enumerate() {
+        let Some(stash) = graph.stashes.iter().find(|stash| stash.name == place.name) else {
+            continue;
+        };
+        let shown = shown_stash == Some(place.name.as_str());
+        let size = style().dot + 1.;
+        let show = place.name.clone();
+        content = content.child(
+            div()
+                .id(("stash-mark", k))
+                .absolute()
+                .left(px(place.x - size / 2.))
+                .top(px(place.y - size / 2.))
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, _, cx| this.show_stash(&show, cx)))
+                .child(diamond(
+                    if shown { theme.accent } else { theme.secondary },
+                    size,
+                )),
+        );
+        let target = Target::Stash {
+            name: place.name.clone(),
+            id: stash.id.clone(),
+            message: stash.message.clone(),
+        };
+        let label = div()
+            .flex_none()
+            .h(px(TAG_HEIGHT))
+            .flex()
+            .items_center()
+            .px(px(5.))
+            .rounded(px(3.))
+            .border_1()
+            .border_color(if shown { theme.accent } else { theme.secondary })
+            .bg(if shown {
+                theme.selection
+            } else {
+                theme.tag_background
+            })
+            .text_color(if shown {
+                theme.foreground
+            } else {
+                theme.secondary
+            })
+            .italic()
+            .child(place.name.clone());
+        let show = place.name.clone();
+        content = content.child(
+            div()
+                .id(("stash-label", k))
+                .absolute()
+                .left(px(place.x + symbol() / 2. + TAG_GAP))
+                .top(px(place.y - TAG_HEIGHT / 2.))
+                .whitespace_nowrap()
+                .text_xs()
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, _, cx| this.show_stash(&show, cx)))
+                .child(with_menu(label, ("stash", k), target, cx)),
+        );
     }
 
     // Scrolled away from the worktree list, a hovered worktree, or a commit
@@ -1647,7 +1731,7 @@ mod tests {
             node(0, &[0], 1, 1),
             node(1, &[0], 1, 2),
         ]);
-        let layout = layout(&graph, Axis::Topological, WorktreeOrder::LastCommit);
+        let layout = layout(&graph, WorktreeOrder::LastCommit);
 
         assert_eq!(layout.nodes[0].0, PAD_X);
         assert_eq!(layout.nodes[1].0, PAD_X + style().column);
@@ -1661,7 +1745,7 @@ mod tests {
     #[test]
     fn beads_grow_with_commit_count_up_to_a_cap() {
         let graph = graph(vec![node(0, &[], 4, 0), node(0, &[0], 2000, 1)]);
-        let layout = layout(&graph, Axis::Topological, WorktreeOrder::LastCommit);
+        let layout = layout(&graph, WorktreeOrder::LastCommit);
         let length = |i: usize| layout.nodes[i].1 - layout.nodes[i].0;
         assert_eq!(length(0), 3. * style().bead_spacing);
         assert_eq!(length(1), style().beads as f32 * style().bead_spacing);
@@ -1679,11 +1763,7 @@ mod tests {
             |worktree: GraphNode| graph(vec![node(0, &[], 1, 0), node(0, &[0], 1, 1), worktree]);
         // A clean one is the frame around its commit, its lead on the
         // commit's row straight to its list tag.
-        let framed = layout(
-            &graph_of(clean),
-            Axis::Topological,
-            WorktreeOrder::LastCommit,
-        );
+        let framed = layout(&graph_of(clean), WorktreeOrder::LastCommit);
         assert!(framed.detached.is_empty() && framed.framed == [2]);
         assert!(framed.list_x[2].is_some());
         assert_eq!(framed.nodes[2].2, framed.nodes[0].2, "on its commit's row");
@@ -1691,7 +1771,7 @@ mod tests {
         assert!(framed.leads[0].0 > framed.nodes[0].1);
 
         let graph = graph_of(worktree);
-        let layout = layout(&graph, Axis::Topological, WorktreeOrder::LastCommit);
+        let layout = layout(&graph, WorktreeOrder::LastCommit);
 
         assert_eq!(layout.detached, [2]);
         assert_ne!(layout.nodes[2].2, layout.nodes[0].2);
@@ -1740,8 +1820,7 @@ mod tests {
             nodes.push(worktree);
         }
         let graph = graph(nodes);
-        let row =
-            |order: WorktreeOrder, i: usize| layout(&graph, Axis::Topological, order).nodes[i].2;
+        let row = |order: WorktreeOrder, i: usize| layout(&graph, order).nodes[i].2;
 
         assert!(row(WorktreeOrder::LastCommit, 1) < row(WorktreeOrder::LastCommit, 2));
         assert!(row(WorktreeOrder::FirstCommit, 2) < row(WorktreeOrder::FirstCommit, 1));
@@ -1759,7 +1838,7 @@ mod tests {
             node(0, &[0, 1], 1, 2),
             worktree,
         ]);
-        let layout = layout(&graph, Axis::Topological, WorktreeOrder::LastCommit);
+        let layout = layout(&graph, WorktreeOrder::LastCommit);
 
         assert_eq!(layout.detached, [3]);
         assert_ne!(
@@ -1773,7 +1852,7 @@ mod tests {
         let mut tagged = node(0, &[], 1, 0);
         tagged.refs = vec!["worktree-vliw-sequential-slots".to_string()];
         let graph = graph(vec![tagged, node(0, &[0], 1, 1), node(1, &[0], 1, 2)]);
-        let layout = layout(&graph, Axis::Topological, WorktreeOrder::LastCommit);
+        let layout = layout(&graph, WorktreeOrder::LastCommit);
 
         let label_end =
             layout.nodes[0].1 + style().dot / 2. + TAG_GAP + labels_width(&graph, &graph.nodes[0]);
@@ -1884,7 +1963,7 @@ mod tests {
             nodes.push(worktree);
         }
         let graph = graph(nodes);
-        let layout = layout(&graph, Axis::Topological, WorktreeOrder::LastCommit);
+        let layout = layout(&graph, WorktreeOrder::LastCommit);
 
         assert_eq!(layout.leads.len(), 2, "a lead for each row");
         assert_ne!(layout.nodes[1].2, layout.nodes[2].2);
@@ -1912,7 +1991,7 @@ mod tests {
                         continue;
                     }
                 };
-                let layout = layout(&graph, Axis::Topological, WorktreeOrder::LastCommit);
+                let layout = layout(&graph, WorktreeOrder::LastCommit);
                 let found = overlaps(&graph, &layout);
                 println!(
                     "{repo} remotes={remotes} tags={tags}: {} overlaps",
@@ -1975,28 +2054,9 @@ mod tests {
             node(2, &[0], 1, 5),
             node(1, &[3], 1, 6),
         ]);
-        let layout = layout(&graph, Axis::Topological, WorktreeOrder::LastCommit);
+        let layout = layout(&graph, WorktreeOrder::LastCommit);
         assert_eq!(layout.nodes[5].2, layout.nodes[6].2);
         assert_ne!(layout.nodes[5].2, layout.nodes[0].2);
-    }
-
-    #[test]
-    fn compressed_time_shortens_idle_gaps() {
-        let graph = graph(vec![
-            node(0, &[], 1, 0),
-            node(0, &[0], 1, 100),
-            node(0, &[1], 1, 100_000),
-        ]);
-        let gaps = |axis| {
-            let x: Vec<f32> = layout(&graph, axis, WorktreeOrder::LastCommit)
-                .nodes
-                .iter()
-                .map(|n| n.0)
-                .collect();
-            (x[1] - x[0]) / (x[2] - x[1])
-        };
-        assert!(gaps(Axis::RealTime) < 0.01);
-        assert!((gaps(Axis::CompressedTime) - 100. / style().idle_gap() as f32).abs() < 0.001);
     }
 
     #[test]
@@ -2006,7 +2066,7 @@ mod tests {
         let mut second = node(2, &[0], 1, 0);
         second.kind = NodeKind::Uncommitted;
         let graph = graph(vec![node(0, &[], 3, 0), first, second]);
-        let layout = layout(&graph, Axis::Topological, WorktreeOrder::LastCommit);
+        let layout = layout(&graph, WorktreeOrder::LastCommit);
 
         let (_, bar_end, y) = layout.nodes[0];
         assert_eq!(layout.worktrees[0], vec![1]);
@@ -2014,5 +2074,22 @@ mod tests {
         assert!(layout.nodes[1].0 > bar_end);
         assert_eq!(layout.detached, [2]);
         assert!(layout.nodes[2].2 > y, "the next on a row of its own");
+    }
+
+    #[test]
+    fn stashes_fork_up_onto_rows_of_their_own() {
+        let mut stashed = node(0, &[], 1, 0);
+        stashed.stashes = vec!["stash@{0}".to_string()];
+        let graph = graph(vec![stashed, node(0, &[0], 1, 1)]);
+        let layout = layout(&graph, WorktreeOrder::LastCommit);
+
+        let [place] = &layout.stashes[..] else {
+            panic!("one stash")
+        };
+        let main_y = layout.nodes[0].2;
+        assert_eq!(place.node, 0);
+        assert!(place.y < main_y, "above the main row");
+        assert!(place.x > layout.nodes[0].1, "after its commit");
+        assert_eq!(layout.nodes[1].2, main_y, "history stays in its row");
     }
 }

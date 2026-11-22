@@ -46,18 +46,17 @@ Or, during development: `cargo run -p wtf -- /path/to/repo`.
 
 ## Keyboard
 
-| Keys          | Action                                                                  |
-| ------------- | ----------------------------------------------------------------------- |
-| ⌘P            | Go to a worktree, branch or commit (⌘↩ opens a worktree in another app) |
-| ⇧⌘P           | Command palette                                                         |
-| ⌘R            | Toggle the side panel                                                   |
-| ⌘J, ⌃`        | Toggle the terminal                                                     |
-| ⌃⌘1, ⌃⌘2, ⌃⌘3 | Topology, compressed time, time                                         |
-| ⌥⌘1, ⌥⌘2      | Structural or text diff                                                 |
-| ⌘T, ⌘W, ⌃⇧T   | New, close, reopen tab                                                  |
-| ⌘1…⌘9         | Switch tab                                                              |
-| ⌘O            | Open a repository                                                       |
-| ⌘,            | Settings                                                                |
+| Keys        | Action                                                                  |
+| ----------- | ----------------------------------------------------------------------- |
+| ⌘P          | Go to a worktree, branch or commit (⌘↩ opens a worktree in another app) |
+| ⇧⌘P         | Command palette                                                         |
+| ⌘R          | Toggle the side panel                                                   |
+| ⌘J, ⌃`      | Toggle the terminal                                                     |
+| ⌥⌘1, ⌥⌘2    | Structural or text diff                                                 |
+| ⌘T, ⌘W, ⌃⇧T | New, close, reopen tab                                                  |
+| ⌘1…⌘9       | Switch tab                                                              |
+| ⌘O          | Open a repository                                                       |
+| ⌘,          | Settings                                                                |
 
 ## Development
 

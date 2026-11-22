@@ -26,8 +26,6 @@ pub struct GraphStyle {
     pub hover_line: f32,
     /// How far a rail runs while changing rows.
     pub curve: f32,
-    /// Compressed time shortens idle gaps to this.
-    pub idle_minutes: u32,
 }
 
 impl Default for GraphStyle {
@@ -41,14 +39,7 @@ impl Default for GraphStyle {
             line: 2.,
             hover_line: 4.,
             curve: 20.,
-            idle_minutes: 60,
         }
-    }
-}
-
-impl GraphStyle {
-    pub fn idle_gap(&self) -> i64 {
-        i64::from(self.idle_minutes) * 60
     }
 }
 
@@ -256,7 +247,6 @@ fn parse(text: &str) -> (Settings, Appearance) {
             ("graph.line", Some(n)) => graph.line = n,
             ("graph.hover_line", Some(n)) => graph.hover_line = n,
             ("graph.curve", Some(n)) => graph.curve = n,
-            ("graph.idle_minutes", Some(n)) => graph.idle_minutes = n as u32,
             _ => {}
         }
     }
@@ -301,7 +291,6 @@ fn format(settings: &Settings, appearance: Appearance) -> String {
         format!("graph.line={}", g.line),
         format!("graph.hover_line={}", g.hover_line),
         format!("graph.curve={}", g.curve),
-        format!("graph.idle_minutes={}", g.idle_minutes),
     ]
     .into_iter()
     .filter(|line| !line.is_empty())
@@ -1063,16 +1052,6 @@ impl Render for Preferences {
                     &theme,
                     cx,
                 )))
-                .child(row("Compressed idle gap", &theme).child(self.stepper(
-                    "idle",
-                    format!("{} min", graph.idle_minutes),
-                    move |s, d| {
-                        s.graph.idle_minutes =
-                            clamp(s.graph.idle_minutes as f32 + 15. * d, 5., 1440.) as u32
-                    },
-                    &theme,
-                    cx,
-                )))
                 .child(
                     div().mt(px(8.)).child(
                         div()
@@ -1171,7 +1150,6 @@ mod tests {
             code_size: 14.,
             graph: GraphStyle {
                 dot: 12.,
-                idle_minutes: 90,
                 ..GraphStyle::default()
             },
             ..Settings::default()

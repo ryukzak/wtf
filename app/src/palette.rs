@@ -7,9 +7,9 @@ use crate::menus::{
     ToggleRemotes, ToggleTags,
 };
 use crate::repo_view::{
-    CompressedTimeView, Fetch, GoTo, OpenRepository, OpenWorktreeWith, Prune, ShowAllFiles,
-    ShowOneFile, StructuralDiff, TextDiff, TimeView, ToggleCombineCommits, ToggleConsole,
-    ToggleRefreshCommands, ToggleSidePanel, TopologyView,
+    Fetch, GoTo, OpenRepository, OpenWorktreeWith, Prune, ShowAllFiles, ShowOneFile, StashChanges,
+    StructuralDiff, TextDiff, ToggleCombineCommits, ToggleConsole, ToggleRefreshCommands,
+    ToggleSidePanel,
 };
 use crate::workspace::{CloseTab, NewTab, NextTab, PreviousTab, ReopenClosedTab};
 
@@ -19,14 +19,12 @@ pub fn commands() -> Vec<(&'static str, Box<dyn Action>)> {
         ("Go To Worktree, Branch or Commit…", Box::new(GoTo)),
         ("Prune Stale Branches and Worktrees…", Box::new(Prune)),
         ("Fetch All Remotes", Box::new(Fetch)),
+        ("Stash Changes", Box::new(StashChanges)),
         ("Open Worktree With…", Box::new(OpenWorktreeWith)),
         ("Text Diff", Box::new(TextDiff)),
         ("Structural Diff", Box::new(StructuralDiff)),
         ("All Files", Box::new(ShowAllFiles)),
         ("File by File", Box::new(ShowOneFile)),
-        ("Topology View", Box::new(TopologyView)),
-        ("Compressed Time View", Box::new(CompressedTimeView)),
-        ("Time View", Box::new(TimeView)),
         ("Toggle Combine Commits", Box::new(ToggleCombineCommits)),
         ("Toggle Side Panel", Box::new(ToggleSidePanel)),
         ("Toggle Attention Panel", Box::new(ToggleAttentionPanel)),

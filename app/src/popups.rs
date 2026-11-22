@@ -66,6 +66,8 @@ pub enum Command {
     /// A new worktree on the stash's commit, with the stash applied.
     StashWorktree,
     DropStash,
+    /// Stashes a worktree's changes, untracked files too.
+    StashChanges,
     RemoveWorktree,
     RemoveWorktreeAndBranch,
     DeleteRemote,
@@ -269,6 +271,8 @@ pub fn commands(
                 ));
             }
             items.push(item(Command::OpenWith, "Open With…".to_string()));
+            items.push(None);
+            items.push(item(Command::StashChanges, "Stash Changes".to_string()));
             if branch.as_deref() != Some(main) {
                 items.push(None);
                 if branch.is_some() {
@@ -437,6 +441,29 @@ pub fn stash_worktree(repo: &str, path: &str, branch: &str, base: &str, stash: &
         quote(path),
         quote(stash)
     )
+}
+
+/// The flags the Stash picker offers, with what each does.
+pub const STASH_FLAGS: [(&str, &str); 3] = [
+    (
+        "--include-untracked",
+        "Include untracked files in the stash",
+    ),
+    (
+        "--keep-index",
+        "Leave staged changes in the working directory",
+    ),
+    ("--staged", "Stash staged changes only"),
+];
+
+/// Stashes a worktree's changes with the flags picked.
+pub fn stash_with(worktree: &str, flags: &[&str]) -> String {
+    let mut line = format!("git -C {} stash push", quote(worktree));
+    for flag in flags {
+        line.push(' ');
+        line.push_str(flag);
+    }
+    line
 }
 
 /// Stashes a worktree's changes, untracked files too: all, or some paths.
@@ -647,6 +674,10 @@ mod tests {
             "git -C /repo branch -m fix 'fix it'"
         );
         assert_eq!(open_with("zed -n ", "/my repo/wt"), "zed -n '/my repo/wt'");
+        assert_eq!(
+            stash_with("/my repo/wt", &["--keep-index", "--include-untracked"]),
+            "git -C '/my repo/wt' stash push --keep-index --include-untracked"
+        );
         assert_eq!(
             run_in(" zed . ", "/my repo/wt"),
             "cd '/my repo/wt' && zed ."

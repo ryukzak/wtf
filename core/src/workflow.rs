@@ -255,6 +255,13 @@ pub fn build(
     }
 
     let tip_ids: HashSet<&str> = tips.iter().map(|tip| tip.id.as_str()).collect();
+    // A commit a shown stash was made on ends its run, as a tip does, so the
+    // stash's mark sits right after it.
+    let stashes = git::stashes(repo_path)?;
+    let stash_bases: HashSet<&str> = match attention.stashes {
+        true => stashes.iter().map(|stash| stash.base.as_str()).collect(),
+        false => HashSet::new(),
+    };
     let mut children = vec![0; log.len()];
     for parent in log.iter().flat_map(|(_, parents)| parents) {
         if let Some(&p) = index.get(parent.as_str()) {
@@ -282,6 +289,7 @@ pub fn build(
             && p != base_ix
             && children[p] == 1
             && !tip_ids.contains(log[p].0.id.as_str())
+            && !stash_bases.contains(log[p].0.id.as_str())
             && lane_of[p] == lane_of[i]
         {
             let node = &mut nodes[node_of[p]];
@@ -375,7 +383,6 @@ pub fn build(
         }
     }
 
-    let stashes = git::stashes(repo_path)?;
     if attention.stashes {
         for stash in &stashes {
             if let Some(&i) = index.get(stash.base.as_str()) {
@@ -1368,6 +1375,41 @@ mod tests {
         let messages = fixture.git(".", &["log", "--format=%s"]);
         assert_eq!(messages, "Three lines\nThe first commit");
         assert_eq!(fixture.git(".", &["rev-list", "--count", "HEAD"]), "2");
+    }
+
+    #[test]
+    fn a_stash_ends_the_run_it_was_made_in() {
+        let fixture = Fixture::new();
+        fixture.commit(".", "a.txt", "1\n", "c1");
+        fixture.commit(".", "a.txt", "2\n", "c2");
+        fixture.write(".", "a.txt", "wip\n");
+        fixture.git(".", &["stash", "push", "-q"]);
+        fixture.commit(".", "a.txt", "3\n", "c3");
+        fixture.commit(".", "a.txt", "4\n", "c4");
+        let stashes = Attention {
+            stashes: true,
+            ..Attention::default()
+        };
+        let runs = |graph: &WorkflowGraph| -> Vec<Vec<String>> {
+            graph
+                .nodes
+                .iter()
+                .filter(|node| node.kind != NodeKind::Uncommitted)
+                .map(|node| node.commits.iter().map(|c| c.summary.clone()).collect())
+                .collect()
+        };
+        // The stash, made on c2, sits between c2 and c3.
+        let graph = fixture.graph_with(&stashes);
+        assert_eq!(runs(&graph), [vec!["c1"], vec!["c2"], vec!["c3", "c4"]]);
+        let marked = graph
+            .nodes
+            .iter()
+            .find(|node| !node.stashes.is_empty())
+            .unwrap();
+        assert_eq!(marked.commits.last().unwrap().summary, "c2");
+        // Stashes left out of the graph split nothing.
+        let graph = fixture.graph();
+        assert_eq!(runs(&graph), [vec!["c1"], vec!["c2", "c3", "c4"]]);
     }
 
     #[test]

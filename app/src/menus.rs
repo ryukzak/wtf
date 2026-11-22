@@ -1,15 +1,15 @@
 use gpui::{Action, Menu, MenuItem, SystemMenuType, actions};
 use wtf_core::{Attention, Branch, Scope};
 
-use crate::graph_view::{Axis, WorktreeNames, WorktreeOrder};
+use crate::graph_view::{WorktreeNames, WorktreeOrder};
 use crate::workspace::{
     ClearRecent, CloseTab, CloseWindow, NewTab, NextTab, OpenPath, PreviousTab, ReopenClosedTab,
 };
 
 use crate::repo_view::{
-    CommandPalette, CompressedTimeView, Fetch, GoTo, Minimize, OpenRepository, OpenWorktreeWith,
-    Prune, ShowAllFiles, ShowOneFile, StructuralDiff, TextDiff, TimeView, ToggleCombineCommits,
-    ToggleConsole, ToggleRefreshCommands, ToggleSidePanel, TopologyView, Zoom,
+    CommandPalette, Fetch, GoTo, Minimize, OpenRepository, OpenWorktreeWith, Prune, ShowAllFiles,
+    ShowOneFile, StashChanges, StructuralDiff, TextDiff, ToggleCombineCommits, ToggleConsole,
+    ToggleRefreshCommands, ToggleSidePanel, Zoom,
 };
 
 actions!(
@@ -50,7 +50,6 @@ pub struct MenuState {
     pub combine: bool,
     pub names: WorktreeNames,
     pub order: WorktreeOrder,
-    pub axis: Axis,
     pub panel: bool,
     /// Recently opened repositories, newest first.
     pub recent: Vec<String>,
@@ -64,7 +63,6 @@ impl Default for MenuState {
             combine: true,
             names: WorktreeNames::FolderAndBranch,
             order: WorktreeOrder::LastCommit,
-            axis: Axis::Topological,
             panel: false,
             recent: Vec::new(),
         }
@@ -141,7 +139,6 @@ pub fn menus(state: &MenuState) -> Vec<Menu> {
         )
     })
     .collect();
-    let axis = |axis, label| check(state.axis == axis, label);
     let mut recent: Vec<MenuItem> = state
         .recent
         .iter()
@@ -287,13 +284,6 @@ pub fn menus(state: &MenuState) -> Vec<Menu> {
         Menu {
             name: "View".into(),
             items: vec![
-                MenuItem::action(axis(Axis::Topological, "Topology"), TopologyView),
-                MenuItem::action(
-                    axis(Axis::CompressedTime, "Compressed Time"),
-                    CompressedTimeView,
-                ),
-                MenuItem::action(axis(Axis::RealTime, "Time"), TimeView),
-                MenuItem::separator(),
                 MenuItem::action(
                     check(state.combine, "Combine Commits"),
                     ToggleCombineCommits,
@@ -311,6 +301,7 @@ pub fn menus(state: &MenuState) -> Vec<Menu> {
                 MenuItem::action("Command Palette…", CommandPalette),
                 MenuItem::action("Prune Stale Branches…", Prune),
                 MenuItem::action("Fetch All Remotes", Fetch),
+                MenuItem::action("Stash Changes", StashChanges),
                 MenuItem::action("Toggle Side Panel", ToggleSidePanel),
                 MenuItem::action(check(state.panel, "Attention Panel"), ToggleAttentionPanel),
                 MenuItem::submenu(attention_menu),

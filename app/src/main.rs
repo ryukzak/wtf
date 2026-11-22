@@ -24,8 +24,8 @@ use crate::workspace::{
 };
 
 use crate::repo_view::{
-    CommandPalette, CompressedTimeView, Fetch, GoTo, Minimize, OpenRepository, StructuralDiff,
-    TextDiff, TimeView, ToggleConsole, ToggleSidePanel, TopologyView,
+    CommandPalette, Fetch, GoTo, Minimize, OpenRepository, StructuralDiff, TextDiff, ToggleConsole,
+    ToggleSidePanel,
 };
 
 fn main() {
@@ -80,9 +80,6 @@ fn main() {
             KeyBinding::new("alt-cmd-h", HideOthers, None),
             KeyBinding::new("cmd-o", OpenRepository, None),
             KeyBinding::new("cmd-shift-n", NewWindow, None),
-            KeyBinding::new("ctrl-cmd-1", TopologyView, None),
-            KeyBinding::new("ctrl-cmd-2", CompressedTimeView, None),
-            KeyBinding::new("ctrl-cmd-3", TimeView, None),
             KeyBinding::new("cmd-j", ToggleConsole, None),
             KeyBinding::new("cmd-r", ToggleSidePanel, None),
             KeyBinding::new("cmd-p", GoTo, None),
