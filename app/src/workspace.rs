@@ -368,8 +368,15 @@ impl Workspace {
         .when(
             self.tabs[self.active].read(cx).repo_path().is_some(),
             |bar| {
-                bar.child(self.sync_button(false, theme, cx))
-                    .child(self.sync_button(true, theme, cx))
+                // Centred in the bar, whose tabs sit at its bottom.
+                bar.child(
+                    div()
+                        .h_full()
+                        .flex()
+                        .items_center()
+                        .child(self.sync_button(false, theme, cx))
+                        .child(self.sync_button(true, theme, cx)),
+                )
             },
         )
     }
@@ -416,7 +423,6 @@ impl Workspace {
         div()
             .flex()
             .items_center()
-            .mb(px(4.))
             .ml(px(6.))
             .h(px(TAB_BAR_HEIGHT - 12.))
             .rounded(px(5.))

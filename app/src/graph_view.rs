@@ -184,6 +184,8 @@ const TAG_HEIGHT: f32 = 16.;
 const TAG_GAP: f32 = 8.;
 /// How far a worktree off the middle of a lane sits from its commit.
 const DETACHED_OFFSET: f32 = 36.;
+/// Room between a tip and its worktrees when more of them fork below.
+const FORK_GAP: f32 = 22.;
 /// Room between the graph and the worktree list.
 const COLUMN_GAP: f32 = 24.;
 const SYMBOL_GAP: f32 = 6.;
@@ -246,9 +248,11 @@ pub fn layout(graph: &WorkflowGraph, axis: Axis, order: WorktreeOrder) -> Layout
             continue;
         }
         let parent = node.parents[0];
-        if !followed[parent] {
+        // At a tip, the first worktree follows the commit on its row; any
+        // more get rows of their own, so no two sit in one row.
+        if !followed[parent] && worktrees[parent].is_empty() {
             worktrees[parent].push(i);
-        } else if (node.added, node.removed) == (0, 0) {
+        } else if followed[parent] && (node.added, node.removed) == (0, 0) {
             xs[i] = xs[parent];
             framed.push(i);
         } else {
@@ -257,14 +261,26 @@ pub fn layout(graph: &WorkflowGraph, axis: Axis, order: WorktreeOrder) -> Layout
             detached.push(i);
         }
     }
+    // Worktrees forking from a tip stand one under the other, past room
+    // for the fork's curve.
+    let forks = |parent: usize| {
+        !followed[parent]
+            && detached
+                .iter()
+                .any(|&w| graph.nodes[w].parents.first() == Some(&parent))
+    };
     for (parent, group) in worktrees.iter().enumerate() {
+        let gap = if forks(parent) { FORK_GAP } else { SYMBOL_GAP };
         for (k, &worktree) in group.iter().enumerate() {
-            let x = xs[parent].1
-                + style().dot / 2.
-                + SYMBOL_GAP
-                + symbol() / 2.
-                + k as f32 * symbol_step();
+            let x =
+                xs[parent].1 + style().dot / 2. + gap + symbol() / 2. + k as f32 * symbol_step();
             xs[worktree] = (x, x);
+        }
+    }
+    for &worktree in &detached {
+        let parent = graph.nodes[worktree].parents[0];
+        if let Some(&first) = worktrees[parent].first() {
+            xs[worktree] = xs[first];
         }
     }
 
@@ -464,10 +480,15 @@ pub fn layout(graph: &WorkflowGraph, axis: Axis, order: WorktreeOrder) -> Layout
         .map(|parent| {
             tags_start(parent, &xs, &worktrees) + labels_width(graph, &graph.nodes[parent])
         });
+    let own_labels_end = detached.iter().filter_map(|&w| {
+        let name = own_row_branch(graph, &detached, w)?;
+        Some(xs[w].1 + symbol() / 2. + TAG_GAP + label_width(name) + extras_width(graph, name))
+    });
     let right = spans
         .iter()
         .flatten()
         .map(|span| span.1)
+        .chain(own_labels_end)
         .filter(|end| end.is_finite())
         .chain(xs.iter().map(|x| x.1 + symbol()))
         .chain(leads.iter().map(|lead| lead.0))
@@ -500,6 +521,19 @@ pub fn layout(graph: &WorkflowGraph, axis: Axis, order: WorktreeOrder) -> Layout
         width: column + list + PAD_X,
         height: PAD_Y + rows.len() as f32 * style().row_height,
     }
+}
+
+/// The branch a worktree on a row of its own has checked out: its label
+/// sits on that row, not on its commit's.
+fn own_row_branch<'a>(
+    graph: &'a WorkflowGraph,
+    detached: &[usize],
+    worktree: usize,
+) -> Option<&'a str> {
+    detached
+        .contains(&worktree)
+        .then(|| graph.nodes[worktree].branch.as_deref())
+        .flatten()
 }
 
 /// Where the tags of a node start: after its worktree symbols, if any.
@@ -735,6 +769,7 @@ pub fn render(
     // Dashed lines lead from the worktrees to their names in the list.
     for (from, y, group) in &layout.leads {
         let first = group[0];
+        let picked = group.iter().any(|w| selected.contains(w));
         edges.push(Edge {
             from: point(px(*from), px(*y)),
             to: point(px(layout.column - 6.), px(*y)),
@@ -748,7 +783,11 @@ pub fn render(
                     || hovered.is_some() && hovered == graph.nodes[w].parents.first().copied()
             }),
             lane: row_lane(graph, layout, first),
-            color: color(&graph.nodes[first]),
+            // A selected worktree's lead takes the selection's color.
+            color: match picked {
+                true => theme.accent,
+                false => color(&graph.nodes[first]),
+            },
         });
     }
     // The hovered node's branch is drawn bold on top of everything else.
@@ -793,7 +832,10 @@ pub fn render(
                     .h(px(style().dot + 2. * pad))
                     .rounded(px(4.))
                     .map(|frame| match is_selected {
-                        true => frame.border_2().border_color(theme.accent),
+                        true => frame
+                            .border_2()
+                            .border_color(theme.accent)
+                            .bg(theme.accent.opacity(0.2)),
                         false => frame.border_1().border_color(color),
                     }),
             );
@@ -897,6 +939,20 @@ pub fn render(
                     |shape| shape.opacity(0.3),
                 )
         };
+        // A selected commit or bar is underlined in the accent: a border on
+        // the dots would vanish on lanes of a like colour.
+        if is_selected && !worktree {
+            content = content.child(
+                div()
+                    .absolute()
+                    .left(px(start - style().dot / 2.))
+                    .top(px(y + style().dot / 2. + 3.))
+                    .w(px(end - start + style().dot))
+                    .h(px(2.5))
+                    .rounded(px(1.5))
+                    .bg(theme.accent),
+            );
+        }
         content =
             content.child(
                 div()
@@ -946,6 +1002,22 @@ pub fn render(
                     .child(shape),
             );
         if worktree {
+            // A worktree on a row of its own carries its branch's label there.
+            if let Some(name) = own_row_branch(graph, &layout.detached, i) {
+                let target = label_target(graph, name, String::new());
+                let (note, badge) = (stale_note(graph, name), sync_badge(graph, name));
+                let tag = branch_tag(name, note, badge, color, true, theme);
+                content = content.child(
+                    div()
+                        .absolute()
+                        .left(px(end + symbol() / 2. + TAG_GAP))
+                        .top(px(y - TAG_HEIGHT / 2.))
+                        .flex()
+                        .whitespace_nowrap()
+                        .text_xs()
+                        .child(menu_label(tag, name, target, i, true, cx)),
+                );
+            }
             continue;
         }
 
@@ -953,9 +1025,18 @@ pub fn render(
             continue;
         }
         // Branches get outlined tags.
+        // Branches whose worktree has a row of its own are labelled there.
+        let elsewhere: Vec<&str> = graph
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| w.kind == NodeKind::Uncommitted && w.parents.first() == Some(&i))
+            .filter_map(|(w, _)| own_row_branch(graph, &layout.detached, w))
+            .collect();
         let mut branches: Vec<AnyElement> = node
             .refs
             .iter()
+            .filter(|name| !elsewhere.contains(&name.as_str()))
             .map(|name| {
                 let commit = match &node.tip {
                     Revision::Commit(id) => id.clone(),
@@ -1087,11 +1168,16 @@ pub fn render(
                     .whitespace_nowrap()
                     .text_xs()
                     .cursor_pointer()
+                    // A selected worktree stands out from hover: a solid
+                    // accent ring around its tags.
                     .when(selected.contains(&w), |tags| {
-                        tags.rounded(px(4.))
-                            .bg(theme.selection)
-                            .border_1()
+                        tags.rounded(px(5.))
+                            .p(px(2.))
+                            .m(px(-2.))
+                            .bg(theme.accent.opacity(0.3))
+                            .border_2()
                             .border_color(theme.accent)
+                            .shadow_md()
                     })
                     .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                         this.click_node(w, event.modifiers().platform, cx)
@@ -1356,8 +1442,7 @@ fn beads(
                     // A picked commit stands taller in its own colour.
                     (_, Some(true)) => bead.top(px(-2.)).h(px(style().dot + 4.)),
                     (_, Some(false)) => bead.opacity(0.3),
-                    (Some(_), None) => bead.border_1().border_color(theme.accent),
-                    (None, _) => bead,
+                    (Some(_), None) | (None, _) => bead,
                 }),
         );
     }
@@ -1785,7 +1870,7 @@ mod tests {
     }
 
     #[test]
-    fn worktrees_on_one_commit_share_a_lead_and_sit_side_by_side_in_the_list() {
+    fn worktrees_on_one_commit_get_a_row_and_a_lead_each() {
         let mut tip = node(0, &[], 1, 0);
         tip.refs = vec!["feature-with-a-long-name".to_string()];
         tip.tags = vec!["v1.0".to_string()];
@@ -1801,8 +1886,8 @@ mod tests {
         let graph = graph(nodes);
         let layout = layout(&graph, Axis::Topological, WorktreeOrder::LastCommit);
 
-        assert_eq!(layout.leads.len(), 1, "one lead for the row");
-        assert!(layout.list_x[2] > layout.list_x[1]);
+        assert_eq!(layout.leads.len(), 2, "a lead for each row");
+        assert_ne!(layout.nodes[1].2, layout.nodes[2].2);
         assert_eq!(overlaps(&graph, &layout), Vec::<String>::new());
     }
 
@@ -1915,7 +2000,7 @@ mod tests {
     }
 
     #[test]
-    fn worktrees_sit_after_their_commit_in_its_row() {
+    fn the_first_worktree_sits_after_its_commit_and_the_next_one_below() {
         let mut first = node(1, &[0], 1, 0);
         first.kind = NodeKind::Uncommitted;
         let mut second = node(2, &[0], 1, 0);
@@ -1924,10 +2009,10 @@ mod tests {
         let layout = layout(&graph, Axis::Topological, WorktreeOrder::LastCommit);
 
         let (_, bar_end, y) = layout.nodes[0];
-        assert_eq!(layout.worktrees[0], vec![1, 2]);
-        assert_eq!(layout.nodes[1].2, y, "no rows of their own");
-        assert_eq!(layout.nodes[2].2, y);
+        assert_eq!(layout.worktrees[0], vec![1]);
+        assert_eq!(layout.nodes[1].2, y, "the first on the commit's row");
         assert!(layout.nodes[1].0 > bar_end);
-        assert_eq!(layout.nodes[2].0 - layout.nodes[1].0, symbol_step());
+        assert_eq!(layout.detached, [2]);
+        assert!(layout.nodes[2].2 > y, "the next on a row of its own");
     }
 }

@@ -22,7 +22,9 @@ short bullets starting with '- '. No preamble.";
 pub const MESSAGE_PROMPT: &str = "You write a git commit message for the staged changes \
 below. Use only facts in the input. Reply with a subject line of at most 72 characters in \
 the imperative mood, without a trailing period. If the changes need it, add a blank line \
-and then 1 to 4 short bullets starting with '- '. No preamble, no quotes.";
+and then 1 to 4 short bullets starting with '- ', each a plain sentence about what changed. \
+Plain text only: no Markdown, no code blocks, no backticks, no code or constants copied from \
+the diff. No preamble, no quotes.";
 
 /// A commit message for staged changes, from their files and diff.
 pub fn commit_message(changes: &str, prompt: &str) -> Result<String, CoreError> {
@@ -110,7 +112,20 @@ fn respond(instructions: &str, input: &str) -> Result<String, CoreError> {
 
 /// The first line as the header, then each bullet.
 fn parse(text: &str) -> Option<Summary> {
-    let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+    // Code the model quotes despite being told not to is left out, fences
+    // and all, even when it marks their lines as bullets.
+    let mut fenced = false;
+    let mut lines = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            let fence = line
+                .trim_start_matches(['-', '•', '*', ' '])
+                .starts_with("```");
+            fenced ^= fence;
+            !fence && !fenced
+        })
+        .filter(|line| !line.is_empty());
     let header = lines
         .next()?
         .trim_start_matches(['-', '•', '*', ' '])
@@ -143,6 +158,19 @@ fn strip_ansi(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn leaves_out_quoted_code() {
+        let text = "Update graph constants\n\n- ```\n- const FORK_GAP: f32 = 22.;\n- ```\n\
+                    - Stack forked worktrees\n";
+        assert_eq!(
+            parse(text),
+            Some(Summary {
+                header: "Update graph constants".to_string(),
+                details: vec!["Stack forked worktrees".to_string()],
+            })
+        );
+    }
 
     #[test]
     fn reads_a_header_and_bullets() {

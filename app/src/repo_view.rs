@@ -64,7 +64,8 @@ const ATTENTION_PANEL_WIDTH: f32 = 240.;
 const MIN_SIDEBAR_WIDTH: f32 = 180.;
 const MAX_SIDEBAR_WIDTH: f32 = 500.;
 /// The closed sidebar: a strip holding its toggle.
-const SIDEBAR_STRIP_WIDTH: f32 = 26.;
+/// Room for the strip's boxes and a margin on either side of them.
+const SIDEBAR_STRIP_WIDTH: f32 = 34.;
 /// The all-files view falls back to one file at a time above this.
 const MAX_STACKED_FILES: usize = 100;
 /// The commit header shows this much of a message body.
@@ -3175,9 +3176,11 @@ impl RepoView {
             .nodes
             .iter()
             .enumerate()
+            // Only worktrees with changes: a clean one has nothing to show.
             .filter(|(_, worktree)| {
                 worktree.kind == wtf_core::NodeKind::Uncommitted
                     && worktree.parents.first() == Some(&selected)
+                    && (worktree.added, worktree.removed) != (0, 0)
             })
             .map(|(w, worktree)| {
                 let label = graph_view::worktree_label(worktree, self.worktree_names);
@@ -4061,35 +4064,25 @@ impl RepoView {
     /// The strip at the window's right edge, the same with a panel open or
     /// not: the arrow, the panels by name, then the diff view switches.
     fn side_strip(&self, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> AnyElement {
-        // Each panel: one boxed button holding its arrow and its name.
+        // Each panel: a box like the mode groups below, of one button
+        // holding its arrow and its name.
         let tab = |panel: SidePanel, label: &'static str| {
             let open = self.side_panel == Some(panel);
-            div()
-                .id(label)
-                .flex()
-                .flex_col()
-                .items_center()
-                .gap(px(2.))
-                .mt(px(4.))
-                .w(px(20.))
-                .pt(px(5.))
-                .pb(px(3.))
-                .rounded(px(4.))
-                .border_1()
-                .border_color(theme.separator)
-                .cursor_pointer()
-                .hover(|button| button.bg(theme.selection))
-                .when(open, |button| button.bg(theme.selection))
-                .on_click(cx.listener(move |this, _, _, cx| this.toggle_panel(panel, cx)))
-                .child(side_chevron(!open, theme.secondary, 10.))
-                .child(vertical_label(label, theme.foreground, window))
+            strip_group(theme).child(
+                strip_option(label, open, theme)
+                    .gap(px(2.))
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_panel(panel, cx)))
+                    .child(side_chevron(!open, theme.secondary, 10.))
+                    .child(vertical_label(label, theme.foreground, window)),
+            )
         };
         div()
             .flex()
             .flex_col()
             .flex_none()
             .items_center()
-            .gap(px(4.))
+            .gap(px(STRIP_GAP))
+            .pt(px(STRIP_GAP))
             .w(px(SIDEBAR_STRIP_WIDTH))
             .h_full()
             .border_l_1()
@@ -4097,7 +4090,7 @@ impl RepoView {
             .bg(theme.graph_background)
             .child(tab(SidePanel::Attention, "Attention"))
             .child(tab(SidePanel::Files, "Files"))
-            .child(div().w(px(16.)).h(px(1.)).my(px(8.)).bg(theme.separator))
+            .child(div().w(px(16.)).h(px(1.)).bg(theme.separator))
             .child(self.view_toggles(theme, window, cx))
             .into_any_element()
     }
@@ -5626,27 +5619,13 @@ impl RepoView {
     /// down the strip.
     fn view_toggles(&self, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> gpui::Div {
         let option = |label: &'static str, selected: bool| {
-            div()
-                .id(label)
-                .flex()
-                .justify_center()
-                .px(px(2.))
-                .py(px(6.))
-                .rounded(px(4.))
-                .cursor_pointer()
-                .when(selected, |option| option.bg(theme.selection))
-                .child(vertical_label(label, theme.foreground, window))
+            strip_option(label, selected, theme).child(vertical_label(
+                label,
+                theme.foreground,
+                window,
+            ))
         };
-        let group = || {
-            div()
-                .flex()
-                .flex_col()
-                .items_center()
-                .p(px(2.))
-                .rounded(px(6.))
-                .border_1()
-                .border_color(theme.separator)
-        };
+        let group = || strip_group(theme);
         let layout = |label: &'static str, layout: ChangesLayout| {
             option(label, self.changes_layout == layout)
                 .on_click(cx.listener(move |this, _, _, cx| this.set_changes_layout(layout, cx)))
@@ -5659,7 +5638,7 @@ impl RepoView {
             .flex()
             .flex_col()
             .items_center()
-            .gap(px(8.))
+            .gap(px(STRIP_GAP))
             .child(
                 group()
                     .child(layout("File by file", ChangesLayout::OneFile))
@@ -7088,6 +7067,37 @@ impl Render for RepoView {
             .children(self.goto_view(&theme, window, cx))
             .children(self.prune_view(&theme, window, cx))
     }
+}
+
+/// Space between the side strip's boxes, and above the first.
+const STRIP_GAP: f32 = 6.;
+
+/// A box of the side strip: a panel's button, or a group of modes.
+fn strip_group(theme: &Theme) -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap(px(2.))
+        .p(px(2.))
+        .rounded(px(6.))
+        .border_1()
+        .border_color(theme.separator)
+}
+
+/// A button in a box of the side strip, filled while on.
+fn strip_option(id: &'static str, on: bool, theme: &Theme) -> Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex()
+        .flex_col()
+        .items_center()
+        .px(px(2.))
+        .py(px(6.))
+        .rounded(px(4.))
+        .cursor_pointer()
+        .hover(|option| option.bg(theme.selection.opacity(0.5)))
+        .when(on, |option| option.bg(theme.selection))
 }
 
 /// Text turned to read downwards, for the sidebar strip. GPUI draws text
