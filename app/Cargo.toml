@@ -1,0 +1,18 @@
+[package]
+name = "wtf"
+version = "0.0.1"
+edition = "2024"
+license = "BSD-3-Clause"
+repository = "https://github.com/ryukzak/wtf"
+
+[dependencies]
+wtf_core = { path = "../core" }
+# runtime_shaders compiles the Metal shaders at startup, so the full Xcode is not needed.
+alacritty_terminal = "0.26"
+futures = "0.3"
+gpui = { version = "0.2", default-features = false, features = ["font-kit", "runtime_shaders"] }
+# To stop the window moving while a tab is dragged in the title bar.
+objc = "0.2"
+raw-window-handle = "0.6"
+# Code colors in diffs, from Sublime Text's grammars and themes; pure Rust.
+syntect = { version = "5", default-features = false, features = ["default-syntaxes", "default-themes", "parsing", "regex-fancy"] }
