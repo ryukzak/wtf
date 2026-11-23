@@ -305,6 +305,7 @@ impl RepoView {
                     div()
                         .text_color(theme.secondary)
                         .font_family(preferences::code_font())
+                        .font_weight(preferences::code_weight())
                         .text_xs()
                         .child(file.status.clone()),
                 )
@@ -389,6 +390,7 @@ impl RepoView {
                                         div()
                                             .w(px(10.))
                                             .font_family(preferences::code_font())
+                                            .font_weight(preferences::code_weight())
                                             .text_xs()
                                             .text_color(theme.secondary)
                                             .child(file.status.clone()),

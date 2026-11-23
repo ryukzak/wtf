@@ -395,28 +395,6 @@ impl RepoView {
                                 )
                             })
                             .when(!staged, |buttons| {
-                                let stash_path = path.clone();
-                                buttons.child(
-                                    button(
-                                        SharedString::from(format!("stash-{index}")),
-                                        "Stash File",
-                                    )
-                                    .on_click(cx.listener(
-                                        move |this, _, window, cx| {
-                                            cx.stop_propagation();
-                                            if let Some(worktree) = this.staging_worktree() {
-                                                let line = popups::stash_push(
-                                                    &worktree,
-                                                    "",
-                                                    std::slice::from_ref(&stash_path),
-                                                );
-                                                this.run_in_terminal(line, window, cx);
-                                            }
-                                        },
-                                    )),
-                                )
-                            })
-                            .when(!staged, |buttons| {
                                 buttons.child(
                                     button(
                                         SharedString::from(format!("discard-{index}")),

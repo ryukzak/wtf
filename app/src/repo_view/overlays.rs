@@ -1073,6 +1073,7 @@ impl RepoView {
                     .border_1()
                     .border_color(theme.accent)
                     .font_family(preferences::code_font())
+                    .font_weight(preferences::code_weight())
                     .whitespace_nowrap()
                     .overflow_hidden()
                     .child(prompt.input.clone())
@@ -1198,7 +1199,12 @@ impl RepoView {
                             .text_color(theme.accent)
                             .child(if self.stash_flags[k] { "✓" } else { "" }),
                     )
-                    .child(div().font_family(preferences::code_font()).child(*flag))
+                    .child(
+                        div()
+                            .font_family(preferences::code_font())
+                            .font_weight(preferences::code_weight())
+                            .child(*flag),
+                    )
                     .child(div().flex_1())
                     .child(
                         div()

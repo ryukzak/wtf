@@ -17,6 +17,8 @@ actions!(
     [
         Quit,
         About,
+        CheckTools,
+        InstallCommand,
         OpenSettings,
         Hide,
         HideOthers,
@@ -251,6 +253,8 @@ pub fn menus(state: &MenuState) -> Vec<Menu> {
             name: "wtf".into(),
             items: vec![
                 MenuItem::action("About wtf", About),
+                MenuItem::action("Check External Tools…", CheckTools),
+                MenuItem::action("Install 'wtf' Command…", InstallCommand),
                 MenuItem::separator(),
                 MenuItem::action("Settings…", OpenSettings),
                 MenuItem::separator(),

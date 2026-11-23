@@ -4,10 +4,10 @@ use wtf_core::{DiffRow, DiffSide};
 use crate::syntax::{Colors, Spans};
 use crate::theme::Theme;
 
-/// Diff rows are 1.6 code lines tall, room enough for the larger text of
-/// section and file headers, which share their height.
+/// Diff rows are a line of code tall, as Settings set it; section and file
+/// headers share their height.
 pub fn row_height() -> f32 {
-    (crate::preferences::code_size() * 1.6).round()
+    crate::preferences::code_line_height()
 }
 
 /// Room for line numbers: four digits of code.

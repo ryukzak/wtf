@@ -34,7 +34,7 @@ fn font_size() -> f32 {
 }
 
 fn line_height() -> f32 {
-    (font_size() * 1.34).round()
+    crate::preferences::terminal_line_height()
 }
 const PADDING: f32 = 8.;
 const SCROLLBACK: usize = 10_000;
@@ -710,6 +710,7 @@ impl Render for TerminalView {
             .p(px(PADDING))
             .overflow_hidden()
             .font_family(crate::preferences::code_font())
+            .font_weight(crate::preferences::code_weight())
             .text_size(px(font_size()))
             .line_height(px(line_height()))
             .text_color(palette.foreground);

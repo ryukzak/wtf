@@ -1,4 +1,5 @@
 mod about;
+mod cli;
 mod console_view;
 mod diff_view;
 mod goto;
@@ -14,11 +15,14 @@ mod sync;
 mod syntax;
 mod terminal_view;
 mod theme;
+mod tools;
 mod workspace;
 
 use gpui::{App, Application, KeyBinding};
 
-use crate::menus::{About, Hide, HideOthers, NewWindow, OpenSettings, Quit, ShowAll};
+use crate::menus::{
+    About, CheckTools, Hide, HideOthers, InstallCommand, NewWindow, OpenSettings, Quit, ShowAll,
+};
 use crate::workspace::{
     CloseTab, CloseWindow, NewTab, NextTab, PreviousTab, ReopenClosedTab, SelectTab, open_window,
 };
@@ -53,21 +57,14 @@ fn main() {
         })
         .detach();
         preferences::load();
-        // The first run finds out whether this Mac can summarize commits.
-        if !preferences::summaries_decided() {
-            let check = cx
-                .background_executor()
-                .spawn(async { wtf_core::summaries_available() });
-            cx.spawn(async move |cx| {
-                let available = check.await;
-                cx.update(|cx| preferences::decide_summaries(available, cx))
-                    .ok();
-            })
-            .detach();
-        }
+        // Missing or broken external programs are reported, and the first
+        // run finds out whether this Mac can summarize commits.
+        tools::check_at_launch(cx);
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.on_action(|_: &OpenSettings, cx| preferences::open(cx));
         cx.on_action(|_: &About, cx| about::open(cx));
+        cx.on_action(|_: &CheckTools, cx| tools::open(cx));
+        cx.on_action(|_: &InstallCommand, cx| cli::install(cx));
         cx.on_action(|_: &Hide, cx| cx.hide());
         cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
         cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());

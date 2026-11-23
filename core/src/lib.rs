@@ -5,6 +5,7 @@ mod git;
 mod patch;
 mod summary;
 mod text;
+mod tools;
 
 pub use text::carry_line;
 mod workflow;
@@ -18,6 +19,7 @@ pub use git::{
     changed_files, commit, discard, discard_lines, head_message, push, range_commits, reword,
     stage, stage_lines, stash_files, unstage, worktree_status,
 };
+pub use tools::{ToolCheck, check_tools};
 pub use workflow::{Branch, GraphNode, NodeKind, WorkflowGraph};
 
 #[derive(Debug, thiserror::Error)]
@@ -124,11 +126,6 @@ pub fn workflow_graph(
 }
 
 pub use summary::{MESSAGE_PROMPT, SUMMARY_PROMPT, Summary};
-
-/// Whether Apple's on-device model can summarize commits on this Mac.
-pub fn summaries_available() -> bool {
-    summary::available()
-}
 
 /// A commit message for what a worktree has staged, written by the model
 /// from the staged files and a short diff of them.

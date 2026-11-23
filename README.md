@@ -10,12 +10,14 @@ The key purpose of the tool: understand what our agents did and why, change dire
 
 ## Run
 
-macOS only, needs Rust and Git:
+macOS only, needs Rust and Git. Structural diffs need [difftastic](https://difftastic.wilfred.me.uk) (`brew install difftastic`):
 
     scripts/build.sh
     open build/wtf.app --args /path/to/repo
 
 Or, during development: `cargo run -p wtf -- /path/to/repo`.
+
+To open repositories from a terminal, choose **wtf › Install 'wtf' Command…**; then `wtf .` opens the one you are in. It goes in `~/.local/bin`, `~/bin` or `~/.bin` when your shell's PATH has one, else in `/usr/local/bin`, with your password.
 
 ## Interface
 
@@ -37,11 +39,9 @@ Or, during development: `cargo run -p wtf -- /path/to/repo`.
 │                      │                                 │                    │ l │
 │                      │                                 │                    │ e │
 ├──────────────────────┴─────────────────────────────────┤                    │ s │
-│ Terminal  ⌘J                                           │                    │   │
-│                                                        │                    │   │
-├────────────────────────────────────────────────────────┴────────────────────┴───┤
-│ Status bar: terminal toggle, last Git command                                   │
-└─────────────────────────────────────────────────────────────────────────────────┘
+│ Terminal  ⌘J                                           │                    │ T │
+│ the app's Git commands, too                            │                    │ e │
+└────────────────────────────────────────────────────────┴────────────────────┴───┘
 ```
 
 ## Keyboard

@@ -47,19 +47,24 @@ pub struct Summary {
     pub details: Vec<String>,
 }
 
-/// Whether `fm` is here and its on-device model can answer.
-pub fn available() -> bool {
-    Command::new("fm")
+/// What `fm models` says, on either stream and without colors. It exits
+/// with an error when any model is missing, as the cloud one often is, so
+/// its status says little.
+pub(crate) fn models() -> std::io::Result<String> {
+    let output = Command::new("fm")
         .arg("models")
         .env("NO_COLOR", "1")
-        .output()
-        // It exits with an error when any model is missing, as the cloud one
-        // often is; what counts is the on-device one's tick.
-        .is_ok_and(|output| {
-            strip_ansi(&String::from_utf8_lossy(&output.stdout))
-                .lines()
-                .any(|line| line.trim_start().starts_with("✓ system"))
-        })
+        .output()?;
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    Ok(strip_ansi(&text))
+}
+
+/// Whether `fm models` ticks the on-device model.
+pub(crate) fn system_model_ready(models: &str) -> bool {
+    models
+        .lines()
+        .any(|line| line.trim_start().starts_with("✓ system"))
 }
 
 /// Summarizes commits, newest first, with the files their changes touch.

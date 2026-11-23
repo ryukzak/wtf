@@ -12,8 +12,7 @@ use gpui::{
     canvas, deferred, div, point, prelude::*, pulsating_between, px, rems, uniform_list,
 };
 use wtf_core::{
-    Attention, ChangedFile, Commit, CoreError, DiffMode, FileDiff, LogEntry, Revision, Scope,
-    WorkflowGraph,
+    Attention, ChangedFile, Commit, CoreError, DiffMode, FileDiff, Revision, Scope, WorkflowGraph,
 };
 
 use crate::console_view;
@@ -471,10 +470,6 @@ pub struct RepoView {
 
     console_open: bool,
     hide_refresh: bool,
-    /// The last command logged here, and the last not run by a refresh,
-    /// for the status bar.
-    last_entry: Option<LogEntry>,
-    last_own_entry: Option<LogEntry>,
     log_seq: u64,
     /// The directory of the last command printed in the terminal.
     announced_dir: Option<String>,
@@ -498,9 +493,8 @@ pub struct RepoView {
     /// The remote picked in the Push menu; `None` for where the branch
     /// tracks.
     push_remote: Option<String>,
-    /// When the remotes were last fetched, and why the last fetch failed.
+    /// When the remotes were last fetched.
     fetched_at: Option<i64>,
-    fetch_error: Option<String>,
     commits_task: Option<Task<()>>,
     files_task: Option<Task<()>>,
     diff_task: Option<Task<()>>,
@@ -614,8 +608,6 @@ impl RepoView {
             error_message: None,
             console_open: false,
             hide_refresh: true,
-            last_entry: None,
-            last_own_entry: None,
             log_seq: 0,
             announced_dir: None,
             dock_height: DOCK_HEIGHT,
@@ -630,7 +622,6 @@ impl RepoView {
             sync_task: None,
             push_remote: None,
             fetched_at: None,
-            fetch_error: None,
             commits_task: None,
             files_task: None,
             diff_task: None,
@@ -749,11 +740,12 @@ impl RepoView {
             .background_executor()
             .spawn(async move { wtf_core::fetch(&path, prune, background) });
         self.fetch_task = Some(cx.spawn(async move |this, cx| {
-            let result = load.await;
+            // A failed fetch is only logged, in red in the terminal: it is
+            // tried again soon, and the user did not ask for it.
+            load.await.ok();
             this.update(cx, |this, cx| {
                 this.fetch_task = None;
                 this.fetched_at = Some(now_seconds());
-                this.fetch_error = result.err().map(message);
                 this.start_refresh(cx);
                 cx.notify();
             })
@@ -787,9 +779,12 @@ impl RepoView {
                 this.sync_task = None;
                 if fetch {
                     this.fetched_at = Some(now_seconds());
-                    this.fetch_error = result.err().map(message);
                 }
-                // A failure shows in red in the status bar, as Git said it.
+                // The user asked for it, so a failure shows in the review
+                // area, as Git said it.
+                if let Err(error) = result {
+                    this.error_message = Some(message(error));
+                }
                 this.start_refresh(cx);
                 cx.notify();
             })
@@ -933,32 +928,6 @@ impl RepoView {
             },
             cx,
         );
-    }
-
-    fn attention_summary(&self) -> String {
-        let attention = &self.attention;
-        let mut parts = vec![match (attention.scope, attention.window_days) {
-            (Scope::Worktrees, _) => "worktrees only".to_string(),
-            (Scope::Branches, Some(1)) => "last day".to_string(),
-            (Scope::Branches, Some(days)) => format!("last {days} days"),
-            (Scope::Branches, None) => "all time".to_string(),
-        }];
-        if !attention.authors.is_empty() {
-            parts.push(attention.authors.join(", "));
-        }
-        if !attention.pinned.is_empty() {
-            parts.push(format!("{} pinned", attention.pinned.len()));
-        }
-        if !attention.hidden.is_empty() {
-            parts.push(format!("{} hidden", attention.hidden.len()));
-        }
-        let branches = &self.graph.branches;
-        let shown = branches.iter().filter(|branch| branch.shown).count();
-        format!(
-            "Attention: {shown} of {} branches · {}",
-            branches.len(),
-            parts.join(" · ")
-        )
     }
 
     /// Like pulling a list down to refresh: scrolling stops at the graph's
@@ -1579,12 +1548,6 @@ impl RepoView {
         // The log is shared by all windows; this one shows its repository's.
         new.retain(|entry| self.runs_here(&entry.dir));
         let lines = console_view::lines(&new, self.hide_refresh, &mut self.announced_dir);
-        if let Some(own) = new.iter().rev().find(|entry| !entry.refresh) {
-            self.last_own_entry = Some(own.clone());
-        }
-        if let Some(last) = new.pop() {
-            self.last_entry = Some(last);
-        }
         if let Some(terminal) = &self.terminal {
             terminal.update(cx, |terminal, cx| terminal.announce(lines, cx));
         }
@@ -1697,96 +1660,6 @@ impl RepoView {
             .child(div().flex_1().min_h_0().children(self.terminal.clone()))
     }
 
-    fn status_bar(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let last = match self.hide_refresh {
-            true => self.last_own_entry.as_ref(),
-            false => self.last_entry.as_ref(),
-        };
-        div()
-            .id("status")
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap(px(10.))
-            .px(px(12.))
-            .h(px(24.))
-            .border_t_1()
-            .border_color(theme.separator)
-            .text_xs()
-            // The terminal's button, boxed like the side panels' ones, with
-            // an arrow to where it goes.
-            .child(
-                div()
-                    .id("terminal-toggle")
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .gap(px(4.))
-                    .px(px(6.))
-                    .h(px(18.))
-                    .rounded(px(4.))
-                    .border_1()
-                    .border_color(theme.separator)
-                    .cursor_pointer()
-                    .hover(|button| button.bg(theme.selection))
-                    .when(self.console_open, |button| button.bg(theme.selection))
-                    .on_click(cx.listener(|this, _, window, cx| this.toggle_console(window, cx)))
-                    .child(
-                        div()
-                            .text_color(theme.secondary)
-                            .child(if self.console_open { "▾" } else { "▴" }),
-                    )
-                    .child("Terminal"),
-            )
-            .children(last.map(|entry| {
-                div()
-                    .truncate()
-                    .font_family(preferences::code_font())
-                    .text_color(if entry.ok {
-                        theme.secondary
-                    } else {
-                        theme.error
-                    })
-                    .child(entry.command.clone())
-            }))
-            .child(div().flex_1())
-            .when(self.repo_path.is_some(), |bar| {
-                bar.child(
-                    div()
-                        .flex_none()
-                        .text_color(theme.secondary)
-                        .child(self.attention_summary()),
-                )
-                .child(self.fetch_status(theme, cx))
-            })
-    }
-
-    /// The last fetch, `⟳ 3m`, or a failed one in red; a click fetches now.
-    fn fetch_status(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let (text, color) = match (&self.fetch_task, &self.fetch_error, self.fetched_at) {
-            (Some(_), _, _) => ("⟳ fetching…".to_string(), theme.secondary),
-            (None, Some(_), _) => ("⟳ fetch failed".to_string(), theme.error),
-            (None, None, Some(at)) => (
-                format!("⟳ {}", short_age(at, now_seconds())),
-                theme.secondary,
-            ),
-            (None, None, None) => ("⟳ fetch".to_string(), theme.secondary),
-        };
-        div()
-            .id("fetch-status")
-            .flex_none()
-            .px(px(6.))
-            .h(px(18.))
-            .flex()
-            .items_center()
-            .rounded(px(4.))
-            .cursor_pointer()
-            .hover(|button| button.bg(theme.selection))
-            .text_color(color)
-            .on_click(cx.listener(|this, _, _, cx| this.fetch(false, cx)))
-            .child(text)
-    }
-
     fn title(&self) -> String {
         let name = self
             .repo_path
@@ -1884,6 +1757,7 @@ impl RepoView {
             .flex_1()
             .size_full()
             .font_family(preferences::code_font())
+            .font_weight(preferences::code_weight())
             .text_size(px(preferences::code_size()))
             // Headers and code lines share one line height, whatever the font.
             .line_height(px(diff_view::row_height()));
@@ -1927,6 +1801,7 @@ impl RepoView {
                     pinned.map(|file| {
                         div()
                             .font_family(preferences::code_font())
+                            .font_weight(preferences::code_weight())
                             .text_size(px(preferences::code_size()))
                             .line_height(px(diff_view::row_height()))
                             .border_b_1()
@@ -1967,6 +1842,7 @@ impl RepoView {
                 .track_scroll(self.diff_scroll.clone())
                 .size_full()
                 .font_family(preferences::code_font())
+                .font_weight(preferences::code_weight())
                 .text_size(px(preferences::code_size()))
                 .line_height(px(diff_view::row_height()));
                 let scroll_y =
@@ -2058,7 +1934,8 @@ impl RepoView {
     }
 
     /// The strip at the window's right edge, the same with a panel open or
-    /// not: the arrow, the panels by name, then the diff view switches.
+    /// not: the arrow, the panels by name, then the diff view switches; the
+    /// terminal's button at the foot, nearest the terminal.
     fn side_strip(&self, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         // Each panel: a box like the mode groups below, of one button
         // holding its arrow and its name.
@@ -2088,6 +1965,27 @@ impl RepoView {
             .child(tab(SidePanel::Files, "Files"))
             .child(div().w(px(16.)).h(px(1.)).bg(theme.separator))
             .child(self.view_toggles(theme, window, cx))
+            .child(div().flex_1())
+            .child(
+                strip_group(theme).mb(px(STRIP_GAP)).child(
+                    strip_option("Terminal", self.console_open, theme)
+                        .gap(px(2.))
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.toggle_console(window, cx)),
+                        )
+                        .child(vertical_label("Terminal", theme.foreground, window))
+                        // At the foot, towards the terminal: down closes
+                        // it, up opens it.
+                        .child(stroke_icon(
+                            match self.console_open {
+                                true => "M3.5 6 L8 10.5 L12.5 6",
+                                false => "M3.5 10 L8 5.5 L12.5 10",
+                            },
+                            theme.secondary,
+                            10.,
+                        )),
+                ),
+            )
             .into_any_element()
     }
 
@@ -2373,7 +2271,6 @@ impl Render for RepoView {
                         row.child(self.side_panel_view(&theme, window, cx))
                     }),
             )
-            .child(self.status_bar(&theme, cx))
             .children(self.context_menu_view(&theme, cx))
             .children(self.dropdown_view(&theme, cx))
             .children(self.prompt_view(&theme, window, cx))
@@ -2524,10 +2421,7 @@ impl RepoView {
     /// The lines of `path`, as it is after the selection, that the selection
     /// added or changed: from the diff the review loaded for it.
     fn changed_lines(&self, path: &str) -> HashSet<u32> {
-        let index = self
-            .files
-            .iter()
-            .position(|file| file.path() == path);
+        let index = self.files.iter().position(|file| file.path() == path);
         let diff = match index {
             Some(i) if self.selected_file == Some(i) && self.diff.is_some() => self.diff.as_ref(),
             Some(i) => self
@@ -2911,10 +2805,8 @@ impl RepoView {
                                         this.open_snapshot_file(path.clone());
                                         this.snapshot_scroll.scroll_to_item(0, ScrollStrategy::Top);
                                         // Its changes load too, for its tints.
-                                        let index = this
-                                            .files
-                                            .iter()
-                                            .position(|file| file.path() == path);
+                                        let index =
+                                            this.files.iter().position(|file| file.path() == path);
                                         if index.is_some() && this.selected_file != index {
                                             this.select_file(index, cx);
                                         }
@@ -2924,6 +2816,7 @@ impl RepoView {
                                         div()
                                             .w(px(10.))
                                             .font_family(preferences::code_font())
+                                            .font_weight(preferences::code_weight())
                                             .text_xs()
                                             .text_color(theme.accent)
                                             .child(file.status.clone()),
@@ -2973,7 +2866,12 @@ impl RepoView {
                                         this.focus.focus(window);
                                     }
                                     "enter" => {}
-                                    _ if type_key(&mut this.snapshot.filter, keystroke, true, cx) => {}
+                                    _ if type_key(
+                                        &mut this.snapshot.filter,
+                                        keystroke,
+                                        true,
+                                        cx,
+                                    ) => {}
                                     _ => return,
                                 }
                                 cx.stop_propagation();
@@ -3174,6 +3072,7 @@ impl RepoView {
         .track_scroll(self.snapshot_scroll.clone())
         .size_full()
         .font_family(preferences::code_font())
+        .font_weight(preferences::code_weight())
         .text_size(px(preferences::code_size()))
         .line_height(px(diff_view::row_height()))
         .into_any_element()

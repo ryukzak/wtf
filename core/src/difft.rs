@@ -38,9 +38,7 @@ struct Change {
 
 pub fn diff(path: &str, old: &[u8], new: &[u8]) -> Result<FileDiff, CoreError> {
     let difft = find_difft().ok_or_else(|| {
-        CoreError::new(
-            "difft not found. Build wtf with scripts/build.sh, or: brew install difftastic",
-        )
+        CoreError::new("difft not found. Install difftastic: brew install difftastic")
     })?;
 
     // difft picks the language from the file name, so both sides keep it.
@@ -66,19 +64,14 @@ pub fn diff(path: &str, old: &[u8], new: &[u8]) -> Result<FileDiff, CoreError> {
     )
 }
 
-/// The one bundled next to the app's executable, else one on the PATH.
-/// GUI apps do not inherit the shell PATH, so Homebrew prefixes are checked too.
-fn find_difft() -> Option<PathBuf> {
+/// The one `WTF_DIFFT` names, else one on the PATH. GUI apps do not inherit
+/// the shell PATH, so Homebrew prefixes are checked too.
+pub(crate) fn find_difft() -> Option<PathBuf> {
     if let Some(path) = env::var_os("WTF_DIFFT") {
         return Some(path.into());
     }
-    let bundled = env::current_exe()
-        .ok()
-        .and_then(|exe| Some(exe.parent()?.to_path_buf()));
     let path = env::var_os("PATH").unwrap_or_default();
-    bundled
-        .into_iter()
-        .chain(env::split_paths(&path))
+    env::split_paths(&path)
         .chain(["/opt/homebrew/bin".into(), "/usr/local/bin".into()])
         .map(|dir| dir.join("difft"))
         .find(|candidate| candidate.is_file())

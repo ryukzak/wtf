@@ -51,6 +51,11 @@ struct Settings {
     ui_font: SharedString,
     code_font: SharedString,
     code_size: f32,
+    /// The code font's weight, 100 (thin) to 900 (black); 400 is regular.
+    code_weight: f32,
+    /// Lines of code and of the terminal, as multiples of the code size.
+    code_line: f32,
+    terminal_line: f32,
     /// The interface's rem size; text and controls scale with it.
     ui_size: f32,
     /// Days without a commit after which a branch reads as idle.
@@ -62,6 +67,8 @@ struct Settings {
     /// messages; `None` for the built-in prompts.
     summary_prompt: Option<String>,
     message_prompt: Option<String>,
+    /// At launch, problems with external programs open the tools window.
+    tool_check: bool,
     graph: GraphStyle,
     /// Minutes between background fetches; 0 for none.
     fetch_minutes: u32,
@@ -79,6 +86,12 @@ impl Settings {
     fn clamp(&mut self) {
         self.ui_size = self.ui_size.clamp(12., 22.);
         self.code_size = self.code_size.clamp(9., 24.);
+        self.code_weight = (self.code_weight / 100.).round().clamp(1., 9.) * 100.;
+        // Below 1.3 the diff's section headers, a little shorter than its
+        // rows, no longer fit; terminals run tighter, and box drawing joins
+        // up only near 1.2.
+        self.code_line = ((self.code_line * 10.).round() / 10.).clamp(1.3, 2.);
+        self.terminal_line = ((self.terminal_line * 20.).round() / 20.).clamp(1., 1.6);
         self.idle_days = self.idle_days.clamp(1, 365);
         self.pull_option = self.pull_option.min(sync::PULL.len() - 1);
         self.push_option = self.push_option.min(sync::PUSH.len() - 1);
@@ -101,11 +114,15 @@ impl Default for Settings {
             ui_font: SYSTEM_FONT.into(),
             code_font: "Menlo".into(),
             code_size: 12.,
+            code_weight: 400.,
+            code_line: 1.6,
+            terminal_line: 1.35,
             ui_size: 16.,
             idle_days: 14,
             summaries: None,
             summary_prompt: None,
             message_prompt: None,
+            tool_check: true,
             graph: GraphStyle::default(),
             fetch_minutes: 5,
             fetch_prune: true,
@@ -136,6 +153,37 @@ pub fn code_font() -> SharedString {
 
 pub fn code_size() -> f32 {
     read().code_size
+}
+
+/// The height of a line of code, such as a diff row, in points.
+pub fn code_line_height() -> f32 {
+    let settings = read();
+    (settings.code_size * settings.code_line).round()
+}
+
+/// The height of a terminal line, in points.
+pub fn terminal_line_height() -> f32 {
+    let settings = read();
+    (settings.code_size * settings.terminal_line).round()
+}
+
+pub fn code_weight() -> gpui::FontWeight {
+    gpui::FontWeight(read().code_weight)
+}
+
+/// A weight's name, as font menus call it.
+fn weight_name(weight: f32) -> &'static str {
+    match weight as u32 {
+        100 => "Thin",
+        200 => "Extra Light",
+        300 => "Light",
+        400 => "Regular",
+        500 => "Medium",
+        600 => "Semibold",
+        700 => "Bold",
+        800 => "Extra Bold",
+        _ => "Black",
+    }
 }
 
 pub fn ui_size() -> f32 {
@@ -193,6 +241,20 @@ pub fn decide_summaries(available: bool, cx: &mut App) {
     }
 }
 
+/// Turns commit summaries on or off, as Settings › Review does.
+pub fn set_summaries(on: bool, cx: &mut App) {
+    change(|settings| settings.summaries = Some(on), cx);
+}
+
+/// Whether problems with external programs show at launch.
+pub fn tool_check() -> bool {
+    read().tool_check
+}
+
+pub fn set_tool_check(on: bool, cx: &mut App) {
+    change(|settings| settings.tool_check = on, cx);
+}
+
 pub fn appearance() -> Appearance {
     read().appearance
 }
@@ -209,10 +271,6 @@ pub fn message_prompt() -> String {
         .message_prompt
         .clone()
         .unwrap_or_else(|| wtf_core::MESSAGE_PROMPT.to_string())
-}
-
-pub fn summaries_decided() -> bool {
-    read().summaries.is_some()
 }
 
 /// macOS's interface font, offered as "System".
@@ -257,12 +315,16 @@ fn parse(text: &str) -> Settings {
             ("ui_font", _) if !value.is_empty() => settings.ui_font = value.to_string().into(),
             ("code_font", _) if !value.is_empty() => settings.code_font = value.to_string().into(),
             ("code_size", Some(n)) => settings.code_size = n,
+            ("code_weight", Some(n)) => settings.code_weight = n,
+            ("code_line", Some(n)) => settings.code_line = n,
+            ("terminal_line", Some(n)) => settings.terminal_line = n,
             ("ui_size", Some(n)) => settings.ui_size = n,
             ("idle_days", Some(n)) => settings.idle_days = n as u32,
             ("summaries", _) => settings.summaries = Some(value == "on"),
             ("fetch_minutes", Some(n)) => settings.fetch_minutes = n as u32,
             ("fetch_prune", _) => settings.fetch_prune = value == "on",
             ("sync_badges", _) => settings.sync_badges = value == "on",
+            ("tool_check", _) => settings.tool_check = value == "on",
             ("pull_option", Some(n)) => settings.pull_option = n as usize,
             ("push_option", Some(n)) => settings.push_option = n as usize,
             ("summary_prompt", _) => settings.summary_prompt = Some(unescape(raw)),
@@ -320,11 +382,15 @@ fn format(settings: &Settings) -> String {
         format!("ui_font={}", settings.ui_font),
         format!("code_font={}", settings.code_font),
         format!("code_size={}", settings.code_size),
+        format!("code_weight={}", settings.code_weight),
+        format!("code_line={}", settings.code_line),
+        format!("terminal_line={}", settings.terminal_line),
         format!("ui_size={}", settings.ui_size),
         format!("idle_days={}", settings.idle_days),
         format!("fetch_minutes={}", settings.fetch_minutes),
         format!("fetch_prune={}", on_off(settings.fetch_prune)),
         format!("sync_badges={}", on_off(settings.sync_badges)),
+        format!("tool_check={}", on_off(settings.tool_check)),
         format!("pull_option={}", settings.pull_option),
         format!("push_option={}", settings.push_option),
         match settings.summaries {
@@ -633,7 +699,15 @@ impl Preferences {
                     }),
                 ),
             )
-            .child(div().w(px(48.)).flex().justify_center().child(value))
+            .child(
+                div()
+                    .min_w(px(48.))
+                    .px(px(4.))
+                    .flex()
+                    .justify_center()
+                    .whitespace_nowrap()
+                    .child(value),
+            )
             .child(
                 small_button(SharedString::from(format!("{id}-up")), "+", theme).on_click(
                     cx.listener(move |_, _, _, cx| {
@@ -953,7 +1027,42 @@ impl Render for Preferences {
                     move |s, d| s.code_size += d,
                     &theme,
                     cx,
-                ))),
+                )))
+                .child(row("Code weight", &theme).child(self.stepper(
+                    "code-weight",
+                    format!(
+                        "{} {}",
+                        weight_name(settings.code_weight),
+                        settings.code_weight
+                    ),
+                    move |s, d| s.code_weight += d * 100.,
+                    &theme,
+                    cx,
+                )))
+                .child(note(
+                    "A font without this weight shows its nearest one; many monospace \
+                     fonts have only Regular and Bold.",
+                    &theme,
+                ))
+                .child(row("Code line height", &theme).child(self.stepper(
+                    "code-line",
+                    format!("{:.1}", settings.code_line),
+                    move |s, d| s.code_line += d * 0.1,
+                    &theme,
+                    cx,
+                )))
+                .child(row("Terminal line height", &theme).child(self.stepper(
+                    "terminal-line",
+                    format!("{:.2}", settings.terminal_line),
+                    move |s, d| s.terminal_line += d * 0.05,
+                    &theme,
+                    cx,
+                )))
+                .child(note(
+                    "Times the code size. Diffs read well at 1.5 to 1.7; terminals at \
+                     1.15 to 1.25, where box drawing joins up.",
+                    &theme,
+                )),
             Section::Review => {
                 let on = settings.summaries == Some(true);
                 div()
@@ -1190,6 +1299,7 @@ mod tests {
             ui_font: "Helvetica".into(),
             code_font: "SF Mono".into(),
             code_size: 14.,
+            code_weight: 300.,
             graph: GraphStyle {
                 dot: 12.,
                 ..GraphStyle::default()
@@ -1214,5 +1324,23 @@ mod tests {
         assert_eq!(settings.ui_size, 12.);
         assert_eq!(settings.code_size, Settings::default().code_size);
         assert_eq!(settings.push_option, sync::PUSH.len() - 1);
+    }
+
+    #[test]
+    fn code_weight_is_a_named_step() {
+        assert_eq!(parse("code_weight=540\n").code_weight, 500.);
+        assert_eq!(parse("code_weight=5\n").code_weight, 100.);
+        assert_eq!(parse("code_weight=2000\n").code_weight, 900.);
+        assert_eq!(weight_name(Settings::default().code_weight), "Regular");
+    }
+
+    #[test]
+    fn line_heights_keep_their_steps_and_ranges() {
+        let settings = parse("code_line=1.63\nterminal_line=1.22\n");
+        assert_eq!(settings.code_line, 1.6);
+        assert_eq!(settings.terminal_line, 1.2);
+        let settings = parse("code_line=1\nterminal_line=3\n");
+        assert_eq!(settings.code_line, 1.3);
+        assert_eq!(settings.terminal_line, 1.6);
     }
 }
