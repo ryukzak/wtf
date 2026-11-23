@@ -56,7 +56,23 @@ fn worktree_target(graph: &WorkflowGraph, index: usize) -> Target {
         branch: node.branch.clone(),
         commit: node.base.clone().unwrap_or_default(),
         leaf: leaf(graph, index),
+        stale: stale_worktree(graph, index),
     }
+}
+
+/// A worktree done with: no changes, on a branch a channel has merged or
+/// whose remote branch is gone.
+pub fn stale_worktree(graph: &WorkflowGraph, index: usize) -> bool {
+    let node = &graph.nodes[index];
+    let clean = (node.added, node.removed) == (0, 0);
+    let done = node.branch.as_ref().is_some_and(|name| {
+        graph
+            .branches
+            .iter()
+            .find(|branch| branch.name == *name)
+            .is_some_and(|branch| !branch.stale.is_empty())
+    });
+    node.kind == NodeKind::Uncommitted && clean && done
 }
 
 /// Whether a worktree's branch can go with it, and whether the main branch
@@ -312,6 +328,12 @@ pub fn layout(graph: &WorkflowGraph, order: WorktreeOrder) -> Layout {
         .filter(|&w| followed[graph.nodes[w].parents[0]])
         .collect();
     let lane_count = graph.lane_count + detached.len() + stash_rows.len() + framed_up.len();
+    // A worktree off the middle of the main line goes up; off another line,
+    // down. Without the main line's history known, every one goes up.
+    let goes_up = |worktree: usize| {
+        let commit = graph.nodes[worktree].parents[0];
+        followed[commit] && graph.on_main.get(commit).copied().unwrap_or(true)
+    };
     let own_lane = |worktree: usize| {
         graph.lane_count + detached.iter().position(|&w| w == worktree).unwrap_or(0)
     };
@@ -402,16 +424,23 @@ pub fn layout(graph: &WorkflowGraph, order: WorktreeOrder) -> Layout {
             }
         }
     }
-    // Rows of worktrees off the middle of a lane, and stash rows, are placed
-    // apart, above the main row; worktrees stacked under another at a tip
-    // stay below.
-    let mid_lane = |k: usize| followed[graph.nodes[detached[k]].parents[0]];
+    // Rows of worktrees off the middle of the main line, and stash rows,
+    // are placed apart, above the main row. Worktrees off the middle of
+    // another line stay below, near it: going up they would cross every
+    // row between; so do worktrees stacked under another at a tip.
+    let mid_lane = |k: usize| goes_up(detached[k]);
     let mut lanes: Vec<(usize, (f32, f32))> = (1..stash_lane(0))
         .filter(|&lane| {
             !(graph.lane_count..stash_lane(0)).contains(&lane) || {
                 !mid_lane(lane - graph.lane_count)
             }
         })
+        .chain(
+            framed_up
+                .iter()
+                .filter(|&&w| !goes_up(w))
+                .map(|&w| framed_lane(w)),
+        )
         .filter_map(|lane| Some((lane, spans[lane]?)))
         .collect();
     // Worktree rows come right after merged branches, newest first by the chosen
@@ -503,7 +532,12 @@ pub fn layout(graph: &WorkflowGraph, order: WorktreeOrder) -> Layout {
     let mut up: Vec<(usize, (f32, f32))> = (0..detached.len())
         .filter(|&k| mid_lane(k))
         .map(|k| graph.lane_count + k)
-        .chain(framed_up.iter().map(|&w| framed_lane(w)))
+        .chain(
+            framed_up
+                .iter()
+                .filter(|&&w| goes_up(w))
+                .map(|&w| framed_lane(w)),
+        )
         .chain((0..stash_rows.len()).map(stash_lane))
         .filter_map(|lane| Some((lane, spans[lane]?)))
         .collect();
@@ -572,7 +606,7 @@ pub fn layout(graph: &WorkflowGraph, order: WorktreeOrder) -> Layout {
     for &worktree in &framed {
         let parent = graph.nodes[worktree].parents[0];
         match framed_up.contains(&worktree) {
-            // On a row of its own above: from past the rise off the frame.
+            // On a row of its own: from past the way off the frame.
             true => {
                 let from = xs[parent].1 + style().dot / 2. + FORK_GAP;
                 leads.push((from, nodes[worktree].2, vec![worktree]));
@@ -624,6 +658,7 @@ pub fn layout(graph: &WorkflowGraph, order: WorktreeOrder) -> Layout {
             list_x[worktree] = Some(column + x);
             let node = &graph.nodes[worktree];
             x += label_width(&worktree_label(node, WorktreeNames::Folder))
+                + AGE_WIDTH
                 + node
                     .branch
                     .as_deref()
@@ -760,6 +795,14 @@ fn branch_tag(
         .child(div().ml(px(NOTE_GAP)).child(note))
 }
 
+/// Room for a worktree's age after its name, as "12m".
+const AGE_WIDTH: f32 = 34.;
+/// How long a worktree goes without work before it shows quiet.
+const QUIET_AFTER: i64 = 86_400;
+
+/// How many beads past the first a release line's commits take at most.
+const RELEASE_BEADS: usize = 2;
+
 /// Each node one column after its parents, as long as its commits' beads, and
 /// past a parent's labels when it continues that parent's branch.
 fn topological(graph: &WorkflowGraph) -> Vec<(f32, f32)> {
@@ -779,8 +822,12 @@ fn topological(graph: &WorkflowGraph) -> Vec<(f32, f32)> {
                 xs[p].1 + style().column.max(labels)
             })
             .fold(left_edge(graph), f32::max);
-        let length =
-            node.commits.len().saturating_sub(1).min(style().beads) as f32 * style().bead_spacing;
+        // A release line takes little room: its commits are not the work.
+        let beads = match node.channel {
+            true => RELEASE_BEADS,
+            false => style().beads,
+        };
+        let length = node.commits.len().saturating_sub(1).min(beads) as f32 * style().bead_spacing;
         xs.push((start, start + length));
     }
     xs
@@ -821,8 +868,11 @@ pub fn render(
     } = marks;
     // The commit the current worktree has checked out.
     let current_head = current.and_then(|w| graph.nodes[w].parents.first().copied());
+    // History, and a release line work grows from, are not the work's own:
+    // muted.
     let color = |node: &GraphNode| match node.kind {
         NodeKind::History => theme.secondary,
+        _ if node.channel => theme.secondary,
         _ => theme.lanes[node.lane % theme.lanes.len()],
     };
 
@@ -877,8 +927,8 @@ pub fn render(
             color: theme.secondary,
         });
     }
-    // A clean worktree off the middle of a lane rises from its frame's top
-    // edge to its row above, where its lead runs on to its name.
+    // A clean worktree off the middle of a lane leaves its frame for a row
+    // of its own, where its lead runs on to its name.
     for &w in &layout.framed {
         let parent = graph.nodes[w].parents[0];
         let (_, parent_end, parent_y) = layout.nodes[parent];
@@ -893,8 +943,13 @@ pub fn render(
             .count();
         let pad = FRAME_PAD + (frames - 1) as f32 * FRAME_STEP;
         let picked = current == Some(w);
+        // Up from the frame's top edge, or down from its bottom one.
+        let edge = match y < parent_y {
+            true => parent_y - style().dot / 2. - pad,
+            false => parent_y + style().dot / 2. + pad,
+        };
         edges.push(Edge {
-            from: point(px(parent_end), px(parent_y - style().dot / 2. - pad)),
+            from: point(px(parent_end), px(edge)),
             to: point(px(parent_end + style().dot / 2. + FORK_GAP), px(y)),
             merge: false,
             dashed: true,
@@ -928,10 +983,12 @@ pub fn render(
             strong,
             lane: row_lane(graph, layout, first),
             // Full color for the current worktree and one picked or hovered;
-            // lighter for the rest, pointers rather than history.
-            color: match strong {
-                true => color(&graph.nodes[first]),
-                false => color(&graph.nodes[first]).opacity(0.6),
+            // lighter for the rest, pointers rather than history; fainter
+            // still for worktrees done with.
+            color: match (strong, group.iter().all(|&w| stale_worktree(graph, w))) {
+                (true, _) => color(&graph.nodes[first]),
+                (false, false) => color(&graph.nodes[first]).opacity(0.6),
+                (false, true) => color(&graph.nodes[first]).opacity(0.25),
             },
         });
     }
@@ -972,6 +1029,18 @@ pub fn render(
         .and_then(|w| graph.nodes[w].branch.as_deref())
         .into_iter()
         .collect();
+    // Hovering a line pairs a local branch with its remote one: both
+    // labels are ringed, wherever they are.
+    let paired: Vec<String> = hovered
+        .map(|i| {
+            let node = &graph.nodes[i];
+            let names = node.refs.iter().chain(node.branch.as_ref());
+            names
+                .filter_map(|name| Some([name.clone(), partner(graph, name)?]))
+                .flatten()
+                .collect()
+        })
+        .unwrap_or_default();
     // The hovered node's branch is drawn bold on top of everything else.
     let hovered_lane = hovered.map(|i| row_lane(graph, layout, i));
     let (bold, plain): (Vec<Edge>, Vec<Edge>) = edges
@@ -1196,6 +1265,7 @@ pub fn render(
                 let (note, badge) = (stale_note(graph, name), sync_badge(graph, name));
                 let tag = branch_tag(name, note, badge, color, true, theme);
                 let tag = with_current_lines(tag, picked_branches.contains(&name), theme);
+                let tag = with_pair(tag, graph, name, &paired, theme);
                 content = content.child(
                     div()
                         .absolute()
@@ -1238,6 +1308,7 @@ pub fn render(
                 let (note, badge) = (stale_note(graph, name), sync_badge(graph, name));
                 let tag = branch_tag(name, note, badge, color, checked_out, theme);
                 let tag = with_current_lines(tag, picked_branches.contains(&name.as_str()), theme);
+                let tag = with_pair(tag, graph, name, &paired, theme);
                 menu_label(tag, name, target, i, true, cx)
             })
             .collect();
@@ -1286,6 +1357,14 @@ pub fn render(
         // Branches have labels of their own at their commits; the list names
         // the worktrees by folder.
         let label = worktree_label(worktree, WorktreeNames::Folder);
+        // How long since its last work, a commit or a change; one quiet for
+        // long fades, unless it is the current one.
+        let now = crate::repo_view::now_seconds();
+        let quiet = now - worktree.last_time > QUIET_AFTER && current != Some(w);
+        let age = div()
+            .ml(px(4.))
+            .text_color(theme.secondary)
+            .child(crate::repo_view::short_age(worktree.last_time, now));
         let tags: Vec<AnyElement> = worktree
             .refs
             .first()
@@ -1326,7 +1405,9 @@ pub fn render(
                     .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                         this.hover_node(w, *hovered, cx)
                     }))
-                    .children(tags),
+                    .when(quiet, |row| row.opacity(0.5))
+                    .children(tags)
+                    .child(age),
             );
     }
 
@@ -1392,72 +1473,6 @@ pub fn render(
                 .on_click(cx.listener(move |this, _, _, cx| this.show_stash(&show, cx)))
                 .child(with_menu(label, ("stash", k), target, cx)),
         );
-    }
-
-    // Scrolled away from the worktree list, a hovered worktree, or a commit
-    // with worktrees, shows its tags at the view's right edge, on their rows.
-    // The view's edges, where the graph's own coordinates start past the margin.
-    let view_right = f32::from(scroll.bounds().size.width - scroll.offset().x) - MARGIN;
-    if let Some(hovered) = hovered.filter(|_| view_right > 0. && view_right < layout.column) {
-        for (w, worktree) in graph.nodes.iter().enumerate() {
-            let on_it = w == hovered || worktree.parents.first() == Some(&hovered);
-            if worktree.kind != NodeKind::Uncommitted || !on_it || layout.list_x[w].is_none() {
-                continue;
-            }
-            let (_, _, y) = layout.nodes[w];
-            // The arrow points on to the worktree list, off to the right.
-            let name = format!("{} →", worktree_label(worktree, WorktreeNames::Folder));
-            let width = label_width(&name);
-            // Drawn last, above rails and labels, so it always reads.
-            content = content.child(
-                gpui::deferred(
-                    tag(&name, color(worktree), true, theme)
-                        .absolute()
-                        .left(px(view_right - width - 8.))
-                        .top(px(y - TAG_HEIGHT / 2.))
-                        .whitespace_nowrap()
-                        .text_xs()
-                        .shadow_md(),
-                )
-                .with_priority(1),
-            );
-        }
-    }
-    // The other way: a hovered worktree whose commit is scrolled off to the
-    // left shows its branch, or its commit, at the view's left edge, on the
-    // commit's row.
-    let view_left = f32::from(-scroll.offset().x) - MARGIN;
-    if let Some(worktree) = hovered
-        .map(|w| &graph.nodes[w])
-        .filter(|node| node.kind == NodeKind::Uncommitted && view_right > 0.)
-    {
-        let parent = worktree.parents[0];
-        let (_, end, y) = layout.nodes[parent];
-        if end < view_left {
-            let commit = &graph.nodes[parent];
-            let (name, filled) = match &worktree.branch {
-                Some(branch) => (branch.clone(), true),
-                None => (
-                    commit
-                        .commits
-                        .last()
-                        .map_or(String::new(), |commit| commit.short_id.clone()),
-                    false,
-                ),
-            };
-            content = content.child(
-                gpui::deferred(
-                    tag(&format!("← {name}"), color(worktree), filled, theme)
-                        .absolute()
-                        .left(px(view_left + 8.))
-                        .top(px(y - TAG_HEIGHT / 2.))
-                        .whitespace_nowrap()
-                        .text_xs()
-                        .shadow_md(),
-                )
-                .with_priority(1),
-            );
-        }
     }
 
     if let Some(oldest) = oldest.filter(|_| graph.older > 0) {
@@ -1762,6 +1777,106 @@ fn menu_label(
         .into_any_element()
 }
 
+/// A chevron pointing left or right, drawn so it sits on its box's centre
+/// whatever the font.
+pub fn chevron(left: bool, color: Hsla) -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            let (o, w, h) = (bounds.origin, bounds.size.width, bounds.size.height);
+            let (near, far) = match left {
+                true => (o.x + w * 0.25, o.x + w * 0.75),
+                false => (o.x + w * 0.75, o.x + w * 0.25),
+            };
+            let mut path = PathBuilder::stroke(px(2.));
+            path.move_to(point(far, o.y + h * 0.1));
+            path.line_to(point(near, o.y + h * 0.5));
+            path.line_to(point(far, o.y + h * 0.9));
+            if let Ok(path) = path.build() {
+                window.paint_path(path, color);
+            }
+        },
+    )
+    .flex_none()
+    .w(px(7.))
+    .h(px(10.))
+}
+
+/// The other half of a branch's pair: a local branch's remote one, or the
+/// local branch tracking a remote one.
+fn partner(graph: &WorkflowGraph, name: &str) -> Option<String> {
+    let branch = graph.branches.iter().find(|branch| branch.name == name)?;
+    match branch.remote {
+        false => branch.upstream.clone(),
+        true => graph
+            .branches
+            .iter()
+            .find(|local| local.upstream.as_deref() == Some(name))
+            .map(|local| local.name.clone()),
+    }
+}
+
+/// A label in the hovered pair: ringed in the text's colour, and saying
+/// where the other half is and how the two differ, under it, over what is
+/// there, so nothing moves.
+fn with_pair(
+    label: gpui::Div,
+    graph: &WorkflowGraph,
+    name: &str,
+    paired: &[String],
+    theme: &Theme,
+) -> gpui::Div {
+    if !paired.iter().any(|paired| paired == name) {
+        return label;
+    }
+    let ring = div()
+        .absolute()
+        .top(px(-3.))
+        .bottom(px(-3.))
+        .left(px(-3.))
+        .right(px(-3.))
+        .rounded(px(6.))
+        .border_2()
+        .border_color(theme.foreground);
+    let Some(other) = partner(graph, name) else {
+        return label.relative().child(ring);
+    };
+    let local = match graph.branches.iter().any(|b| b.name == name && !b.remote) {
+        true => name,
+        false => other.as_str(),
+    };
+    let gone = !graph.branches.iter().any(|branch| branch.name == other);
+    let state = graph
+        .branches
+        .iter()
+        .find(|branch| branch.name == local && !gone)
+        .map(|branch| match (branch.ahead, branch.behind) {
+            (0, 0) => "same commit".to_string(),
+            (ahead, 0) => format!("{ahead} ahead"),
+            (0, behind) => format!("{behind} behind"),
+            (ahead, behind) => format!("{ahead} ahead, {behind} behind"),
+        })
+        .unwrap_or_else(|| "gone from the remote".to_string());
+    // Said once, under the local half, the remote one named.
+    let note = (local == name).then(|| {
+        div()
+            .absolute()
+            .top(px(TAG_HEIGHT + 4.))
+            .left_0()
+            .px(px(6.))
+            .py(px(1.))
+            .rounded(px(4.))
+            .bg(theme.graph_background)
+            .border_1()
+            .border_color(theme.separator)
+            .text_color(theme.foreground)
+            .font_weight(gpui::FontWeight::NORMAL)
+            .whitespace_nowrap()
+            .child(format!("⇄ {other} · {state}"))
+    });
+    label.relative().child(ring).children(note)
+}
+
 /// The lines marking the current worktree's labels, in the text's color, above
 /// and below a label and outside its room: the label keeps its place, and
 /// nothing on its row, a commit's frame or a rail, runs into them.
@@ -1873,6 +1988,7 @@ mod tests {
             removed: 0,
             base: None,
             tip: Revision::Commit(String::new()),
+            channel: false,
         }
     }
 

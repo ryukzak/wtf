@@ -231,6 +231,62 @@ pub fn snapshot_files(repo: &str, revision: &Revision) -> Result<Vec<String>, Co
     })
 }
 
+/// A line of a file that a search found.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Found {
+    pub path: String,
+    /// From 1.
+    pub line: u32,
+    pub text: String,
+}
+
+/// How many lines a search lists at most, and from one file.
+const MAX_FOUND: usize = 300;
+const MAX_FOUND_IN_FILE: &str = "--max-count=20";
+
+/// The lines holding `query`, ignoring case, in the repository as it is at
+/// `revision`: a commit's tree, or a worktree's files, new ones too but not
+/// ignored ones. Binary files are left out. Read quietly, with the refresh
+/// commands.
+pub fn snapshot_grep(repo: &str, revision: &Revision, query: &str) -> Vec<Found> {
+    let base = ["grep", "-n", "-I", "-i", "-F", "-z", MAX_FOUND_IN_FILE];
+    let output = console::as_refresh(|| match revision {
+        Revision::Commit(id) => {
+            let mut args = base.to_vec();
+            args.extend(["-e", query, id.as_str()]);
+            git::run(repo, &args)
+        }
+        Revision::Worktree(path) => {
+            let mut args = base.to_vec();
+            args.extend(["--untracked", "-e", query]);
+            git::run(path, &args)
+        }
+    });
+    // git grep fails when it finds nothing.
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    let prefix = match revision {
+        Revision::Commit(id) => format!("{id}:"),
+        Revision::Worktree(_) => String::new(),
+    };
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, '\0');
+            let path = parts.next()?;
+            let number = parts.next()?.parse().ok()?;
+            let text = parts.next()?.trim().to_string();
+            Some(Found {
+                path: path.strip_prefix(&prefix).unwrap_or(path).to_string(),
+                line: number,
+                text,
+            })
+        })
+        .take(MAX_FOUND)
+        .collect()
+}
+
 /// A file's text as it is at `revision`; an error for binary files and very
 /// large ones.
 pub fn snapshot_file(repo: &str, revision: &Revision, file: &str) -> Result<String, CoreError> {

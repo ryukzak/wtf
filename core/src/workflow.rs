@@ -45,6 +45,9 @@ pub struct GraphNode {
     /// The node's changes are `base..tip`; a `None` base is the empty tree.
     pub base: Option<String>,
     pub tip: Revision,
+    /// Commits of a release line, a channel's, that work grows from: not
+    /// the work's own.
+    pub channel: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -286,6 +289,7 @@ pub fn build(
         true => stashes.iter().map(|stash| stash.base.as_str()).collect(),
         false => HashSet::new(),
     };
+    let (channel_ends, channel_commits) = release_lines(&log, &index, &tips[0].id, &branches);
     let mut children = vec![0; log.len()];
     for parent in log.iter().flat_map(|(_, parents)| parents) {
         if let Some(&p) = index.get(parent.as_str()) {
@@ -314,6 +318,7 @@ pub fn build(
             && children[p] == 1
             && !tip_ids.contains(log[p].0.id.as_str())
             && !stash_bases.contains(log[p].0.id.as_str())
+            && !channel_ends.contains_key(log[p].0.id.as_str())
             && lane_of[p] == lane_of[i]
         {
             let node = &mut nodes[node_of[p]];
@@ -353,6 +358,7 @@ pub fn build(
             removed: 0,
             base: commit.parent.clone(),
             tip: Revision::Commit(commit.id.clone()),
+            channel: channel_commits.contains(commit.id.as_str()),
         });
         node_of[i] = nodes.len() - 1;
     }
@@ -369,8 +375,9 @@ pub fn build(
                 if !tip.detached {
                     nodes[node_of[i]].refs.push(tip.name.clone());
                 }
-                let (added, removed) = worktree_stats(path)?;
-                let time = log[i].0.time;
+                let (added, removed, touched) = worktree_stats(path)?;
+                // Its last work: the newest commit, or a change since.
+                let time = log[i].0.time.max(touched);
                 nodes.push(GraphNode {
                     key: format!("worktree:{path}"),
                     kind: NodeKind::Uncommitted,
@@ -387,8 +394,17 @@ pub fn build(
                     removed,
                     base: Some(tip.id.clone()),
                     tip: Revision::Worktree(path.clone()),
+                    channel: false,
                 });
             }
+        }
+    }
+
+    // Where a release line ends, its branch is named, as a tip's is.
+    for (id, name) in &channel_ends {
+        let node = &mut nodes[node_of[index[id.as_str()]]];
+        if !node.refs.contains(name) {
+            node.refs.push(name.clone());
         }
     }
 
@@ -458,6 +474,71 @@ pub fn build(
     };
     graph.on_main = graph.main_history();
     Ok(graph)
+}
+
+/// The release lines work grows from: channel branches, other than the
+/// main one, whose commits the graph holds off the main line. Of a local
+/// channel and its remote one, the newer stands, so work on a release
+/// line counts from where the line is now. Returns where each line ends,
+/// with its branch's name, and the lines' commits.
+fn release_lines(
+    log: &Log,
+    index: &HashMap<&str, usize>,
+    main: &str,
+    branches: &[Branch],
+) -> (HashMap<String, String>, HashSet<String>) {
+    // What the main line holds: everything back from its tip.
+    let ancestors = |from: Vec<usize>, stop: &HashSet<usize>| {
+        let mut seen = HashSet::new();
+        let mut stack = from;
+        while let Some(i) = stack.pop() {
+            if stop.contains(&i) || !seen.insert(i) {
+                continue;
+            }
+            stack.extend(
+                log[i]
+                    .1
+                    .iter()
+                    .filter_map(|p| index.get(p.as_str()).copied()),
+            );
+        }
+        seen
+    };
+    let on_main = ancestors(
+        index.get(main).copied().into_iter().collect(),
+        &HashSet::new(),
+    );
+    // By the line's own name, `v2607` for `origin/v2607` too: the newest,
+    // first in the log's order.
+    let mut lines: HashMap<&str, (usize, &str)> = HashMap::new();
+    for branch in branches.iter().filter(|b| b.channel && b.commit != main) {
+        let Some(&at) = index.get(branch.commit.as_str()) else {
+            continue;
+        };
+        if on_main.contains(&at) {
+            continue;
+        }
+        let short = match branch.remote {
+            true => branch
+                .name
+                .split_once('/')
+                .map_or(branch.name.as_str(), |(_, b)| b),
+            false => branch.name.as_str(),
+        };
+        let line = lines.entry(short).or_insert((at, &branch.name));
+        if at < line.0 {
+            *line = (at, &branch.name);
+        }
+    }
+    let ends: HashMap<String, String> = lines
+        .values()
+        .map(|&(at, name)| (log[at].0.id.clone(), name.to_string()))
+        .collect();
+    let commits = ancestors(lines.values().map(|&(at, _)| at).collect(), &on_main)
+        .into_iter()
+        .map(|i| log[i].0.id.clone())
+        .collect();
+    (ends, commits)
 }
 
 /// Commits on `tip`'s first-parent line to show before it: those in the
@@ -839,21 +920,38 @@ fn worktrees(repo_path: &str) -> Result<Worktrees, CoreError> {
 /// Work inside submodules is left out: git would look into each of them
 /// on every refresh, and their lines are not the worktree's. A submodule
 /// moved to another commit still counts.
-fn worktree_stats(path: &str) -> Result<(u32, u32), CoreError> {
-    let (mut added, removed) = numstat(&git::run(
+fn worktree_stats(path: &str) -> Result<(u32, u32, i64), CoreError> {
+    let raw = git::run(
         path,
         &["diff", "--numstat", "--ignore-submodules=dirty", "HEAD"],
-    )?);
+    )?;
+    let (mut added, removed) = numstat(&raw);
+    // When the changes were last touched: the newest of their files.
+    let mut touched = 0;
+    let mut touch = |meta: &fs::Metadata| {
+        let modified = meta.modified().ok();
+        let since = modified.and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok());
+        touched = touched.max(since.map_or(0, |since| since.as_secs() as i64));
+    };
+    for name in raw.lines().filter_map(|line| line.splitn(3, '\t').nth(2)) {
+        if let Ok(meta) = fs::metadata(Path::new(path).join(name)) {
+            touch(&meta);
+        }
+    }
     for file in git::untracked(path)? {
         let file = Path::new(path).join(file);
-        if fs::metadata(&file).is_ok_and(|meta| meta.len() <= MAX_COUNTED_FILE)
+        let Ok(meta) = fs::metadata(&file) else {
+            continue;
+        };
+        touch(&meta);
+        if meta.len() <= MAX_COUNTED_FILE
             && let Ok(bytes) = fs::read(&file)
             && !bytes.contains(&0)
         {
             added += bytes.iter().filter(|&&byte| byte == b'\n').count() as u32;
         }
     }
-    Ok((added, removed))
+    Ok((added, removed, touched))
 }
 
 /// Sums `git diff --numstat`; binary files count as zero.
@@ -1184,6 +1282,46 @@ mod tests {
     }
 
     #[test]
+    fn work_on_a_release_line_counts_from_where_the_line_is_now() {
+        // Release v1 forks from master at c2; the remote has it at f2, the
+        // local branch is behind at f1; fix is work on it.
+        let fixture = forked();
+        let path = fixture.path();
+        fixture.git(".", &["branch", "v1", "feature~1"]);
+        fixture.git(".", &["remote", "add", "origin", &path]);
+        fixture.git(".", &["update-ref", "refs/remotes/origin/v1", "feature"]);
+        fixture.git(".", &["checkout", "-q", "-b", "fix", "feature"]);
+        fixture.commit(".", "c.txt", "1\n", "x1");
+        fixture.commit(".", "c.txt", "1\n2\n", "x2");
+        fixture.git(".", &["checkout", "-q", "master"]);
+        fixture.git(".", &["branch", "-q", "-D", "feature"]);
+
+        // Without channels the line's newer commits pass for the work's.
+        let graph = fixture.graph();
+        assert_eq!(summaries(node(&graph, "fix").1), ["f2", "x1", "x2"]);
+
+        crate::add_channel(&path, "v[0-9]").unwrap();
+        let graph = fixture.graph();
+        let (_, fix) = node(&graph, "fix");
+        assert_eq!(summaries(fix), ["x1", "x2"], "only the work's own");
+        assert!(!fix.channel);
+        // The line ends at the remote's newer tip, labelled, and is muted.
+        let (_, line) = node(&graph, "origin/v1");
+        assert_eq!(summaries(line), ["f2"]);
+        assert!(line.channel);
+        assert!(node(&graph, "v1").1.channel);
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .filter(|n| n.channel)
+                .all(|n| !n.commits.is_empty())
+        );
+        let (_, master) = node(&graph, "master");
+        assert!(!master.channel, "the main line is never a release line");
+    }
+
+    #[test]
     fn branches_merged_into_a_channel_are_merged() {
         // A release branch on the remote has the fix; master does not.
         let fixture = forked();
@@ -1306,6 +1444,23 @@ mod tests {
         );
         std::fs::write(format!("{path}/bin"), [0u8, 1, 2]).unwrap();
         assert!(crate::snapshot_file(&path, &worktree, "bin").is_err());
+        // Search finds lines, ignoring case: in a commit's tree, and in a
+        // worktree's files, new ones too.
+        let found = crate::snapshot_grep(&path, &at(&feature), "Y");
+        assert_eq!(
+            found,
+            [crate::Found {
+                path: "b.txt".to_string(),
+                line: 2,
+                text: "y".to_string(),
+            }]
+        );
+        let found = crate::snapshot_grep(&path, &worktree, "n");
+        assert_eq!(
+            found.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(),
+            ["new.txt"]
+        );
+        assert!(crate::snapshot_grep(&path, &worktree, "nothing").is_empty());
     }
 
     #[test]

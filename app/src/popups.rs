@@ -18,6 +18,8 @@ pub enum Target {
         /// When nothing but the main branch grows from its branch, both can
         /// go together: whether the main branch has merged it.
         leaf: Option<bool>,
+        /// Done with: clean, its branch merged or gone from the remote.
+        stale: bool,
     },
     /// A commit in the commit list.
     Commit {
@@ -61,6 +63,8 @@ pub enum Command {
     NewBranch,
     /// Checks a branch out in one of the open worktrees.
     CheckoutIn(usize),
+    /// Selects the worktree that has the branch already.
+    SelectWorktree(usize),
     /// Applies a stash in one of the worktrees, keeping it, or popping it.
     StashApply(usize),
     StashPop(usize),
@@ -104,17 +108,89 @@ pub const RECENT_COMMANDS: usize = 3;
 
 /// How much of a commit id names it short, as git's `%h` does.
 const SHORT_HASH: usize = 7;
-/// How much of a commit id a Copy SHA label shows of the whole.
-const LABEL_HASH: usize = 12;
 
 pub fn short_hash(id: &str) -> String {
     id.chars().take(SHORT_HASH).collect()
 }
 
-/// The menu for a target, `None` marking separators. Copy items show what
-/// they copy; `recent` are the last Open With commands. The main branch and
-/// the main worktree, at `main_worktree`, cannot be renamed, deleted or
-/// removed.
+/// A worktree a menu sends a command to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Place {
+    /// Its folder's name.
+    pub name: String,
+    /// The current worktree, which commands go to first.
+    pub current: bool,
+    /// It has the menu's branch checked out, so git switches nothing there.
+    pub has: bool,
+}
+
+impl Place {
+    pub fn new(name: &str, current: bool, has: bool) -> Self {
+        Self {
+            name: name.to_string(),
+            current,
+            has,
+        }
+    }
+}
+
+/// A menu item's label: a short name, and the worktree it acts in, shown
+/// on the right as shortcuts are.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Label {
+    pub text: String,
+    pub place: Option<Place>,
+    /// It deletes something.
+    pub danger: bool,
+}
+
+impl std::fmt::Display for Label {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.place {
+            Some(place) => write!(f, "{} · {}", self.text, place.name),
+            None => f.write_str(&self.text),
+        }
+    }
+}
+
+pub type Item = Option<(Command, Label)>;
+
+fn text(command: Command, text: impl Into<String>) -> (Command, Label) {
+    at(command, text, None)
+}
+
+fn at(command: Command, text: impl Into<String>, place: Option<&Place>) -> (Command, Label) {
+    let label = Label {
+        text: text.into(),
+        place: place.cloned(),
+        danger: false,
+    };
+    (command, label)
+}
+
+fn danger(command: Command, text: impl Into<String>) -> (Command, Label) {
+    let (command, mut label) = at(command, text, None);
+    label.danger = true;
+    (command, label)
+}
+
+/// Groups joined by separators, the empty ones left out.
+fn grouped(groups: Vec<Vec<(Command, Label)>>) -> Vec<Item> {
+    let mut items = Vec::new();
+    for group in groups.into_iter().filter(|group| !group.is_empty()) {
+        if !items.is_empty() {
+            items.push(None);
+        }
+        items.extend(group.into_iter().map(Some));
+    }
+    items
+}
+
+/// The menu for a target, `None` marking separators: what it does first,
+/// into each worktree in `places`, the current one first; then copies;
+/// then what deletes. `recent` are the last Open With commands. The main
+/// branch and the main worktree, at `main_worktree`, cannot be renamed,
+/// deleted or removed.
 pub fn commands(
     target: &Target,
     main: &str,
@@ -122,229 +198,158 @@ pub fn commands(
     recent: &[String],
     shown: bool,
     overridden: bool,
-    worktrees: &[String],
-) -> Vec<Option<(Command, String)>> {
-    let item = |command, label: String| Some((command, label));
-    // Labels other than local branches and worktrees have menus of their own.
-    let long = |commit: &str| commit.chars().take(LABEL_HASH).collect::<String>();
-    match target {
-        Target::Remote {
-            remote,
-            branch,
-            commit,
-        } => {
-            let mut items = vec![
-                item(
-                    Command::CopyName,
-                    format!("Copy Branch Name — {remote}/{branch}"),
-                ),
-                item(Command::CopyHash, format!("Copy SHA — {}…", long(commit))),
-            ];
-            // Checked out, a remote branch becomes a local one tracking it.
-            if !worktrees.is_empty() {
-                items.push(None);
-            }
-            items.extend(
-                worktrees.iter().enumerate().map(|(k, label)| {
-                    item(Command::CheckoutIn(k), format!("Check Out in {label}"))
-                }),
-            );
-            items.extend([
-                None,
-                attention_item(shown, overridden),
-                None,
-                item(
-                    Command::DeleteRemote,
-                    format!("Delete {branch} on {remote}…"),
-                ),
-            ]);
-            return items;
+    places: &[Place],
+) -> Vec<Item> {
+    let copies = |name: bool, commit: &str| {
+        let mut items = Vec::new();
+        if name {
+            items.push(text(Command::CopyName, "Copy Name"));
         }
-        Target::Tag { name, .. } => {
-            return vec![
-                item(Command::CopyName, format!("Copy Tag Name — {name}")),
-                None,
-                item(Command::DeleteTag, "Delete Tag…".to_string()),
-            ];
+        if !commit.is_empty() {
+            items.push(text(Command::CopyHash, "Copy SHA"));
+            items.push(text(Command::CopyShortHash, "Copy Short SHA"));
         }
-        // A stash goes into a worktree, or one of its own, or away.
-        Target::Stash { name, id } => {
-            let mut items = vec![
-                item(Command::CopyName, format!("Copy Stash Name — {name}")),
-                item(Command::CopyHash, format!("Copy SHA — {}…", long(id))),
-                None,
-            ];
-            items.extend(
-                worktrees
-                    .iter()
-                    .enumerate()
-                    .map(|(k, label)| item(Command::StashApply(k), format!("Apply to {label}"))),
-            );
-            items.extend(
-                worktrees
-                    .iter()
-                    .enumerate()
-                    .map(|(k, label)| item(Command::StashPop(k), format!("Pop into {label}"))),
-            );
-            items.extend([
-                item(
-                    Command::StashWorktree,
-                    "New Worktree from Stash…".to_string(),
-                ),
-                None,
-                item(Command::DropStash, "Drop Stash…".to_string()),
-            ]);
-            return items;
-        }
-        _ => {}
-    }
-    let (name, commit) = match target {
-        Target::Branch { name, commit, .. } => (Some(name), commit),
-        Target::Worktree { branch, commit, .. } => (branch.as_ref(), commit),
-        Target::Commit { commit, .. } => (None, commit),
-        _ => return Vec::new(),
+        items
     };
-    let mut items = Vec::new();
-    if let Some(name) = name {
-        items.push(item(
-            Command::CopyName,
-            format!("Copy Branch Name — {name}"),
-        ));
-    }
-    if !commit.is_empty() {
-        items.push(item(
-            Command::CopyHash,
-            format!("Copy SHA — {}…", long(commit)),
-        ));
-        items.push(item(
-            Command::CopyShortHash,
-            format!("Copy Short SHA — {}", short_hash(commit)),
-        ));
-    }
-    if let Target::Commit { .. } = target {
-        items.push(item(Command::CopyMessage, "Copy Message".to_string()));
-        // Any worktree can go to the commit, off its branch.
-        if !worktrees.is_empty() {
-            items.push(None);
-        }
-        items.extend(worktrees.iter().enumerate().map(|(k, label)| {
-            item(
-                Command::CheckoutIn(k),
-                format!("Check Out in {label} (Detached)"),
-            )
-        }));
-        items.extend([
-            None,
-            item(Command::NewBranch, "New Branch Here…".to_string()),
-            item(Command::NewWorktree, "New Worktree Here…".to_string()),
-        ]);
-        return items;
-    }
-    // A branch checks out in a worktree already open, any branch, the main
-    // one too, where no other worktree has it; or in a worktree of its own,
-    // but for the main branch, which stays in the main worktree.
-    if let Target::Branch { name, .. } = target {
-        if !worktrees.is_empty() {
-            items.push(None);
-        }
-        items.extend(
-            worktrees
-                .iter()
-                .enumerate()
-                .map(|(k, label)| item(Command::CheckoutIn(k), format!("Check Out in {label}"))),
-        );
-        if name != main {
-            items.push(item(
-                Command::NewWorktree,
-                "New Worktree for Branch…".to_string(),
-            ));
-        }
-    }
-    if attention_name(target) != main {
-        items.push(None);
-        items.push(attention_item(shown, overridden));
-    }
+    let attention = |name: &str| match name == main {
+        true => Vec::new(),
+        false => vec![attention_item(shown, overridden)],
+    };
+    // Into each worktree; one with the branch already, where git would
+    // refuse, is gone to instead.
+    let switches = |branch: bool| {
+        places
+            .iter()
+            .enumerate()
+            .map(|(k, place)| match place.has && branch {
+                true => at(Command::SelectWorktree(k), "Go To", Some(place)),
+                false => at(Command::CheckoutIn(k), "Switch", Some(place)),
+            })
+            .collect::<Vec<_>>()
+    };
     match target {
-        Target::Branch { name, leaf, .. } => {
+        Target::Commit { commit, .. } => {
+            let mut actions = switches(false);
+            actions.push(text(Command::NewBranch, "New Branch…"));
+            actions.push(text(Command::NewWorktree, "New Worktree…"));
+            let mut copied = copies(false, commit);
+            copied.push(text(Command::CopyMessage, "Copy Message"));
+            grouped(vec![actions, copied])
+        }
+        Target::Branch { name, commit, leaf } => {
+            let mut actions = switches(true);
+            let mut removal = Vec::new();
             if name != main {
+                actions.push(text(Command::NewWorktree, "New Worktree…"));
+                removal.push(text(Command::Rename, "Rename…"));
                 // An unmerged branch nothing else grows from goes with its
                 // commits; others only as git allows.
-                let delete = match leaf {
-                    Some(false) => item(
-                        Command::DeleteWithCommits,
-                        "Delete Branch and Its Commits…".to_string(),
-                    ),
-                    _ => item(Command::Delete, "Delete Branch…".to_string()),
-                };
-                items.extend([
-                    None,
-                    item(Command::Rename, "Rename Branch…".to_string()),
-                    delete,
-                ]);
+                removal.push(match leaf {
+                    Some(false) => danger(Command::DeleteWithCommits, "Delete with Commits…"),
+                    _ => danger(Command::Delete, "Delete…"),
+                });
             }
+            grouped(vec![
+                actions,
+                copies(true, commit),
+                attention(name),
+                removal,
+            ])
         }
-        Target::Commit { .. }
-        | Target::Remote { .. }
-        | Target::Tag { .. }
-        | Target::Stash { .. } => {}
+        // Checked out, a remote branch becomes a local one tracking it.
+        Target::Remote { remote, commit, .. } => {
+            let mut actions = switches(false);
+            actions.push(text(Command::NewWorktree, "New Worktree…"));
+            grouped(vec![
+                actions,
+                copies(true, commit),
+                vec![attention_item(shown, overridden)],
+                vec![danger(
+                    Command::DeleteRemote,
+                    format!("Delete on {remote}…"),
+                )],
+            ])
+        }
+        Target::Tag { .. } => grouped(vec![
+            vec![text(Command::CopyName, "Copy Name")],
+            vec![danger(Command::DeleteTag, "Delete…")],
+        ]),
+        // A stash goes into a worktree, or one of its own, or away.
+        Target::Stash { id, .. } => {
+            let mut actions: Vec<_> = places
+                .iter()
+                .enumerate()
+                .map(|(k, place)| at(Command::StashApply(k), "Apply", Some(place)))
+                .collect();
+            actions.extend(
+                places
+                    .iter()
+                    .enumerate()
+                    .map(|(k, place)| at(Command::StashPop(k), "Pop", Some(place))),
+            );
+            actions.push(text(Command::StashWorktree, "New Worktree…"));
+            let mut copied = vec![text(Command::CopyName, "Copy Name")];
+            copied.extend(copies(false, id).into_iter().take(1));
+            grouped(vec![
+                actions,
+                copied,
+                vec![danger(Command::DropStash, "Drop…")],
+            ])
+        }
         Target::Worktree {
-            path, branch, leaf, ..
+            path,
+            branch,
+            commit,
+            leaf,
+            stale,
         } => {
-            items.push(item(
-                Command::CopyPath,
-                format!("Copy Path — {}", tilde(path)),
-            ));
-            items.push(None);
-            items.push(item(
-                Command::RevealInFinder,
-                "Reveal in Finder".to_string(),
-            ));
+            let rename = branch.as_deref().filter(|branch| *branch != main);
+            let mut actions = vec![text(Command::StashChanges, "Stash…")];
+            if rename.is_some() {
+                actions.push(text(Command::Rename, "Rename Branch…"));
+            }
+            let mut copied = copies(branch.is_some(), commit);
+            copied.push(text(Command::CopyPath, "Copy Path"));
+            let mut open = vec![text(Command::RevealInFinder, "Reveal in Finder")];
             for (k, command) in recent.iter().take(RECENT_COMMANDS).enumerate() {
-                items.push(item(
+                open.push(text(
                     Command::OpenWithRecent(k),
                     format!("Open with {command}"),
                 ));
             }
-            items.push(item(Command::OpenWith, "Open With…".to_string()));
-            items.push(None);
-            items.push(item(Command::StashChanges, "Stash Changes".to_string()));
-            let rename = branch.is_some() && branch.as_deref() != Some(main);
-            let remove = main_worktree != Some(path.as_str());
-            if rename || remove {
-                items.push(None);
-            }
-            if rename {
-                items.push(item(Command::Rename, "Rename Branch…".to_string()));
-            }
-            if remove {
-                // Removing names the worktree it removes.
-                let folder = folder_name(path);
-                items.push(item(
-                    Command::RemoveWorktree,
-                    format!("Remove Worktree — {folder}…"),
-                ));
+            open.push(text(Command::OpenWith, "Open With…"));
+            let mut removal = Vec::new();
+            if main_worktree != Some(path.as_str()) {
+                removal.push(danger(Command::RemoveWorktree, "Remove…"));
                 // The main branch stays, wherever it is checked out.
-                if let (Some(_), Some(branch), true) = (leaf, branch, rename) {
-                    items.push(item(
+                if rename.is_some() && (leaf.is_some() || *stale) {
+                    removal.push(danger(
                         Command::RemoveWorktreeAndBranch,
-                        format!("Remove Worktree {folder} and Branch {branch}…"),
+                        "Remove with Branch…",
                     ));
                 }
             }
+            let attention = attention(&attention_name(target));
+            match stale {
+                // Done with, it is offered to go first, with its branch.
+                true => {
+                    removal.reverse();
+                    grouped(vec![removal, actions, copied, open, attention])
+                }
+                false => grouped(vec![actions, copied, open, attention, removal]),
+            }
         }
     }
-    items
 }
 
 /// What the menu offers about attention: a branch shown or left out by hand
 /// goes back to the filters; otherwise it can be hidden or shown.
-fn attention_item(shown: bool, overridden: bool) -> Option<(Command, String)> {
-    let (command, label) = match (overridden, shown) {
-        (true, _) => (Command::FollowFilters, "Follow Attention Filters"),
-        (false, true) => (Command::Hide, "Hide from Attention"),
-        (false, false) => (Command::Pin, "Show in Attention"),
-    };
-    Some((command, label.to_string()))
+fn attention_item(shown: bool, overridden: bool) -> (Command, Label) {
+    match (overridden, shown) {
+        (true, _) => text(Command::FollowFilters, "Follow Filters"),
+        (false, true) => text(Command::Hide, "Hide"),
+        (false, false) => text(Command::Pin, "Show"),
+    }
 }
 
 /// The recent commands saved in the file `name`, as many as are kept.
@@ -571,13 +576,13 @@ mod tests {
         };
         assert_eq!(
             labels(&remote).last().map(String::as_str),
-            Some("Delete fix on origin…")
+            Some("Delete on origin…")
         );
         let tag = Target::Tag {
             name: "v1".to_string(),
             commit: String::new(),
         };
-        assert_eq!(labels(&tag), ["Copy Tag Name — v1", "—", "Delete Tag…"]);
+        assert_eq!(labels(&tag), ["Copy Name", "—", "Delete…"]);
         assert_eq!(
             delete_remote_branch("/r", "origin", "fix"),
             "git -C /r push origin --delete fix"
@@ -587,7 +592,7 @@ mod tests {
     fn labels(target: &Target) -> Vec<String> {
         commands(target, "master", Some("/repo"), &[], true, false, &[])
             .into_iter()
-            .map(|item| item.map_or("—".to_string(), |(_, label)| label))
+            .map(|item| item.map_or("—".to_string(), |(_, label)| label.to_string()))
             .collect()
     }
 
@@ -602,72 +607,82 @@ mod tests {
             commit: "abc".to_string(),
             leaf: None,
         };
-        assert_eq!(
-            labels(&main),
-            [
-                "Copy Branch Name — master",
-                "Copy SHA — abc…",
-                "Copy Short SHA — abc"
-            ]
-        );
+        assert_eq!(labels(&main), ["Copy Name", "Copy SHA", "Copy Short SHA"]);
         let feature = Target::Branch {
             name: "feature".to_string(),
             commit: "abc".to_string(),
             leaf: None,
         };
-        assert!(has(&labels(&feature), "Hide from Attention"));
+        assert!(has(&labels(&feature), "Hide"));
         let unmerged = Target::Branch {
             name: "try".to_string(),
             commit: "abc".to_string(),
             leaf: Some(false),
         };
-        assert!(has(&labels(&unmerged), "Delete Branch and Its Commits"));
+        assert!(has(&labels(&unmerged), "Delete with Commits…"));
         let left_out: Vec<String> = commands(&feature, "master", None, &[], false, false, &[])
             .into_iter()
             .flatten()
-            .map(|(_, label)| label)
+            .map(|(_, label)| label.to_string())
             .collect();
-        assert!(left_out.contains(&"Show in Attention".to_string()));
+        assert!(left_out.contains(&"Show".to_string()));
 
         let main_worktree = Target::Worktree {
             path: "/repo".to_string(),
             branch: Some("master".to_string()),
             commit: "abc".to_string(),
             leaf: None,
+            stale: false,
         };
-        assert!(!has(&labels(&main_worktree), "Remove Worktree"));
+        assert!(!has(&labels(&main_worktree), "Remove"));
         // The main worktree is known by its folder, whatever it has checked out.
         let main_on_feature = Target::Worktree {
             path: "/repo".to_string(),
             branch: Some("feature".to_string()),
             commit: "abc".to_string(),
             leaf: None,
+            stale: false,
         };
-        assert!(!has(&labels(&main_on_feature), "Remove Worktree"));
-        assert!(has(&labels(&main_on_feature), "Rename Branch"));
+        assert!(!has(&labels(&main_on_feature), "Remove"));
+        assert!(has(&labels(&main_on_feature), "Rename Branch…"));
         let linked_on_master = Target::Worktree {
             path: "/repo/wt".to_string(),
             branch: Some("master".to_string()),
             commit: "abc".to_string(),
             leaf: Some(true),
+            stale: false,
         };
         let linked = labels(&linked_on_master);
-        assert!(has(&linked, "Remove Worktree — wt…"));
-        assert!(!has(&linked, "Rename Branch") && !has(&linked, "Remove Worktree wt and"));
+        assert!(has(&linked, "Remove…"));
+        assert!(!has(&linked, "Rename Branch") && !has(&linked, "Remove with Branch"));
 
         let leaf = Target::Worktree {
             path: "/repo/wt".to_string(),
             branch: Some("fix".to_string()),
             commit: "abc".to_string(),
             leaf: Some(true),
+            stale: false,
         };
         let leaf_labels = labels(&leaf);
-        assert!(has(&leaf_labels, "Remove Worktree — wt…"));
-        assert!(has(&leaf_labels, "Remove Worktree wt and Branch fix…"));
+        assert!(has(&leaf_labels, "Remove…"));
+        assert!(has(&leaf_labels, "Remove with Branch…"));
         assert_eq!(
             remove_worktree_and_branch("/repo", "/repo/wt", "fix", true),
             "git -C /repo worktree remove /repo/wt && git -C /repo branch -d fix"
         );
+    }
+
+    #[test]
+    fn a_worktree_done_with_offers_to_go_first() {
+        let stale = Target::Worktree {
+            path: "/repo/wt".to_string(),
+            branch: Some("fix".to_string()),
+            commit: "abc".to_string(),
+            leaf: None,
+            stale: true,
+        };
+        let labels = labels(&stale);
+        assert_eq!(labels[..3], ["Remove with Branch…", "Remove…", "—"]);
     }
 
     #[test]
@@ -677,13 +692,14 @@ mod tests {
             branch: None,
             commit: "abc".to_string(),
             leaf: Some(false),
+            stale: false,
         };
         let labels = labels(&detached);
         assert!(!has(&labels, "Rename Branch"));
-        assert!(!has(&labels, "Remove Worktree wt and Branch"));
-        assert!(!has(&labels, "Copy Branch Name"));
-        assert!(has(&labels, "Remove Worktree"));
-        assert!(has(&labels, "Copy Path — /repo/wt"));
+        assert!(!has(&labels, "Remove with Branch"));
+        assert!(!has(&labels, "Copy Name"));
+        assert!(has(&labels, "Remove…"));
+        assert!(has(&labels, "Copy Path"));
     }
 
     #[test]
@@ -693,52 +709,47 @@ mod tests {
             commit: "abc".to_string(),
             leaf: None,
         };
-        let labels: Vec<String> = commands(
-            &branch,
-            "master",
-            None,
-            &[],
-            true,
-            false,
-            &["wtf · master".to_string()],
-        )
-        .into_iter()
-        .flatten()
-        .map(|(_, label)| label)
-        .collect();
-        assert!(labels.contains(&"New Worktree for Branch…".to_string()));
-        assert!(labels.contains(&"Check Out in wtf · master".to_string()));
+        // The current worktree first; one with the branch already selects it.
+        let places = [
+            Place::new("wtf", true, false),
+            Place::new("wtf-x", false, true),
+        ];
+        let items: Vec<(Command, String)> =
+            commands(&branch, "master", None, &[], true, false, &places)
+                .into_iter()
+                .flatten()
+                .map(|(command, label)| (command, label.to_string()))
+                .collect();
+        assert_eq!(
+            items[..3],
+            [
+                (Command::CheckoutIn(0), "Switch · wtf".to_string()),
+                (Command::SelectWorktree(1), "Go To · wtf-x".to_string()),
+                (Command::NewWorktree, "New Worktree…".to_string()),
+            ]
+        );
 
         // A commit goes into any worktree, off its branch.
         let commit = Target::Commit {
-            commit: "abc123".to_string(),
+            commit: "abc1234567".to_string(),
             message: "Fix".to_string(),
         };
-        let items = commands(
-            &commit,
-            "master",
-            None,
-            &[],
-            true,
-            false,
-            &["wtf · master".to_string(), "wtf-x · x".to_string()],
-        );
-        let checkouts: Vec<(Command, String)> = items
+        let places = [
+            Place::new("wtf", true, false),
+            Place::new("wtf-x", false, false),
+        ];
+        let labels: Vec<String> = commands(&commit, "master", None, &[], true, false, &places)
             .into_iter()
-            .flatten()
-            .filter(|(command, _)| matches!(command, Command::CheckoutIn(_)))
+            .map(|item| item.map_or("—".to_string(), |(_, label)| label.to_string()))
             .collect();
         assert_eq!(
-            checkouts,
+            labels[..5],
             [
-                (
-                    Command::CheckoutIn(0),
-                    "Check Out in wtf · master (Detached)".to_string()
-                ),
-                (
-                    Command::CheckoutIn(1),
-                    "Check Out in wtf-x · x (Detached)".to_string()
-                ),
+                "Switch · wtf",
+                "Switch · wtf-x",
+                "New Branch…",
+                "New Worktree…",
+                "—",
             ]
         );
         assert_eq!(
@@ -783,11 +794,12 @@ mod tests {
             branch: None,
             commit: String::new(),
             leaf: None,
+            stale: false,
         };
         let labels: Vec<String> = commands(&worktree, "master", None, &recent, true, false, &[])
             .into_iter()
             .flatten()
-            .map(|(_, label)| label)
+            .map(|(_, label)| label.to_string())
             .collect();
         assert!(labels.contains(&"Open with subl".to_string()));
         assert!(!labels.iter().any(|label| label.contains("Terminal")));

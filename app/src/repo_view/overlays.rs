@@ -89,7 +89,8 @@ impl RepoView {
                 }
             }
             Command::NewWorktree => match &target {
-                Target::Branch { name, .. } => {
+                // By its name alone, git makes a local branch tracking it.
+                Target::Branch { name, .. } | Target::Remote { branch: name, .. } => {
                     let path = popups::worktree_path(&repo, name);
                     self.show_prompt(PromptKind::WorktreeFor(name.clone()), path, window);
                 }
@@ -146,6 +147,19 @@ impl RepoView {
                         window,
                         cx,
                     );
+                }
+            }
+            Command::SelectWorktree(k) => {
+                let Some((path, _)) = self.checkout_worktrees(&target).get(k).cloned() else {
+                    return;
+                };
+                let index = self
+                    .graph
+                    .nodes
+                    .iter()
+                    .position(|node| matches!(&node.tip, Revision::Worktree(p) if *p == path));
+                if let Some(index) = index {
+                    self.select_and_reveal(index, cx);
                 }
             }
             Command::CheckoutIn(k) => {
@@ -228,8 +242,21 @@ impl RepoView {
                         ..
                     }
                 );
+                let gone = matches!(
+                    target,
+                    Target::Worktree {
+                        stale: true,
+                        leaf: None | Some(false),
+                        ..
+                    }
+                );
                 if let (Some(path), Some(name)) = (path, name) {
                     let detail = match merged {
+                        false if gone => {
+                            "Its remote branch is gone, as after a pull request is merged. \
+                             Commits kept only here are lost: a squashed or rebased merge \
+                             has them in another form."
+                        }
                         true => {
                             "The main branch has merged it, so no work is lost. git refuses to \
                              remove a worktree with uncommitted changes."
@@ -1008,27 +1035,36 @@ impl RepoView {
         }
     }
 
-    /// The worktrees a branch can be checked out in: all but one that has it.
-    fn checkout_worktrees(&self, target: &Target) -> Vec<(String, String)> {
+    /// The worktrees a menu sends commands to, the current one first, each
+    /// by its folder; for a branch, marked where it is checked out already.
+    fn checkout_worktrees(&self, target: &Target) -> Vec<(String, popups::Place)> {
         let name = match target {
             Target::Branch { name, .. } => Some(name),
-            // A stash, a commit or a remote branch goes into any worktree.
             Target::Stash { .. } | Target::Commit { .. } | Target::Remote { .. } => None,
             _ => return Vec::new(),
         };
-        self.graph
+        let current = self
+            .current_worktree_path()
+            .or(self.repo_path.as_deref())
+            .map(|path| path.trim_end_matches('/').to_string());
+        let mut places: Vec<(String, popups::Place)> = self
+            .graph
             .nodes
             .iter()
             .filter(|node| node.kind == wtf_core::NodeKind::Uncommitted)
-            .filter(|node| name.is_none() || node.branch.as_ref() != name)
             .filter_map(|node| match &node.tip {
-                Revision::Worktree(path) => Some((
-                    path.clone(),
-                    graph_view::worktree_label(node, self.worktree_names),
-                )),
+                Revision::Worktree(path) => {
+                    let is_current = current.as_deref() == Some(path.trim_end_matches('/'));
+                    let has = name.is_some() && node.branch.as_ref() == name;
+                    let place =
+                        popups::Place::new(&crate::workspace::folder_name(path), is_current, has);
+                    Some((path.clone(), place))
+                }
                 Revision::Commit(_) => None,
             })
-            .collect()
+            .collect();
+        places.sort_by_key(|(_, place)| !place.current);
+        places
     }
 
     pub(super) fn context_menu_view(
@@ -1058,10 +1094,10 @@ impl RepoView {
             .iter()
             .find(|branch| branch.name == name)
             .is_none_or(|branch| branch.shown);
-        let worktrees: Vec<String> = self
+        let worktrees: Vec<popups::Place> = self
             .checkout_worktrees(target)
             .into_iter()
-            .map(|(_, label)| label)
+            .map(|(_, place)| place)
             .collect();
         let overridden =
             self.attention.pinned.contains(&name) || self.attention.hidden.contains(&name);
@@ -1086,7 +1122,12 @@ impl RepoView {
                     )
                 })
                 .map_or(items.len(), |at| at + 1);
-            items.insert(at, Some((Command::ToggleChannel, label.to_string())));
+            let label = popups::Label {
+                text: label.to_string(),
+                place: None,
+                danger: false,
+            };
+            items.insert(at, Some((Command::ToggleChannel, label)));
         }
         for (k, item) in items.into_iter().enumerate() {
             menu = match item {
@@ -1101,7 +1142,7 @@ impl RepoView {
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.run_command(command, window, cx)
                         }))
-                        .child(label),
+                        .child(menu_label(&label, theme)),
                 ),
             };
         }
@@ -1443,4 +1484,30 @@ fn field_with_caret(
 
 fn dialog_width(width: f32, window: &Window) -> f32 {
     width.min(f32::from(window.viewport_size().width) - 32.)
+}
+
+/// A menu item's label: its name, red when it deletes, and the worktree it
+/// acts in on the right, in bold when it is the current one.
+fn menu_label(label: &popups::Label, theme: &Theme) -> AnyElement {
+    let color = if label.danger {
+        theme.error
+    } else {
+        theme.foreground
+    };
+    let mut row = div()
+        .flex()
+        .justify_between()
+        .gap(px(24.))
+        .whitespace_nowrap()
+        .child(div().text_color(color).child(label.text.clone()));
+    if let Some(place) = &label.place {
+        let name = div().child(place.name.clone());
+        row = row.child(match place.current {
+            true => name
+                .text_color(theme.foreground)
+                .font_weight(gpui::FontWeight::SEMIBOLD),
+            false => name.text_color(theme.secondary),
+        });
+    }
+    row.into_any_element()
 }

@@ -38,6 +38,7 @@ mod graph_band;
 mod header;
 mod lists;
 mod overlays;
+mod search;
 mod stack;
 mod staging;
 mod time;
@@ -144,7 +145,13 @@ struct Snapshot {
     text_loading: Option<(Revision, String)>,
     /// A worktree's files changed on disk: read them again.
     stale: bool,
-    filter: String,
+    /// What the search field holds; the lines of text it found, for which
+    /// query and state, and the query and state searched now.
+    search: String,
+    found: Option<(String, Revision, Vec<wtf_core::Found>)>,
+    searching: Option<(String, Revision)>,
+    /// A line found and opened: shown marked, scrolled to once read.
+    found_line: Option<(String, u32)>,
     only_changed: bool,
     /// Folders open in the tree: by a click, or on the way to a file opened.
     /// Only a click closes one.
@@ -357,9 +364,9 @@ pub struct RepoView {
     snapshot_mode: bool,
     snapshot: Snapshot,
     /// Reading the files, the open file, and its history.
-    snapshot_tasks: [Option<Task<()>>; 3],
+    snapshot_tasks: [Option<Task<()>>; 4],
     snapshot_scroll: UniformListScrollHandle,
-    snapshot_filter_focus: FocusHandle,
+    snapshot_search_focus: FocusHandle,
     /// The last commands used to open a worktree, newest first.
     open_with: Vec<String>,
     /// Shell commands run from the palette, newest first.
@@ -376,6 +383,8 @@ pub struct RepoView {
     dropdown: Option<(Dropdown, Point<Pixels>)>,
     /// The graph's width when last drawn, to keep the view still as it changes.
     graph_width: Cell<f32>,
+    /// How wide the graph's view was when last drawn.
+    graph_view_width: Cell<f32>,
     /// The graph's layout as last made, and what it was made from besides
     /// the graph, which drops it when it changes.
     graph_layout: RefCell<Option<(LayoutKey, Rc<graph_view::Layout>)>>,
@@ -413,6 +422,9 @@ pub struct RepoView {
 
     selected_nodes: Vec<usize>,
     hovered_node: Option<usize>,
+    /// The worktree whose edge chevron the pointer is over, and whether on
+    /// the left.
+    edge_hovered: Option<(usize, bool)>,
     /// The diff of the selected nodes, `None` when they are not on one line.
     range: Option<(Option<String>, Revision)>,
     commits: Vec<Commit>,
@@ -559,9 +571,9 @@ impl RepoView {
             goto_focus: cx.focus_handle(),
             snapshot_mode: false,
             snapshot: Snapshot::default(),
-            snapshot_tasks: [None, None, None],
+            snapshot_tasks: [None, None, None, None],
             snapshot_scroll: UniformListScrollHandle::new(),
-            snapshot_filter_focus: cx.focus_handle(),
+            snapshot_search_focus: cx.focus_handle(),
             prune: None,
             prune_focus: cx.focus_handle(),
             open_with: popups::load_recent("open-with"),
@@ -575,6 +587,7 @@ impl RepoView {
             collapsed_sections: HashSet::new(),
             dropdown: None,
             graph_width: Cell::new(0.),
+            graph_view_width: Cell::new(0.),
             graph_layout: RefCell::new(None),
             outside_graph: false,
             stash_view: None,
@@ -593,6 +606,7 @@ impl RepoView {
             reveal: Cell::new(None),
             selected_nodes: Vec::new(),
             hovered_node: None,
+            edge_hovered: None,
             range: None,
             commits: Vec::new(),
             narrowed: Vec::new(),
@@ -693,14 +707,9 @@ impl RepoView {
         (alive && tab != Some(path.trim_end_matches('/'))).then_some(path)
     }
 
-    /// The tab's title: its repository, and the current worktree when it
-    /// is another, as `sansara › sansara-8853`.
+    /// The tab's title: its repository.
     pub fn tab_title(&self) -> Option<String> {
-        let name = self.repo_name()?;
-        Some(match self.current_worktree_path() {
-            Some(path) => format!("{name} › {}", workspace::folder_name(path)),
-            None => name,
-        })
+        self.repo_name()
     }
 
     pub fn repo_name(&self) -> Option<String> {
@@ -1282,6 +1291,7 @@ impl RepoView {
             false if self.hovered_node == Some(index) => None,
             false => self.hovered_node,
         };
+
         if next != self.hovered_node {
             self.hovered_node = next;
             cx.notify();
@@ -2582,6 +2592,7 @@ impl RepoView {
             return;
         };
         let stale = std::mem::take(&mut self.snapshot.stale);
+        self.sync_search(cx);
         let listed = self.snapshot.revision.as_ref() == Some(&revision) && !stale;
         if !listed && self.snapshot.loading.as_ref() != Some(&revision) {
             self.snapshot.loading = Some(revision.clone());
@@ -2634,7 +2645,15 @@ impl RepoView {
                     this.snapshot.text_loading = None;
                     let (revision, path) = wanted;
                     this.keep_reading_position(&path, &text);
+                    let found = this
+                        .snapshot
+                        .found_line
+                        .as_ref()
+                        .is_some_and(|(p, _)| *p == path);
                     this.snapshot.text = Some((revision, path, text));
+                    if found {
+                        this.scroll_to_found();
+                    }
                     this.snapshot.colors.replace(None);
                     cx.notify();
                 }
@@ -2901,11 +2920,10 @@ impl RepoView {
         marks
     }
 
-    /// The snapshot's files as the tree lists them, filtered, with how the
+    /// The snapshot's files as the tree lists them, with how the
     /// selection changed them; files it deleted are listed too.
     fn snapshot_entries(&self) -> Vec<ChangedFile> {
         let changed = self.changed_paths();
-        let filter = self.snapshot.filter.trim().to_lowercase();
         let deleted = changed
             .iter()
             .filter(|(_, status)| status.as_str() == "D")
@@ -2926,10 +2944,6 @@ impl RepoView {
             .into_iter()
             .filter(|path| {
                 let open = self.snapshot.path.as_ref() == Some(path);
-                open || filter.is_empty() || path.to_lowercase().contains(&filter)
-            })
-            .filter(|path| {
-                let open = self.snapshot.path.as_ref() == Some(path);
                 open || !self.snapshot.only_changed || changed.contains_key(path)
             })
             .map(|path| ChangedFile {
@@ -2944,14 +2958,10 @@ impl RepoView {
     }
 
     /// Folders of the snapshot tree that are closed: those without changes,
-    /// unless opened, and those with changes the user closed. A filter
-    /// opens them all.
+    /// unless opened, and those with changes the user closed.
     /// `folders` are the tree's, from [`snapshot_folders`]: worked out once
     /// per drawing, as they take a walk over every file.
     fn snapshot_closed(&self, folders: &HashMap<String, bool>) -> HashSet<String> {
-        if !self.snapshot.filter.trim().is_empty() {
-            return HashSet::new();
-        }
         // Folders open and close by hand only, so stepping through versions
         // leaves the tree as it is: closed at first, but for the way to the
         // open file. A click turns one from how it starts.
@@ -2962,10 +2972,10 @@ impl RepoView {
             .collect()
     }
 
-    /// The Files panel in Snapshot mode: a filter, and the whole tree with
-    /// the selection's changes marked.
+    /// The Files panel in Snapshot mode: a search, and the whole tree with
+    /// the selection's changes marked, or what the search found.
     fn snapshot_list(&self, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> AnyElement {
-        let focused = self.snapshot_filter_focus.is_focused(window);
+        let focused = self.snapshot_search_focus.is_focused(window);
         let only = self.snapshot.only_changed;
         let count = {
             let entries = self.snapshot_entries();
@@ -3094,29 +3104,31 @@ impl RepoView {
                     .border_color(theme.separator)
                     .child(
                         div()
-                            .id("snapshot-filter")
-                            .track_focus(&self.snapshot_filter_focus)
+                            .id("snapshot-search")
+                            .track_focus(&self.snapshot_search_focus)
                             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                                 let keystroke = &event.keystroke;
                                 match keystroke.key.as_str() {
-                                    "escape" => {
-                                        this.snapshot.filter.clear();
+                                    "escape" if this.snapshot.search.is_empty() => {
                                         this.focus.focus(window);
                                     }
+                                    "escape" => this.snapshot.search.clear(),
                                     "enter" => {}
                                     _ if type_key(
-                                        &mut this.snapshot.filter,
+                                        &mut this.snapshot.search,
                                         keystroke,
                                         true,
                                         cx,
                                     ) => {}
                                     _ => return,
                                 }
+                                this.snapshot.found_line = None;
+                                this.sync_search(cx);
                                 cx.stop_propagation();
                                 cx.notify();
                             }))
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.snapshot_filter_focus.focus(window);
+                                this.snapshot_search_focus.focus(window);
                                 cx.notify();
                             }))
                             .flex_1()
@@ -3134,12 +3146,7 @@ impl RepoView {
                             })
                             .overflow_hidden()
                             .whitespace_nowrap()
-                            .child(field_text(
-                                &self.snapshot.filter,
-                                "Filter files",
-                                focused,
-                                theme,
-                            )),
+                            .child(field_text(&self.snapshot.search, "Search", focused, theme)),
                     )
                     .child(
                         div()
@@ -3163,7 +3170,10 @@ impl RepoView {
                             .child("Changed"),
                     ),
             )
-            .child(list)
+            .child(match self.snapshot.search.trim().is_empty() {
+                true => list.into_any_element(),
+                false => self.search_list(cx),
+            })
             .into_any_element()
     }
 
@@ -3238,6 +3248,14 @@ impl RepoView {
         let foreground = theme.foreground;
         let secondary = theme.secondary;
         let inserted = theme.inserted;
+        // A line a search found and opened shows marked.
+        let marked = self
+            .snapshot
+            .found_line
+            .as_ref()
+            .filter(|(found, _)| *found == path)
+            .map(|(_, line)| *line);
+        let selection = theme.selection;
         // Lines the selection added or changed, from its diff of the file,
         // when the state shown is the selection's own.
         let fresh = self.snapshot_text_is_current(&path)
@@ -3289,6 +3307,7 @@ impl RepoView {
                             .whitespace_nowrap()
                             .overflow_hidden()
                             .when(changed.contains(&(i as u32 + 1)), |row| row.bg(inserted))
+                            .when(marked == Some(i as u32 + 1), |row| row.bg(selection))
                             .child(
                                 div()
                                     .flex_none()

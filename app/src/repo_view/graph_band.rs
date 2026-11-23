@@ -2,6 +2,22 @@
 
 use super::*;
 
+/// Which edge a worktree row runs past, and where a click there goes: the
+/// node its work starts at, or where its name sits in the list.
+#[derive(Clone, Copy)]
+enum Edge {
+    Left(usize),
+    Right(f32),
+}
+
+/// How tall the chips at the graph's edges are.
+const EDGE_CHIP: f32 = 18.;
+/// How near the right edge a worktree's name starts and still counts as out
+/// of view.
+const EDGE_ROOM: f32 = 24.;
+/// How much of the worktree list scrolling to it shows.
+const LIST_ROOM: f32 = 220.;
+
 impl RepoView {
     /// Whether the graph shows the First and Latest buttons.
     pub(super) fn graph_away_now(&self) -> (bool, bool) {
@@ -56,6 +72,242 @@ impl RepoView {
             return None;
         };
         Some((w, arrow))
+    }
+
+    /// The current, selected or hovered worktrees' rows in view whose ends
+    /// are out of it: on the left, where
+    /// the work lies past the view's left edge, with the node it starts at;
+    /// on the right, where the worktree's name in the list lies past the
+    /// right edge, with where the name is.
+    fn rows_out_of_view(&self, layout: &graph_view::Layout) -> Vec<(usize, f32, Edge)> {
+        let view = self.graph_scroll.bounds().size;
+        let (width, height) = (f32::from(view.width), f32::from(view.height));
+        if width <= 0. {
+            return Vec::new();
+        }
+        let offset = self.graph_scroll.offset();
+        let (left, top) = (-f32::from(offset.x), -f32::from(offset.y));
+        let pad = graph_view::MARGIN;
+        // Only for the worktree in hand: the current one, one selected, or
+        // one the pointer is on.
+        let current = self.current_worktree();
+        let wanted = |w: usize| {
+            current == Some(w) || self.selected_nodes.contains(&w) || self.hovered_node == Some(w)
+        };
+        let mut rows = Vec::new();
+        for (_, y, group) in &layout.leads {
+            let Some(&w) = group.iter().find(|&&w| wanted(w)) else {
+                continue;
+            };
+            let y = y + pad - top;
+            // Whole, or not at all: a chip cut by the band's edge reads as
+            // something else.
+            if y < EDGE_CHIP / 2. || y > height - EDGE_CHIP / 2. {
+                continue;
+            }
+            // Its mark, and the labels before it, all out of view.
+            if layout.nodes[w].1 + pad < left {
+                rows.push((w, y, Edge::Left(self.work_start(w))));
+            }
+            if let Some(x) = layout.list_x[w].filter(|x| x + pad > left + width - EDGE_ROOM) {
+                rows.push((w, y, Edge::Right(x)));
+            }
+        }
+        rows
+    }
+
+    /// Where a worktree's own work starts: back from its commit along its
+    /// lane, short of the main line and release lines.
+    fn work_start(&self, worktree: usize) -> usize {
+        let nodes = &self.graph.nodes;
+        let lane = nodes[worktree].lane;
+        let mut at = nodes[worktree].parents.first().copied().unwrap_or(worktree);
+        while let Some(&parent) = nodes[at].parents.first() {
+            let node = &nodes[parent];
+            let main = self.graph.on_main.get(parent).copied().unwrap_or(false);
+            if node.lane != lane || main || node.channel {
+                break;
+            }
+            at = parent;
+        }
+        at
+    }
+
+    /// At the view's edges, on each worktree row whose ends are out of
+    /// view, a chevron over the graph pointing the way; while the pointer is
+    /// over it, or over the worktree, it names the branch. A click goes
+    /// there: to the work's start on the left, to the worktree's name on the
+    /// right.
+    fn edge_arrows(
+        &self,
+        layout: &graph_view::Layout,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        self.rows_out_of_view(layout)
+            .into_iter()
+            .map(|(w, y, edge)| {
+                let node = &self.graph.nodes[w];
+                let color = theme.lanes[node.lane % theme.lanes.len()];
+                let left = matches!(edge, Edge::Left(_));
+                let key = (w, left);
+                let open = self.edge_hovered == Some(key) || self.hovered_node == Some(w);
+                let name = match left {
+                    true => node
+                        .branch
+                        .clone()
+                        .unwrap_or_else(|| graph_view::worktree_label(node, self.worktree_names)),
+                    false => graph_view::worktree_label(node, self.worktree_names),
+                };
+                let chevron = graph_view::chevron(left, if open { gpui::white() } else { color });
+                let text = open.then(|| div().child(name));
+                div()
+                    .id(("edge-arrow", w * 2 + usize::from(left)))
+                    .absolute()
+                    .map(|chip| match left {
+                        true => chip.left(px(4.)),
+                        false => chip.right(px(4.)),
+                    })
+                    .top(px(y - EDGE_CHIP / 2.))
+                    .h(px(EDGE_CHIP))
+                    .min_w(px(EDGE_CHIP))
+                    .px(px(5.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(5.))
+                    .rounded(px(EDGE_CHIP / 2.))
+                    .border_1()
+                    .shadow_sm()
+                    .whitespace_nowrap()
+                    .cursor_pointer()
+                    .text_xs()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .map(|chip| match open {
+                        true => chip.bg(color).border_color(color).text_color(gpui::white()),
+                        false => chip
+                            .bg(theme.graph_background)
+                            .border_color(color.opacity(0.6)),
+                    })
+                    .map(|chip| match left {
+                        true => chip.child(chevron).children(text),
+                        false => chip.children(text).child(chevron),
+                    })
+                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        this.edge_hovered = match hovered {
+                            true => Some(key),
+                            false => this.edge_hovered.filter(|&at| at != key),
+                        };
+                        cx.notify();
+                    }))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_scroll_wheel(cx.listener(Self::scroll_graph))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.edge_hovered = None;
+                        match edge {
+                            Edge::Left(start) => this.reveal.set(Some(start)),
+                            Edge::Right(x) => this.scroll_to_list(x),
+                        }
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            })
+            .collect()
+    }
+
+    /// Scrolls the graph so the worktree list, at `x`, comes into view at
+    /// the right, its names readable.
+    fn scroll_to_list(&self, x: f32) {
+        let view = f32::from(self.graph_scroll.bounds().size.width);
+        let max = f32::from(self.graph_scroll.max_offset().width);
+        let target = (x + graph_view::MARGIN + LIST_ROOM - view).clamp(0., max);
+        let offset = self.graph_scroll.offset();
+        self.graph_scroll.set_offset(point(px(-target), offset.y));
+    }
+
+    /// The arrow to the current worktree, out of view: at the edge it lies
+    /// past, level with it, quiet until the pointer is over it, then with
+    /// its name.
+    fn worktree_arrow(
+        &self,
+        w: usize,
+        arrow: &'static str,
+        layout: &graph_view::Layout,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let node = &self.graph.nodes[w];
+        let color = theme.lanes[node.lane % theme.lanes.len()];
+        let name = graph_view::worktree_label(node, self.worktree_names);
+        let key = (w, false);
+        let open = self.edge_hovered == Some(key) || self.hovered_node == Some(w);
+        let (_, end, y) = layout.nodes[w];
+        let pad = graph_view::MARGIN;
+        let view = self.graph_scroll.bounds().size;
+        let (width, height) = (f32::from(view.width), f32::from(view.height));
+        let offset = self.graph_scroll.offset();
+        // Where it is, in the view, held inside the view's edges.
+        let x = (end + pad + f32::from(offset.x)).clamp(12., (width - 12.).max(12.));
+        let y = (y + pad + f32::from(offset.y)).clamp(12., (height - 12.).max(12.));
+        let (glyph, label) = match arrow {
+            "←" => ("‹", format!("‹ {name}")),
+            "→" => ("›", format!("{name} ›")),
+            "↑" => ("↑", format!("↑ {name}")),
+            _ => ("↓", format!("↓ {name}")),
+        };
+        let chip = div()
+            .id("graph-worktree")
+            .absolute()
+            .h(px(20.))
+            .flex()
+            .items_center()
+            .whitespace_nowrap()
+            .cursor_pointer()
+            .text_xs()
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .map(|chip| match open {
+                true => chip
+                    .px(px(8.))
+                    .rounded(px(10.))
+                    .bg(color)
+                    .text_color(gpui::white())
+                    .child(label),
+                false => chip
+                    .px(px(4.))
+                    .text_color(color)
+                    .text_size(px(match arrow {
+                        "←" | "→" => 18.,
+                        _ => 14.,
+                    }))
+                    .child(glyph),
+            })
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                this.edge_hovered = match hovered {
+                    true => Some(key),
+                    false => this.edge_hovered.filter(|&at| at != key),
+                };
+                cx.notify();
+            }))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_scroll_wheel(cx.listener(Self::scroll_graph))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.edge_hovered = None;
+                this.reveal.set(Some(w));
+                cx.notify();
+            }));
+        match arrow {
+            "←" => chip.left(px(4.)).top(px(y - 10.)),
+            "→" => chip.right(px(4.)).top(px(y - 10.)),
+            // Up or down, it grows away from the nearer side edge.
+            "↑" => chip.top(px(4.)),
+            _ => chip.bottom(px(4.)),
+        }
+        .map(|chip| match arrow {
+            "←" | "→" => chip,
+            _ if x > width / 2. => chip.right(px(width - x - 10.)),
+            _ => chip.left(px(x - 10.)),
+        })
+        .into_any_element()
     }
 
     /// Scrolls the graph from a button floating over it, as if the button
@@ -138,6 +390,20 @@ impl RepoView {
             let x = offset.x - px(layout.width - previous);
             self.graph_scroll.set_offset(point(x.min(px(0.)), offset.y));
         }
+        // When the view narrows or widens, as a side panel opens or closes,
+        // the graph keeps its right edge where it was: what was at the right
+        // stays in view, and the rest moves over.
+        let view_width = f32::from(self.graph_scroll.bounds().size.width);
+        let was = self.graph_view_width.replace(view_width);
+        if was > 0. && view_width > 0. && was != view_width {
+            let offset = self.graph_scroll.offset();
+            // The scroll range is still the old view's: narrower, it grows.
+            let max = self.graph_scroll.max_offset().width + px((was - view_width).max(0.));
+            let x = (offset.x - px(was - view_width)).clamp(-max, px(0.));
+            self.graph_scroll.set_offset(point(x, offset.y));
+            // The view's new width is known only once drawn: draw again.
+            cx.notify();
+        }
         // A node selected from the commit list or Go To scrolls into view
         // when it is out of it; one picked in the graph already is in view.
         let view = self.graph_scroll.bounds().size;
@@ -193,38 +459,17 @@ impl RepoView {
         }
         let (first, away) = self.graph_away_now();
         self.graph_away.set((first, away));
-        let worktree = self.worktree_away(&layout);
+        let edges = self.edge_arrows(&layout, theme, cx);
+        // On a row in view, the worktree has its edge chevrons already; the
+        // arrow to it is for when its row is above or below the view.
+        let worktree = self
+            .worktree_away(&layout)
+            .filter(|&(_, arrow)| arrow == "↑" || arrow == "↓");
         self.worktree_arrow.set(worktree.map(|(_, arrow)| arrow));
-        // Scrolled away from the worktree in review, a button goes back to
-        // it: at the bottom, where Latest is, and in its place on the right.
-        let worktree_away = worktree.map(|(w, arrow)| {
-            let name = graph_view::worktree_label(&self.graph.nodes[w], self.worktree_names);
-            let label = match arrow {
-                "←" => format!("← {name}"),
-                "→" => format!("{name} →"),
-                _ => format!("{name} {arrow}"),
-            };
-            let button = floating(div().id("graph-worktree"), theme)
-                .absolute()
-                .bottom(px(10.))
-                .px(px(8.))
-                .py(px(2.))
-                .rounded(px(4.))
-                .text_xs()
-                .cursor_pointer()
-                .hover(|button| button.bg(theme.selection))
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_scroll_wheel(cx.listener(Self::scroll_graph))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.reveal.set(Some(w));
-                    cx.notify();
-                }))
-                .child(label);
-            match arrow {
-                "←" => button.left(px(10.)),
-                _ => button.right(px(10.)),
-            }
-        });
+        // Scrolled away from the current worktree, an arrow at the edge on
+        // its way points to it, as the leads' arrows do; a click goes there.
+        let worktree_away =
+            worktree.map(|(w, arrow)| self.worktree_arrow(w, arrow, &layout, theme, cx));
         let away = away && worktree_away.is_none();
         let picked: Vec<String> = self
             .narrowed
@@ -277,6 +522,7 @@ impl RepoView {
                         theme,
                         cx,
                     )))
+                    .children(edges)
                     .children(worktree_away)
                     .when(away, |graph| {
                         graph.child(
