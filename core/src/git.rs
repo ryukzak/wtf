@@ -163,12 +163,34 @@ pub fn worktree_status(path: &str) -> Result<WorktreeStatus, CoreError> {
         &["diff", "--cached", "--raw", "-z", "--no-abbrev", "-M"],
     )?;
     let unstaged = run(path, &["diff", "--raw", "-z", "--no-abbrev"])?;
+    let (unstaged, inside) = changed_inside(path, parse_raw(&unstaged, Some(path)));
     let mut status = WorktreeStatus {
-        staged: parse_raw(&staged, None),
-        unstaged: parse_raw(&unstaged, Some(path)),
+        staged: submodules_first(parse_raw(&staged, None)),
+        unstaged,
+        inside,
     };
     status.unstaged.extend(untracked_files(path)?);
     Ok(status)
+}
+
+/// Takes out the submodules changed only inside, whose checkout is still
+/// at the commit the other side has: their paths go apart.
+fn changed_inside(worktree: &str, files: Vec<ChangedFile>) -> (Vec<ChangedFile>, Vec<String>) {
+    let (inside, files): (Vec<ChangedFile>, Vec<ChangedFile>) =
+        files.into_iter().partition(|file| {
+            file.submodule
+                && file.new_path.is_some()
+                && crate::submodule::checkout(&Path::new(worktree).join(file.path()))
+                    .is_some_and(|(head, _)| head == file.old_id)
+        });
+    let paths = inside.iter().map(|file| file.path().to_string()).collect();
+    (submodules_first(files), paths)
+}
+
+/// Submodules before files, each in the order they came.
+fn submodules_first(mut files: Vec<ChangedFile>) -> Vec<ChangedFile> {
+    files.sort_by_key(|file| !file.submodule);
+    files
 }
 
 /// Stages files; all of them when `files` is empty.
@@ -195,6 +217,9 @@ pub fn stage_lines(
     added: &HashSet<u32>,
     unstage: bool,
 ) -> Result<(), CoreError> {
+    if file.submodule {
+        return Err(CoreError::new("A submodule is staged whole, not by lines"));
+    }
     let (old, new) = read_blobs(repo_path, file)?;
     let (old, new) = (String::from_utf8_lossy(&old), String::from_utf8_lossy(&new));
     let path = file.path();
@@ -220,7 +245,10 @@ pub fn discard(path: &str, files: &[ChangedFile]) -> Result<(), CoreError> {
     for file in files {
         let name = file.path();
         let untracked = file.status == "A" && file.old_id == NULL_ID;
-        if untracked {
+        if file.submodule {
+            // Back to the commit the index records for it.
+            run(path, &["submodule", "update", "--init", "--", name])?;
+        } else if untracked {
             // An intent-to-add entry in the index would keep the file from
             // `git clean`, and so would an ignore rule once it is out: `-x`.
             run(
@@ -244,6 +272,11 @@ pub fn discard_lines(
     removed: &HashSet<u32>,
     added: &HashSet<u32>,
 ) -> Result<(), CoreError> {
+    if file.submodule {
+        return Err(CoreError::new(
+            "A submodule is discarded whole, not by lines",
+        ));
+    }
     let (old, new) = read_blobs(repo_path, file)?;
     let (old, new) = (String::from_utf8_lossy(&old), String::from_utf8_lossy(&new));
     let path = file.path();
@@ -497,7 +530,10 @@ pub fn changed_files(
     };
     let mut files = parse_raw(&run(dir, &args)?, worktree);
     if let Some(root) = worktree {
+        files = changed_inside(root, files).0;
         files.extend(untracked_files(root)?);
+    } else {
+        files = submodules_first(files);
     }
     Ok(files)
 }
@@ -513,6 +549,7 @@ fn untracked_files(worktree: &str) -> Result<Vec<ChangedFile>, CoreError> {
             old_id: NULL_ID.to_string(),
             new_id: NULL_ID.to_string(),
             worktree: Some(worktree.to_string()),
+            submodule: false,
         })
         .collect())
 }
@@ -540,6 +577,7 @@ fn parse_raw(raw: &str, worktree: Option<&str>) -> Vec<ChangedFile> {
         };
         let first = fields.next().unwrap_or_default().to_string();
         let kind = &status[..1];
+        let submodule = meta[0].trim_start_matches(':') == GITLINK || meta[1] == GITLINK;
         let (old_path, new_path) = match kind {
             "A" => (None, Some(first)),
             "D" => (Some(first), None),
@@ -553,12 +591,16 @@ fn parse_raw(raw: &str, worktree: Option<&str>) -> Vec<ChangedFile> {
             old_id: old_id.to_string(),
             new_id: new_id.to_string(),
             worktree: worktree.map(str::to_string),
+            submodule,
         });
     }
     files
 }
 
 pub fn read_blobs(repo_path: &str, file: &ChangedFile) -> Result<(Vec<u8>, Vec<u8>), CoreError> {
+    if file.submodule {
+        return Ok(submodule_blobs(repo_path, file));
+    }
     let repo = open(repo_path)?;
     let old = read_blob(&repo, &file.old_id)?;
     // Git reports worktree files with a null id; their content is on disk.
@@ -568,6 +610,74 @@ pub fn read_blobs(repo_path: &str, file: &ChangedFile) -> Result<(Vec<u8>, Vec<u
     };
     Ok((old, new))
 }
+
+/// A submodule's change as two texts: each side's commit, and the commits
+/// only it has. Its commits are looked up in the worktree's checkout of it,
+/// or the repository's; the worktree's side is what is checked out there.
+fn submodule_blobs(repo_path: &str, file: &ChangedFile) -> (Vec<u8>, Vec<u8>) {
+    let path = file.path();
+    let root = file.worktree.as_deref().unwrap_or(repo_path);
+    let dir = Path::new(root).join(path);
+    let id = |id: &str| (id != NULL_ID && !id.is_empty()).then(|| id.to_string());
+    let old = file.old_path.as_ref().and_then(|_| id(&file.old_id));
+    let (new, dirty) = match (&file.worktree, &file.new_path) {
+        (Some(_), Some(_)) => match crate::submodule::checkout(&dir) {
+            Some((head, dirty)) => (Some(head), dirty),
+            None => (None, false),
+        },
+        (None, Some(_)) => (id(&file.new_id), false),
+        (_, None) => (None, false),
+    };
+    let text = |this: Option<&String>, other: Option<&String>, dirty: bool| {
+        crate::submodule::side_text(
+            &dir,
+            path,
+            this.map(String::as_str),
+            other.map(String::as_str),
+            dirty,
+        )
+        .into_bytes()
+    };
+    (
+        text(old.as_ref(), new.as_ref(), false),
+        text(new.as_ref(), old.as_ref(), dirty),
+    )
+}
+
+/// A submodule in a snapshot, as text: where its pointer is at `revision`.
+/// `None` for anything else.
+pub fn snapshot_submodule(repo: &str, revision: &Revision, file: &str) -> Option<String> {
+    let (dir, id, dirty) = match revision {
+        Revision::Worktree(root) => {
+            let dir = Path::new(root).join(file);
+            if !dir.is_dir() {
+                return None;
+            }
+            let (head, dirty) = crate::submodule::checkout(&dir)?;
+            (dir, head, dirty)
+        }
+        Revision::Commit(commit) => {
+            let entry =
+                crate::console::as_refresh(|| run(repo, &["ls-tree", commit, "--", file])).ok()?;
+            let mut fields = entry.split_whitespace();
+            if fields.next()? != GITLINK {
+                return None;
+            }
+            let id = fields.nth(1)?.to_string();
+            (Path::new(repo).join(file), id, false)
+        }
+    };
+    Some(crate::submodule::side_text(
+        &dir,
+        file,
+        Some(&id),
+        None,
+        dirty,
+    ))
+}
+
+/// The mode git gives a submodule's entry.
+const GITLINK: &str = "160000";
 
 /// Null ids (added or deleted side) and submodule commits read as empty.
 fn read_blob(repo: &gix::Repository, id: &str) -> Result<Vec<u8>, CoreError> {

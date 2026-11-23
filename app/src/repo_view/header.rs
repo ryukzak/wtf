@@ -705,6 +705,30 @@ impl RepoView {
                     .child(label),
             );
         }
+        // Submodules changed only inside: nothing to commit here, but work
+        // to see, in the submodule's own tab.
+        for (k, path) in self.submodules_inside.iter().enumerate() {
+            let open = path.clone();
+            description = description.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .text_xs()
+                    .text_color(theme.secondary)
+                    .child(format!("⊙ {path} has changes inside"))
+                    .child(
+                        div()
+                            .id(("open-inside", k))
+                            .text_color(theme.accent)
+                            .cursor_pointer()
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.open_submodule(&open, cx)),
+                            )
+                            .child("Open"),
+                    ),
+            );
+        }
 
         // The diff leaves room for the header as it lays out.
         let view = cx.entity().downgrade();

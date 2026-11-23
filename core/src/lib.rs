@@ -4,6 +4,7 @@ mod console;
 mod difft;
 mod git;
 mod patch;
+mod submodule;
 mod summary;
 mod text;
 mod tools;
@@ -68,6 +69,8 @@ pub struct ChangedFile {
     pub new_id: String,
     /// Set when the new side is read from this worktree's files.
     pub worktree: Option<String>,
+    /// A submodule's pointer, not a file.
+    pub submodule: bool,
 }
 
 impl ChangedFile {
@@ -179,6 +182,9 @@ pub fn repository_root(path: &str) -> Option<String> {
 pub struct WorktreeStatus {
     pub staged: Vec<ChangedFile>,
     pub unstaged: Vec<ChangedFile>,
+    /// Submodules with changes of their own but where the index has them:
+    /// nothing for this repository to commit.
+    pub inside: Vec<String>,
 }
 
 /// Fetches every remote of a repository. A background fetch is logged as
@@ -197,6 +203,19 @@ pub fn pull(path: &str, args: &[&str]) -> Result<(), CoreError> {
 
 /// The largest file a snapshot shows.
 const MAX_SNAPSHOT_FILE: usize = 2 * 1024 * 1024;
+
+/// The submodules of the repository as it is at `revision`, by path.
+pub fn snapshot_submodules(repo: &str, revision: &Revision) -> Vec<String> {
+    let text = match revision {
+        Revision::Commit(id) => {
+            console::as_refresh(|| git::show(repo, &format!("{id}:.gitmodules"))).ok()
+        }
+        Revision::Worktree(path) => std::fs::read(Path::new(path).join(".gitmodules")).ok(),
+    };
+    text.map_or_else(Vec::new, |text| {
+        submodule::paths(&String::from_utf8_lossy(&text))
+    })
+}
 
 /// Every file of the repository as it is at `revision`: in a commit's
 /// tree, or in a worktree, tracked or new and not ignored. Read quietly,
@@ -290,6 +309,9 @@ pub fn snapshot_grep(repo: &str, revision: &Revision, query: &str) -> Vec<Found>
 /// A file's text as it is at `revision`; an error for binary files and very
 /// large ones.
 pub fn snapshot_file(repo: &str, revision: &Revision, file: &str) -> Result<String, CoreError> {
+    if let Some(text) = git::snapshot_submodule(repo, revision, file) {
+        return Ok(text);
+    }
     let bytes = match revision {
         Revision::Commit(id) => console::as_refresh(|| git::show(repo, &format!("{id}:{file}")))?,
         Revision::Worktree(path) => {

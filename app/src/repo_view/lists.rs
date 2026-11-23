@@ -317,7 +317,10 @@ impl RepoView {
                                             .font_weight(preferences::code_weight())
                                             .text_xs()
                                             .text_color(theme.secondary)
-                                            .child(file.status.clone()),
+                                            .child(match file.submodule {
+                                                true => "⊞".to_string(),
+                                                false => file.status.clone(),
+                                            }),
                                     )
                                     .child(div().truncate().child(name.clone()))
                             }

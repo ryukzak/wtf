@@ -137,6 +137,8 @@ struct Snapshot {
     /// The state listed, its files, and a state being listed.
     revision: Option<Revision>,
     files: Vec<String>,
+    /// Which of them are submodules.
+    submodules: HashSet<String>,
     loading: Option<Revision>,
     /// The file open, and its text as last read: at which state, and
     /// whether it is there.
@@ -443,6 +445,8 @@ pub struct RepoView {
     stacked_files: Vec<ChangedFile>,
     /// For a selected worktree, where staged files start in `files`.
     worktree_split: Option<usize>,
+    /// Submodules of the worktree in review changed only inside.
+    submodules_inside: Vec<String>,
     /// Diff rows picked for staging, all in one file.
     line_selection: Option<(usize, Vec<usize>)>,
     line_anchor: Option<usize>,
@@ -627,6 +631,7 @@ impl RepoView {
             stacked_diffs: Vec::new(),
             stacked_files: Vec::new(),
             worktree_split: None,
+            submodules_inside: Vec::new(),
             line_selection: None,
             line_anchor: None,
             draft: CommitDraft::default(),
@@ -1593,17 +1598,17 @@ impl RepoView {
         let load = cx.background_executor().spawn(async move {
             if let Some(stash) = stash {
                 return wtf_core::stash_files(&repo_path, &stash)
-                    .map(|(files, split)| (files, Some(split)));
+                    .map(|(files, split)| (files, Some(split), Vec::new()));
             }
             match worktree {
                 Some(path) => wtf_core::worktree_status(&path).map(|status| {
                     let split = status.unstaged.len();
                     let mut files = status.unstaged;
                     files.extend(status.staged);
-                    (files, Some(split))
+                    (files, Some(split), status.inside)
                 }),
                 None => wtf_core::changed_files(&repo_path, base.as_deref(), &tip)
-                    .map(|files| (files, None)),
+                    .map(|files| (files, None, Vec::new())),
             }
         });
         self.files_task = Some(cx.spawn(async move |this, cx| {
@@ -1611,9 +1616,10 @@ impl RepoView {
             this.update(cx, |this, cx| {
                 this.files_task = None;
                 match result {
-                    Ok((files, split)) => {
+                    Ok((files, split, inside)) => {
                         this.files = files;
                         this.worktree_split = split;
+                        this.submodules_inside = inside;
                         this.error_message = None;
                         let kept = keep.and_then(|path| {
                             this.files.iter().position(|file| file.path() == path)
@@ -1874,6 +1880,21 @@ impl RepoView {
             }
         }
         cx.notify();
+    }
+
+    /// Opens a submodule, by its path in the worktree in review or else the
+    /// repository, as a tab of its own.
+    pub(super) fn open_submodule(&self, path: &str, cx: &mut Context<Self>) {
+        let root = self
+            .staging_worktree()
+            .or_else(|| self.current_worktree_path().map(str::to_string))
+            .or_else(|| self.repo_path.clone());
+        let Some(root) = root else {
+            return;
+        };
+        let full = Path::new(&root).join(path).to_string_lossy().into_owned();
+        // After this update: opening a tab updates the window this runs in.
+        cx.defer(move |cx| workspace::open_paths(vec![full], cx));
     }
 
     /// The panels' sizes as they are now, to keep.
@@ -2620,15 +2641,17 @@ impl RepoView {
         if !listed && self.snapshot.loading.as_ref() != Some(&revision) {
             self.snapshot.loading = Some(revision.clone());
             let (repo, wanted, listing) = (repo.clone(), revision.clone(), revision.clone());
-            let load = cx
-                .background_executor()
-                .spawn(async move { wtf_core::snapshot_files(&repo, &wanted) });
+            let load = cx.background_executor().spawn(async move {
+                let files = wtf_core::snapshot_files(&repo, &wanted);
+                (files, wtf_core::snapshot_submodules(&repo, &wanted))
+            });
             self.snapshot_tasks[0] = Some(cx.spawn(async move |this, cx| {
-                let files = load.await;
+                let (files, submodules) = load.await;
                 this.update(cx, |this, cx| {
                     if this.snapshot.loading.as_ref() == Some(&listing) {
                         this.snapshot.loading = None;
                         this.snapshot.files = files.unwrap_or_default();
+                        this.snapshot.submodules = submodules.into_iter().collect();
                         this.snapshot.revision = Some(listing);
                         cx.notify();
                     }
@@ -2976,6 +2999,7 @@ impl RepoView {
                 old_id: String::new(),
                 new_id: String::new(),
                 worktree: None,
+                submodule: false,
             })
             .collect()
     }
@@ -3070,6 +3094,8 @@ impl RepoView {
                                 let missing = this.snapshot.revision.is_some()
                                     && !deleted
                                     && !this.snapshot.files.contains(&path);
+                                let submodule = this.snapshot.submodules.contains(&path);
+                                let open_path = path.clone();
                                 item.pl(indent(*depth))
                                     .when(open, |item| item.bg(theme.selection))
                                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -3090,7 +3116,10 @@ impl RepoView {
                                             .font_weight(preferences::code_weight())
                                             .text_xs()
                                             .text_color(theme.accent)
-                                            .child(file.status.clone()),
+                                            .child(match submodule {
+                                                true => "⊞".to_string(),
+                                                false => file.status.clone(),
+                                            }),
                                     )
                                     .child(
                                         div()
@@ -3104,6 +3133,22 @@ impl RepoView {
                                             })
                                             .child(name.clone()),
                                     )
+                                    // A submodule opens as a tab of its own.
+                                    .when(submodule, |item| {
+                                        item.child(div().flex_1()).child(
+                                            div()
+                                                .id(("snapshot-open-sub", k))
+                                                .flex_none()
+                                                .text_xs()
+                                                .text_color(theme.accent)
+                                                .cursor_pointer()
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.open_submodule(&open_path, cx)
+                                                }))
+                                                .child("Open"),
+                                        )
+                                    })
                             }
                             TreeRow::Section(..) => item,
                         }
@@ -3514,6 +3559,7 @@ mod tests {
             old_id: String::new(),
             new_id: String::new(),
             worktree: None,
+            submodule: false,
         };
         let files = [
             file("app/src/main.rs"),

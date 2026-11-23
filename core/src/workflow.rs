@@ -1282,6 +1282,70 @@ mod tests {
     }
 
     #[test]
+    fn a_submodule_change_reads_as_the_commits_it_moves_over() {
+        // lib is a repository of its own, added to app as a submodule.
+        let lib = Fixture::new();
+        lib.commit(".", "l.txt", "1\n", "lib one");
+        let app = Fixture::new();
+        app.commit(".", "a.txt", "1\n", "app one");
+        let url = lib.path();
+        app.git(
+            ".",
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                &url,
+                "lib",
+            ],
+        );
+        app.git(".", &["commit", "-q", "-m", "add lib"]);
+        // The worktree's lib moves on two commits, not yet committed in app.
+        app.commit("lib", "l.txt", "1\n2\n", "lib two");
+        app.commit("lib", "l.txt", "1\n2\n3\n", "lib three");
+
+        let path = app.path();
+        let worktree = crate::Revision::Worktree(path.clone());
+        let files = crate::git::changed_files(&path, Some("HEAD"), &worktree).unwrap();
+        let lib_change = files.iter().find(|f| f.path() == "lib").unwrap();
+        assert!(lib_change.submodule);
+        let (old, new) = crate::git::read_blobs(&path, lib_change).unwrap();
+        let (old, new) = (
+            String::from_utf8(old).unwrap(),
+            String::from_utf8(new).unwrap(),
+        );
+        assert!(old.starts_with("Submodule lib\nat "), "{old}");
+        assert!(!old.contains("lib two"));
+        assert!(
+            new.contains("lib three") && new.contains("lib two"),
+            "{new}"
+        );
+        assert!(!new.contains("uncommitted"));
+        // Changes inside are said too.
+        app.write("lib", "l.txt", "dirty\n");
+        let (_, new) = crate::git::read_blobs(&path, lib_change).unwrap();
+        assert!(
+            String::from_utf8(new)
+                .unwrap()
+                .contains("uncommitted changes inside")
+        );
+        // A snapshot shows where it points, not an unreadable folder.
+        let text = crate::snapshot_file(&path, &worktree, "lib").unwrap();
+        assert!(text.starts_with("Submodule lib\n"));
+        let head = app.git(".", &["rev-parse", "HEAD"]);
+        let text = crate::snapshot_file(&path, &crate::Revision::Commit(head), "lib").unwrap();
+        assert!(text.starts_with("Submodule lib\n"));
+        // Its move committed, it is changed only inside: nothing to commit
+        // here, so it is listed apart.
+        app.git(".", &["commit", "-q", "-am", "move lib"]);
+        let status = crate::git::worktree_status(&path).unwrap();
+        assert_eq!(status.inside, ["lib"]);
+        assert!(status.unstaged.iter().all(|f| f.path() != "lib"));
+    }
+
+    #[test]
     fn work_on_a_release_line_counts_from_where_the_line_is_now() {
         // Release v1 forks from master at c2; the remote has it at f2, the
         // local branch is behind at f1; fix is work on it.

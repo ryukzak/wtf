@@ -369,12 +369,30 @@ impl RepoView {
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| this.toggle_fold(index, cx)))
                     .child(chevron(!folded, theme.secondary, preferences::code_size()))
-                    .child(div().text_color(theme.secondary).child(file.status.clone()))
+                    .child(
+                        div()
+                            .text_color(theme.secondary)
+                            .child(match file.submodule {
+                                // A submodule: its pointer, not a file.
+                                true => "⊞".to_string(),
+                                false => file.status.clone(),
+                            }),
+                    )
                     .child(
                         div()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .child(file.path().to_string()),
                     )
+                    .when(file.submodule, |header| {
+                        let open = path.clone();
+                        header.child(
+                            button(SharedString::from(format!("open-sub-{index}")), "Open")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.open_submodule(&open, cx)
+                                })),
+                        )
+                    })
                     .children(staged.map(|staged| {
                         let label = if staged { "Unstage File" } else { "Stage File" };
                         let lines = match &self.line_selection {
