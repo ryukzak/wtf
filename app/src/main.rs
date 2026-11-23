@@ -7,6 +7,7 @@ mod graph_view;
 mod line_edit;
 mod menus;
 mod palette;
+mod panels;
 mod popups;
 mod preferences;
 mod recent;
@@ -138,8 +139,9 @@ fn main() {
         if restored.is_empty() {
             open_window(paths, cx);
         } else {
-            for (active, tabs) in restored {
-                workspace::open_window_at(tabs, active, cx);
+            for saved in restored {
+                let bounds = session::placed(saved.bounds, cx);
+                workspace::open_window_at(saved.tabs, saved.active, bounds, cx);
             }
             if !paths.is_empty() {
                 workspace::open_paths(paths, cx);

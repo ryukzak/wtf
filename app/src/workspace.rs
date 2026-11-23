@@ -88,17 +88,23 @@ impl Render for TabPreview {
 
 /// Opens a window with a tab for each path, or one empty tab.
 pub fn open_window(paths: Vec<String>, cx: &mut App) {
-    open_window_at(paths, 0, cx);
+    open_window_at(paths, 0, None, cx);
 }
 
-/// Opens a window on `paths`, with the `active` one in front.
-pub fn open_window_at(paths: Vec<String>, active: usize, cx: &mut App) {
+/// Opens a window on `paths`, with the `active` one in front, where
+/// `place` says, or where a new window goes.
+pub fn open_window_at(
+    paths: Vec<String>,
+    active: usize,
+    place: Option<WindowBounds>,
+    cx: &mut App,
+) {
     // Each new window steps down and right from the last, as macOS cascades.
     let mut bounds = Bounds::centered(None, size(px(1400.), px(900.)), cx);
     let step = px(28. * cx.windows().len() as f32);
     bounds.origin = point(bounds.origin.x + step, bounds.origin.y + step);
     let options = WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        window_bounds: Some(place.unwrap_or(WindowBounds::Windowed(bounds))),
         // The tab bar is drawn in the title bar, next to the traffic lights.
         titlebar: Some(TitlebarOptions {
             title: Some("wtf".into()),
@@ -117,6 +123,9 @@ pub fn open_window_at(paths: Vec<String>, active: usize, cx: &mut App) {
 
 impl Workspace {
     fn new(paths: Vec<String>, active: usize, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        // Moved or resized, the window is drawn again, which saves its place.
+        cx.observe_window_bounds(window, |_, _, cx| cx.notify())
+            .detach();
         cx.observe_window_activation(window, |this, window, cx| {
             if window.is_window_active() {
                 this.activate(this.active, window, cx);
@@ -763,7 +772,12 @@ impl Render for Workspace {
                 tabs.push(path.to_string());
             }
         }
-        crate::session::remember(window.window_handle().window_id(), front, tabs, cx);
+        let saved = crate::session::Saved {
+            active: front,
+            tabs,
+            bounds: Some(window.window_bounds()),
+        };
+        crate::session::remember(window.window_handle().window_id(), saved, cx);
         div()
             .flex()
             .flex_col()

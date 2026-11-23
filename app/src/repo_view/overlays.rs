@@ -338,27 +338,76 @@ impl RepoView {
         }
     }
 
-    /// Lists the stale branches and worktrees, all ticked to go.
+    /// Lists what looks stale, worktrees, branches and stashes, merged
+    /// branches ticked to go.
     pub(super) fn open_prune(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.prune = Some(self.stale_branches());
+        self.prune = Some(self.prune_items());
         self.prune_focus.focus(window);
         cx.notify();
     }
 
-    /// Branches the prune dialog offers, each with whether it starts ticked.
-    pub(super) fn stale_branches(&self) -> Vec<(String, bool)> {
-        self.graph
+    /// What the prune dialog offers, in its sections' order: worktrees with
+    /// their branches, branches alone, then stashes; each with whether it
+    /// starts ticked. Merged branches start ticked; the rest, idle or with a
+    /// gone remote, may still hold work, and stashes are work set aside, so
+    /// they wait to be ticked.
+    pub(super) fn prune_items(&self) -> Vec<PruneItem> {
+        let status_of = |name: &str| {
+            let branch = self.graph.branches.iter().find(|b| b.name == name);
+            let has = |reason: &str| branch.is_some_and(|b| b.stale.iter().any(|r| r == reason));
+            match (branch, has("merged"), has("remote gone")) {
+                (_, true, _) => PruneStatus::Merged,
+                // A branch that is no more is as gone as its remote one.
+                (None, _, _) | (_, _, true) => PruneStatus::Gone,
+                _ => PruneStatus::Idle,
+            }
+        };
+        let mut items: Vec<PruneItem> = self
+            .graph
             .branches
             .iter()
             .filter(|branch| !branch.remote && !branch.unrelated && branch.name != self.graph.main)
             .filter(|branch| graph_view::stale_note(&self.graph, &branch.name).is_some())
-            // Merged ones start ticked; the rest, idle or with a gone remote,
-            // may still hold work, so they wait to be ticked.
             .map(|branch| {
-                let merged = branch.stale.iter().any(|reason| reason == "merged");
-                (branch.name.clone(), merged)
+                let status = status_of(&branch.name);
+                PruneItem {
+                    kind: match self.prune_worktree(&branch.name).is_some() {
+                        true => PruneKind::Worktree,
+                        false => PruneKind::Branch,
+                    },
+                    name: branch.name.clone(),
+                    status,
+                    on: status == PruneStatus::Merged,
+                }
             })
-            .collect()
+            .collect();
+        // A stash goes by its branch: merged or gone, its work is likely in;
+        // else by its age.
+        let now = now_seconds();
+        let idle = i64::from(preferences::idle_days()) * 86_400;
+        items.extend(self.graph.stashes.iter().map(|stash| {
+            let status = match stash.branch.as_deref().map(status_of) {
+                Some(status @ (PruneStatus::Merged | PruneStatus::Gone)) => status,
+                _ if now - stash.time >= idle => PruneStatus::Idle,
+                _ => PruneStatus::Recent,
+            };
+            PruneItem {
+                kind: PruneKind::Stash,
+                name: stash.name.clone(),
+                status,
+                on: false,
+            }
+        }));
+        // Worktrees, branches, then stashes; in each, merged first.
+        items.sort_by_key(|item| (item.kind, item.status));
+        items
+    }
+
+    /// The worktree that has a branch the prune dialog offers checked out.
+    fn prune_worktree(&self, name: &str) -> Option<&wtf_core::GraphNode> {
+        self.graph.nodes.iter().find(|node| {
+            node.kind == wtf_core::NodeKind::Uncommitted && node.branch.as_deref() == Some(name)
+        })
     }
 
     fn close_prune(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -367,35 +416,45 @@ impl RepoView {
         cx.notify();
     }
 
-    /// Deletes the ticked branches, each worktree first, in the terminal: a
-    /// merged branch as git checks it, others with their commits. One that
-    /// fails leaves the rest to go on.
+    /// Deletes what is ticked, in the terminal: each worktree, then its
+    /// branch, a merged one as git checks it, others with their commits;
+    /// then the stashes, the last first, so the others keep their names.
+    /// One that fails leaves the rest to go on.
     fn run_prune(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (Some(list), Some(repo)) = (self.prune.take(), self.repo_path.clone()) else {
             return;
         };
-        let lines: Vec<String> = list
-            .into_iter()
-            .filter(|(_, ticked)| *ticked)
-            .filter_map(|(name, _)| {
-                let branch = self.graph.branches.iter().find(|b| b.name == name)?;
+        let ticked: Vec<PruneItem> = list.into_iter().filter(|item| item.on).collect();
+        let mut lines: Vec<String> = ticked
+            .iter()
+            .filter(|item| item.kind != PruneKind::Stash)
+            .filter_map(|item| {
+                let name = &item.name;
+                let branch = self.graph.branches.iter().find(|b| b.name == *name)?;
                 let merged = branch.stale.iter().any(|reason| reason == "merged");
                 let delete = match merged {
-                    true => popups::delete_branch(&repo, &name),
-                    false => popups::delete_branch_with_commits(&repo, &name),
+                    true => popups::delete_branch(&repo, name),
+                    false => popups::delete_branch_with_commits(&repo, name),
                 };
-                let worktree = self.graph.nodes.iter().find_map(|node| match &node.tip {
-                    Revision::Worktree(path) if node.branch.as_ref() == Some(&name) => {
-                        Some(path.clone())
+                Some(match self.prune_worktree(name).map(|node| &node.tip) {
+                    Some(Revision::Worktree(path)) => {
+                        format!("{} && {delete}", popups::remove_worktree(&repo, path))
                     }
-                    _ => None,
-                });
-                Some(match worktree {
-                    Some(path) => format!("{} && {delete}", popups::remove_worktree(&repo, &path)),
-                    None => delete,
+                    _ => delete,
                 })
             })
             .collect();
+        let mut stashes: Vec<&str> = ticked
+            .iter()
+            .filter(|item| item.kind == PruneKind::Stash)
+            .map(|item| item.name.as_str())
+            .collect();
+        stashes.sort_by_key(|name| std::cmp::Reverse(stash_index(name)));
+        lines.extend(
+            stashes
+                .into_iter()
+                .map(|name| popups::stash_drop(&repo, name)),
+        );
         self.focus.focus(window);
         if !lines.is_empty() {
             self.run_in_terminal(lines.join(" ; "), window, cx);
@@ -421,13 +480,86 @@ impl RepoView {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let list = self.prune.as_ref()?;
-        let ticked = list.iter().filter(|(_, ticked)| *ticked).count();
-        let rows = list.iter().enumerate().map(|(k, (name, on))| {
-            let worktree = self.graph.nodes.iter().find(|node| {
-                node.kind == wtf_core::NodeKind::Uncommitted && node.branch.as_ref() == Some(name)
-            });
-            let note = graph_view::stale_note(&self.graph, name).unwrap_or_default();
-            div()
+        let ticked = list.iter().filter(|item| item.on).count();
+        // A heading over each kind where it starts, and under it one over
+        // each status.
+        let heading = |k: usize| {
+            let (kind, status) = (list[k].kind, list[k].status);
+            let new_kind = k == 0 || list[k - 1].kind != kind;
+            let new_status = new_kind || list[k - 1].status != status;
+            let mut headings = Vec::new();
+            if new_kind {
+                let count = list.iter().filter(|item| item.kind == kind).count();
+                let title = match kind {
+                    PruneKind::Worktree => "Worktrees, with their branches",
+                    PruneKind::Branch => "Branches",
+                    PruneKind::Stash => "Stashes",
+                };
+                headings.push(
+                    div()
+                        .pt(px(if k == 0 { 0. } else { 10. }))
+                        .pb(px(2.))
+                        .px(px(8.))
+                        .text_xs()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(theme.foreground)
+                        .child(format!("{title} · {count}"))
+                        .into_any_element(),
+                );
+            }
+            if new_status {
+                let count = list
+                    .iter()
+                    .filter(|item| (item.kind, item.status) == (kind, status))
+                    .count();
+                let title = match status {
+                    PruneStatus::Merged => "Merged",
+                    PruneStatus::Gone => "Gone from the remote",
+                    PruneStatus::Idle => "Idle",
+                    PruneStatus::Recent => "Recent",
+                };
+                headings.push(
+                    div()
+                        .pt(px(4.))
+                        .pl(px(16.))
+                        .text_xs()
+                        .text_color(theme.secondary)
+                        .child(format!("{title} · {count}"))
+                        .into_any_element(),
+                );
+            }
+            headings
+        };
+        let now = now_seconds();
+        let rows = list.iter().enumerate().flat_map(|(k, item)| {
+            let (name, on) = (&item.name, item.on);
+            // A worktree by its folder, its branch beside it; a branch by its
+            // name; a stash by its message. Why it looks stale after.
+            let (title, beside, note) = match item.kind {
+                PruneKind::Stash => {
+                    let stash = self.graph.stashes.iter().find(|stash| stash.name == *name);
+                    (
+                        stash.map_or(name.clone(), |stash| stash.message.clone()),
+                        Some(name.clone()),
+                        stash.map_or(String::new(), |stash| short_age(stash.time, now)),
+                    )
+                }
+                kind => {
+                    let note = graph_view::stale_note(&self.graph, name).unwrap_or_default();
+                    match self
+                        .prune_worktree(name)
+                        .filter(|_| kind == PruneKind::Worktree)
+                    {
+                        Some(node) => (
+                            graph_view::worktree_label(node, WorktreeNames::Folder),
+                            Some(name.clone()),
+                            note,
+                        ),
+                        None => (name.clone(), None, note),
+                    }
+                }
+            };
+            let row = div()
                 .id(("prune", k))
                 .flex()
                 .items_center()
@@ -439,29 +571,26 @@ impl RepoView {
                 .hover(|row| row.bg(theme.selection.opacity(0.5)))
                 .when(!on, |row| row.text_color(theme.secondary))
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    if let Some((_, on)) = this.prune.as_mut().and_then(|list| list.get_mut(k)) {
-                        *on = !*on;
+                    if let Some(item) = this.prune.as_mut().and_then(|list| list.get_mut(k)) {
+                        item.on = !item.on;
                         cx.notify();
                     }
                 }))
                 .child(attention_checkbox(
                     ("prune-check", k),
-                    Some(*on),
+                    Some(on),
                     true,
                     theme,
                 ))
-                .child(div().min_w_0().truncate().child(name.clone()))
-                .children(worktree.map(|node| {
+                .child(div().min_w_0().truncate().child(title))
+                .children(beside.map(|beside| {
                     div()
                         .flex_none()
                         .px(px(5.))
                         .rounded(px(3.))
                         .bg(theme.tag_background)
                         .text_xs()
-                        .child(format!(
-                            "▣ {}",
-                            graph_view::worktree_label(node, WorktreeNames::Folder)
-                        ))
+                        .child(beside)
                 }))
                 .child(div().flex_1())
                 .child(
@@ -471,7 +600,8 @@ impl RepoView {
                         .text_color(theme.secondary)
                         .italic()
                         .child(note),
-                )
+                );
+            heading(k).into_iter().chain([row.into_any_element()])
         });
         let button = |id: &'static str, label: String| {
             div()
@@ -500,11 +630,11 @@ impl RepoView {
                 .child(
                     div()
                         .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .child("Prune stale branches and worktrees"),
+                        .child("Prune stale worktrees, branches and stashes"),
                 )
                 .child(div().text_xs().text_color(theme.secondary).child(
-                    "Untick what to keep. Worktrees go first, then their branches; merged ones \
-                 as git checks them, others with their commits.",
+                    "Tick what goes. Worktrees go first, then their branches: merged ones as \
+                 git checks them, others with their commits. Stashes are dropped.",
                 ))
                 // Everything at once, then untick or tick from there.
                 .when(!list.is_empty(), |panel| {
@@ -515,8 +645,8 @@ impl RepoView {
                             .text_color(theme.accent)
                             .cursor_pointer()
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                for (_, ticked) in this.prune.iter_mut().flatten() {
-                                    *ticked = on;
+                                for item in this.prune.iter_mut().flatten() {
+                                    item.on = on;
                                 }
                                 cx.notify();
                             }))
@@ -1510,4 +1640,44 @@ fn menu_label(label: &popups::Label, theme: &Theme) -> AnyElement {
         });
     }
     row.into_any_element()
+}
+
+/// What a prune dialog row deletes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum PruneKind {
+    /// A worktree, and then its branch.
+    Worktree,
+    Branch,
+    Stash,
+}
+
+/// Why a prune dialog row looks stale, in the order the rows go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum PruneStatus {
+    /// A channel has its work: safe to go.
+    Merged,
+    /// Its remote branch, or for a stash its branch, is no more.
+    Gone,
+    /// Left alone long.
+    Idle,
+    /// A stash made lately.
+    Recent,
+}
+
+/// A row of the prune dialog: what, by its name, why, and whether it is
+/// ticked.
+#[derive(Debug, Clone)]
+pub(super) struct PruneItem {
+    pub kind: PruneKind,
+    pub name: String,
+    pub status: PruneStatus,
+    pub on: bool,
+}
+
+/// A stash's place in the list, from its name: 2 for `stash@{2}`.
+fn stash_index(name: &str) -> usize {
+    name.trim_start_matches("stash@{")
+        .trim_end_matches('}')
+        .parse()
+        .unwrap_or(0)
 }

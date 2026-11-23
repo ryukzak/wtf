@@ -3,33 +3,38 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex};
 
-use gpui::{App, WindowId};
+use gpui::{App, Bounds, WindowBounds, WindowId, point, px, size};
 
-/// A window's active tab and its repositories.
-type Tabs = (usize, Vec<String>);
+/// A window as wtf last saw it: its active tab, its repositories, and where
+/// it was on screen.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Saved {
+    pub active: usize,
+    pub tabs: Vec<String>,
+    pub bounds: Option<WindowBounds>,
+}
 
-/// Each open window's tabs, as last drawn, and what was last written, so the
-/// file changes only when they do.
-static OPEN: LazyLock<Mutex<(HashMap<WindowId, Tabs>, String)>> = LazyLock::new(Mutex::default);
+/// Each open window, as last drawn, and what was last written, so the file
+/// changes only when they do.
+static OPEN: LazyLock<Mutex<(HashMap<WindowId, Saved>, String)>> = LazyLock::new(Mutex::default);
 
 fn file() -> PathBuf {
     crate::recent::support_file("session")
 }
 
-/// The windows open when wtf last quit: each with its active tab and its
-/// repositories.
-pub fn load() -> Vec<Tabs> {
+/// The windows open when wtf last quit.
+pub fn load() -> Vec<Saved> {
     parse(&fs::read_to_string(file()).unwrap_or_default())
 }
 
-/// Notes a window's tabs and saves every open window's when they changed.
-/// Windows closed since drop out; quitting draws nothing, so what was open
-/// then stays saved. A session that cannot be saved is only a missing
-/// convenience, so errors are ignored.
-pub fn remember(window: WindowId, active: usize, tabs: Vec<String>, cx: &App) {
+/// Notes a window's tabs and place, and saves every open window's when
+/// they changed. Windows closed since drop out; quitting draws nothing, so
+/// what was open then stays saved. A session that cannot be saved is only
+/// a missing convenience, so errors are ignored.
+pub fn remember(window: WindowId, saved: Saved, cx: &App) {
     let mut open = OPEN.lock().unwrap_or_else(|error| error.into_inner());
     let (windows, written) = &mut *open;
-    windows.insert(window, (active, tabs));
+    windows.insert(window, saved);
     let alive: Vec<WindowId> = cx
         .windows()
         .iter()
@@ -38,7 +43,7 @@ pub fn remember(window: WindowId, active: usize, tabs: Vec<String>, cx: &App) {
     windows.retain(|window, _| alive.contains(window));
     let mut ids: Vec<&WindowId> = windows.keys().collect();
     ids.sort_by_key(|id| id.as_u64());
-    let sessions: Vec<Tabs> = ids.into_iter().map(|id| windows[id].clone()).collect();
+    let sessions: Vec<Saved> = ids.into_iter().map(|id| windows[id].clone()).collect();
     let text = format(&sessions);
     if text != *written {
         let file = file();
@@ -50,27 +55,86 @@ pub fn remember(window: WindowId, active: usize, tabs: Vec<String>, cx: &App) {
     }
 }
 
-/// A line a window: its active tab, then its repositories, tab-separated.
-fn format(windows: &[Tabs]) -> String {
+/// Where a saved window goes again: where it was, when a display still
+/// shows enough of it; else nowhere in particular.
+pub fn placed(bounds: Option<WindowBounds>, cx: &App) -> Option<WindowBounds> {
+    let bounds = bounds?;
+    let inner = bounds.get_bounds();
+    // Its title bar on some display, so it can be grabbed.
+    let title = Bounds::new(inner.origin, size(inner.size.width, px(30.)));
+    cx.displays()
+        .iter()
+        .any(|display| display.bounds().intersects(&title))
+        .then_some(bounds)
+}
+
+/// A line a window: its active tab, where it was as `@x,y,w,h,state` with
+/// state 0 windowed, 1 maximized, 2 full screen, then its repositories,
+/// tab-separated. Lines without the place, from before, still read.
+fn format(windows: &[Saved]) -> String {
     windows
         .iter()
-        .filter(|(_, tabs)| !tabs.is_empty())
-        .map(|(active, tabs)| format!("{active}\t{}\n", tabs.join("\t")))
+        .filter(|saved| !saved.tabs.is_empty())
+        .map(|saved| {
+            let place = saved.bounds.map(|bounds| {
+                let (state, b) = match bounds {
+                    WindowBounds::Windowed(b) => (0, b),
+                    WindowBounds::Maximized(b) => (1, b),
+                    WindowBounds::Fullscreen(b) => (2, b),
+                };
+                format!(
+                    "\t@{},{},{},{},{state}",
+                    f32::from(b.origin.x),
+                    f32::from(b.origin.y),
+                    f32::from(b.size.width),
+                    f32::from(b.size.height)
+                )
+            });
+            format!(
+                "{}{}\t{}\n",
+                saved.active,
+                place.unwrap_or_default(),
+                saved.tabs.join("\t")
+            )
+        })
         .collect()
 }
 
-fn parse(text: &str) -> Vec<Tabs> {
+fn parse(text: &str) -> Vec<Saved> {
     text.lines()
         .filter_map(|line| {
-            let mut fields = line.split('\t');
+            let mut fields = line.split('\t').peekable();
             let active = fields.next()?.parse().ok()?;
+            let bounds = fields
+                .next_if(|field| field.starts_with('@'))
+                .and_then(|field| parse_place(&field[1..]));
             let tabs: Vec<String> = fields
                 .filter(|tab| !tab.is_empty())
                 .map(str::to_string)
                 .collect();
-            (!tabs.is_empty()).then_some((active, tabs))
+            (!tabs.is_empty()).then_some(Saved {
+                active,
+                tabs,
+                bounds,
+            })
         })
         .collect()
+}
+
+fn parse_place(place: &str) -> Option<WindowBounds> {
+    let numbers: Vec<f32> = place
+        .split(',')
+        .map(|n| n.parse().ok())
+        .collect::<Option<_>>()?;
+    let [x, y, w, h, state] = numbers[..] else {
+        return None;
+    };
+    let bounds = Bounds::new(point(px(x), px(y)), size(px(w), px(h)));
+    Some(match state as u8 {
+        1 => WindowBounds::Maximized(bounds),
+        2 => WindowBounds::Fullscreen(bounds),
+        _ => WindowBounds::Windowed(bounds),
+    })
 }
 
 #[cfg(test)]
@@ -79,15 +143,30 @@ mod tests {
 
     #[test]
     fn sessions_survive_saving_and_loading() {
+        let place = Bounds::new(point(px(10.), px(40.)), size(px(1200.), px(800.)));
         let windows = vec![
-            (1, vec!["/a".to_string(), "/b c".to_string()]),
-            (0, Vec::new()),
-            (0, vec!["/d".to_string()]),
+            Saved {
+                active: 1,
+                tabs: vec!["/a".to_string(), "/b c".to_string()],
+                bounds: Some(WindowBounds::Maximized(place)),
+            },
+            Saved {
+                active: 0,
+                tabs: Vec::new(),
+                bounds: None,
+            },
+            Saved {
+                active: 0,
+                tabs: vec!["/d".to_string()],
+                bounds: None,
+            },
         ];
         assert_eq!(
             parse(&format(&windows)),
             [windows[0].clone(), windows[2].clone()]
         );
         assert!(parse("x\t/a\n").is_empty());
+        // Saved before places were.
+        assert_eq!(parse("0\t/a\n")[0].tabs, ["/a"]);
     }
 }

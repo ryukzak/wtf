@@ -347,7 +347,7 @@ pub struct RepoView {
     blink_task: Option<Task<()>>,
     /// The prune list, when open: stale branches by name, and whether each is
     /// ticked to go.
-    prune: Option<Vec<(String, bool)>>,
+    prune: Option<Vec<overlays::PruneItem>>,
     prune_focus: FocusHandle,
     /// The Go To picker or the command palette, when open: the query, the
     /// highlighted result, and whether it lists commands.
@@ -547,6 +547,14 @@ impl RepoView {
             .detach();
         let focus = cx.focus_handle();
         focus.focus(window);
+        // Panels open at the sizes they were last dragged to.
+        let sizes = crate::panels::load(crate::panels::Sizes {
+            sidebar: ATTENTION_PANEL_WIDTH,
+            dock: DOCK_HEIGHT,
+            graph: None,
+            commits: 300.,
+            snapshot_header: None,
+        });
         Self {
             focus,
             active: false,
@@ -581,7 +589,7 @@ impl RepoView {
             completions: Vec::new(),
             side_panel: None,
             last_panel: SidePanel::Attention,
-            sidebar_width: ATTENTION_PANEL_WIDTH,
+            sidebar_width: sizes.sidebar,
             attention_search: String::new(),
             attention_search_focus: cx.focus_handle(),
             collapsed_sections: HashSet::new(),
@@ -653,13 +661,13 @@ impl RepoView {
             awaiting_stash: None,
             log_seq: 0,
             announced_dir: None,
-            dock_height: DOCK_HEIGHT,
+            dock_height: sizes.dock,
             terminal: None,
-            graph_height: None,
-            snapshot_header_height: None,
+            graph_height: sizes.graph,
+            snapshot_header_height: sizes.snapshot_header,
             header_drag: None,
             dragging: None,
-            commits_width: 300.,
+            commits_width: sizes.commits,
             refresh_task: None,
             fetch_task: None,
             sync_task: None,
@@ -1831,6 +1839,7 @@ impl RepoView {
         };
         if event.pressed_button != Some(MouseButton::Left) {
             self.dragging = None;
+            crate::panels::save(self.panel_sizes());
             return;
         }
         let height = f32::from(window.viewport_size().height);
@@ -1865,6 +1874,17 @@ impl RepoView {
             }
         }
         cx.notify();
+    }
+
+    /// The panels' sizes as they are now, to keep.
+    fn panel_sizes(&self) -> crate::panels::Sizes {
+        crate::panels::Sizes {
+            sidebar: self.sidebar_width,
+            dock: self.dock_height,
+            graph: self.graph_height,
+            commits: self.commits_width,
+            snapshot_header: self.snapshot_header_height,
+        }
     }
 
     fn dock(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
@@ -2408,7 +2428,10 @@ impl Render for RepoView {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
-                    this.dragging = None;
+                    // A border let go: its panel keeps that size from now on.
+                    if this.dragging.take().is_some() {
+                        crate::panels::save(this.panel_sizes());
+                    }
                     // The view stays where the drag left it.
                     if this.graph_drag.take().is_some() {
                         cx.notify();
