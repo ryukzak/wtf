@@ -23,15 +23,47 @@ pub const MESSAGE_PROMPT: &str = "You write a git commit message for the staged 
 below. Use only facts in the input. Reply with a subject line of at most 72 characters in \
 the imperative mood, without a trailing period. If the changes need it, add a blank line \
 and then 1 to 4 short bullets starting with '- ', each a plain sentence about what changed. \
-Plain text only: no Markdown, no code blocks, no backticks, no code or constants copied from \
-the diff. No preamble, no quotes.";
+Plain text only: no Markdown, no code blocks, no backticks, no code or \
+constants copied from the diff. No preamble, no quotes.";
 
-/// A commit message for staged changes, from their files and diff.
-pub fn commit_message(changes: &str, prompt: &str) -> Result<String, CoreError> {
+/// How much the example subjects take at most, so the diff keeps most of
+/// the model's small context.
+const MAX_EXAMPLES: usize = 400;
+
+/// Recent commits' subjects, one a line as `git log --format=%s` lists
+/// them, as words to put before the model's instructions: examples of the
+/// repository's style, as many as fit. Only subjects, ahead of the
+/// instructions and called unrelated, as the on-device model otherwise
+/// takes their content for the change's. Empty when there are none.
+pub fn style_examples(subjects: &str) -> String {
+    let mut examples = String::new();
+    for subject in subjects.lines().map(str::trim).filter(|s| !s.is_empty()) {
+        let example = format!("\n- {subject}");
+        if examples.len() + example.len() > MAX_EXAMPLES {
+            break;
+        }
+        examples.push_str(&example);
+    }
+    match examples.is_empty() {
+        true => examples,
+        false => format!(
+            "Match the wording style of these subject lines from unrelated past commits \
+             (length, capitalization, tone), but never their content:{examples}\n\n"
+        ),
+    }
+}
+
+/// A commit message for staged changes, from their files and diff: the
+/// model's likeliest, or, `varied`, another wording each time.
+pub fn commit_message(changes: &str, prompt: &str, varied: bool) -> Result<String, CoreError> {
     let input: String = changes.chars().take(MAX_INPUT).collect();
-    let text = respond(prompt, &input)?;
+    let text = respond(prompt, &input, !varied)?;
     let summary = parse(&text).ok_or_else(|| CoreError::new("The model wrote no message"))?;
-    let mut message = summary.header;
+    // The model sometimes labels the subject line.
+    let mut message = summary
+        .header
+        .strip_prefix("Subject:")
+        .map_or(summary.header.clone(), |subject| subject.trim().to_string());
     if !summary.details.is_empty() {
         message.push_str("\n\n");
         let bullets: Vec<String> = summary.details.iter().map(|d| format!("- {d}")).collect();
@@ -84,20 +116,17 @@ pub fn summarize(commits: &[Commit], files: &str, prompt: &str) -> Result<Summar
     input.push_str("\nFiles changed:\n");
     input.push_str(files);
     let input: String = input.chars().take(MAX_INPUT).collect();
-    let text = respond(prompt, &input)?;
+    let text = respond(prompt, &input, true)?;
     parse(&text).ok_or_else(|| CoreError::new("The model gave no summary"))
 }
 
-/// The model's answer to `input` under `instructions`, without colors.
-fn respond(instructions: &str, input: &str) -> Result<String, CoreError> {
+/// The model's answer to `input` under `instructions`, without colors:
+/// its likeliest one when `greedy`, else one sampled anew.
+fn respond(instructions: &str, input: &str, greedy: bool) -> Result<String, CoreError> {
     let mut child = Command::new("fm")
-        .args([
-            "respond",
-            "--no-stream",
-            "--greedy",
-            "--instructions",
-            instructions,
-        ])
+        .args(["respond", "--no-stream"])
+        .args(greedy.then_some("--greedy"))
+        .args(["--instructions", instructions])
         .env("NO_COLOR", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -163,6 +192,15 @@ fn strip_ansi(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn style_examples_list_subjects_while_they_fit() {
+        assert_eq!(style_examples(""), "");
+        let examples = style_examples("Fix the bar\nAdd foo\n");
+        assert!(examples.ends_with("their content:\n- Fix the bar\n- Add foo\n\n"));
+        let long = format!("Short\n{}\n", "x".repeat(500));
+        assert!(style_examples(&long).ends_with("- Short\n\n"));
+    }
 
     #[test]
     fn leaves_out_quoted_code() {

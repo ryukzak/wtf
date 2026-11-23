@@ -17,6 +17,89 @@ impl RepoView {
         )
     }
 
+    /// Selects the node an arrow key points to from the selected one, as
+    /// the graph is drawn: the nearest that way, nodes on its row or lane
+    /// first. With nothing selected, it starts from the current worktree or
+    /// the main branch. False when there is nothing that way.
+    pub(super) fn step_node(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
+        let layout = self.graph_layout();
+        let from = self
+            .selected_nodes
+            .last()
+            .copied()
+            .or_else(|| self.current_worktree())
+            .or(self.graph.main_node);
+        let Some(&(start, end, y)) = from.and_then(|from| layout.nodes.get(from)) else {
+            return false;
+        };
+        let x = (start + end) / 2.;
+        let next = graph_view::nearest(&layout.nodes, x, y, key);
+        match next {
+            Some(next) if Some(next) != from => {
+                self.select_and_reveal(next, cx);
+                true
+            }
+            // At the left edge, older commits come in, as scrolling on past
+            // it brings them; the next press goes on into them.
+            None if key == "left" && self.graph.older > 0 => {
+                self.load_older(cx);
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// ⌥← and ⌥→: the selected node's commits one by one, older or
+    /// `newer`, as clicks on its beads pick them. Past either end of its
+    /// run, the next node that way, at its nearer end.
+    pub(super) fn step_commit(&mut self, newer: bool, cx: &mut Context<Self>) {
+        let key = if newer { "right" } else { "left" };
+        let [node] = self.selected_nodes[..] else {
+            self.step_node(key, cx);
+            return;
+        };
+        // Oldest first, as the beads run.
+        let ids: Vec<String> = self.graph.nodes[node]
+            .commits
+            .iter()
+            .map(|commit| commit.id.clone())
+            .collect();
+        let current = self
+            .pending_commit
+            .clone()
+            .or_else(|| match self.narrowed[..] {
+                [i] => self.commits.get(i).map(|commit| commit.id.clone()),
+                _ => None,
+            });
+        let at = current.and_then(|id| ids.iter().position(|c| *c == id));
+        let next = match (at, newer) {
+            // A lone commit is its node already.
+            (None, _) if ids.len() <= 1 => None,
+            (None, true) => Some(0),
+            (None, false) => Some(ids.len() - 1),
+            (Some(at), true) => (at + 1 < ids.len()).then_some(at + 1),
+            (Some(at), false) => at.checked_sub(1),
+        };
+        if let Some(i) = next {
+            self.select_commit(node, ids[i].clone(), cx);
+            return;
+        }
+        if self.step_node(key, cx)
+            && let [next] = self.selected_nodes[..]
+        {
+            let commits = &self.graph.nodes[next].commits;
+            let end = if newer {
+                commits.first()
+            } else {
+                commits.last()
+            };
+            if let Some(commit) = end {
+                self.select_commit(next, commit.id.clone(), cx);
+            }
+        }
+        cx.notify();
+    }
+
     /// The current worktree's node: the last one selected, else the one
     /// this tab opened.
     pub(super) fn current_worktree(&self) -> Option<usize> {
@@ -247,7 +330,9 @@ impl RepoView {
                     // A press on nothing in particular grabs the graph to drag.
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            // The arrow keys then move about the graph.
+                            this.focus.focus(window);
                             if this.hovered_node.is_none() {
                                 this.graph_drag =
                                     Some((event.position, this.graph_scroll.offset()));

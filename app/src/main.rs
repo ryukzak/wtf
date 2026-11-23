@@ -35,6 +35,7 @@ use crate::repo_view::{
 };
 
 fn main() {
+    cli::adopt_login_path();
     let paths: Vec<String> = std::env::args()
         .skip(1)
         .map(|path| workspace::repository_path(&path))

@@ -320,6 +320,12 @@ impl RepoView {
                                             .child(file.status.clone()),
                                     )
                                     .child(div().truncate().child(name.clone()))
+                                    .children(old_name(file).map(|old| {
+                                        div()
+                                            .truncate()
+                                            .text_color(theme.secondary)
+                                            .child(format!("← {old}"))
+                                    }))
                             }
                         }
                     })

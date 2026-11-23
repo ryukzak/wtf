@@ -69,17 +69,7 @@ impl RepoView {
             (Section::Stashes, "STASHES", Some(attention.stashes)),
         ];
         for (section, title, enabled) in groups {
-            let branches: Vec<&wtf_core::Branch> = self
-                .graph
-                .branches
-                .iter()
-                .filter(|branch| match section {
-                    Section::Worktrees => branch.worktree,
-                    Section::Local => !branch.worktree && !branch.remote,
-                    Section::Remote => branch.remote,
-                    Section::Tags | Section::Stashes | Section::Channels => false,
-                })
-                .collect();
+            let branches = self.section_branches(section);
             let mut tags: Vec<&str> = Vec::new();
             // Every tag, so they can be looked over before the graph shows
             // them.
@@ -87,7 +77,9 @@ impl RepoView {
                 tags.extend(self.graph.tags.iter().map(String::as_str));
             }
             // A group's checkbox turns it on or off; worktrees are always on.
-            // An open group shows its count and folds with the chevron.
+            // A double click on it, or its menu, shows or hides all its
+            // branches. An open group shows its count and folds with the
+            // chevron.
             let on = enabled.unwrap_or(true);
             let count = match section {
                 Section::Tags => tags.len().to_string(),
@@ -107,11 +99,24 @@ impl RepoView {
                 theme,
             )
             .when(enabled.is_some(), |checkbox| {
-                checkbox.on_click(cx.listener(move |this, _, _, cx| {
+                checkbox.on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                     cx.stop_propagation();
-                    this.toggle_group(section, cx)
+                    // The second click of a double one turns the group back
+                    // as it was before showing or hiding all.
+                    this.toggle_group(section, cx);
+                    if event.click_count() == 2 {
+                        let names = this.section_branches(section);
+                        let all = names.iter().all(|branch| branch.shown);
+                        let command = if all { Command::Hide } else { Command::Pin };
+                        this.attention_group(section, command, cx);
+                    }
                 }))
             });
+            let menu = match section {
+                Section::Local => Some(Target::Group { remote: false }),
+                Section::Remote => Some(Target::Group { remote: true }),
+                _ => None,
+            };
             body = body.child(
                 div()
                     .id(("attention-section", section as usize))
@@ -135,6 +140,15 @@ impl RepoView {
                         }
                         cx.notify();
                     }))
+                    .when_some(menu, |header, menu| {
+                        header.on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.open_context_menu(menu.clone(), event.position, cx);
+                            }),
+                        )
+                    })
                     .child(panel_chevron(!collapsed, theme))
                     .child(div().flex_1().child(title))
                     .child(div().text_color(theme.secondary).child(count))
@@ -603,6 +617,47 @@ impl RepoView {
                 }),
             )
             .into_any_element()
+    }
+
+    /// The branches a group of the attention list holds.
+    fn section_branches(&self, section: Section) -> Vec<&wtf_core::Branch> {
+        self.graph
+            .branches
+            .iter()
+            .filter(|branch| match section {
+                Section::Worktrees => branch.worktree,
+                Section::Local => !branch.worktree && !branch.remote,
+                Section::Remote => branch.remote,
+                Section::Tags | Section::Stashes | Section::Channels => false,
+            })
+            .collect()
+    }
+
+    /// Shows all of a group's branches with [`Command::Pin`], hides them
+    /// with [`Command::Hide`], or leaves them to the filters.
+    pub(super) fn attention_group(
+        &mut self,
+        section: Section,
+        command: Command,
+        cx: &mut Context<Self>,
+    ) {
+        let names: Vec<String> = self
+            .section_branches(section)
+            .into_iter()
+            .map(|branch| branch.name.clone())
+            .collect();
+        match command {
+            Command::Pin => self.toggle_branches(&names, false, cx),
+            Command::Hide => self.toggle_branches(&names, true, cx),
+            Command::FollowFilters => self.change_attention(
+                |attention| {
+                    attention.pinned.retain(|pinned| !names.contains(pinned));
+                    attention.hidden.retain(|hidden| !names.contains(hidden));
+                },
+                cx,
+            ),
+            _ => {}
+        }
     }
 
     /// Drops a pin or hide, so the filters decide on the branch again.

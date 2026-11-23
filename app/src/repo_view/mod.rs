@@ -196,8 +196,13 @@ struct CommitDraft {
     /// The message as last laid out, to place the cursor by a click and
     /// move it between lines.
     message_layout: RefCell<Option<gpui::TextLayout>>,
-    /// All of the message is selected, by ⌘A.
-    message_selected: bool,
+    /// The other end of the message's selection, when there is one.
+    message_anchor: Option<usize>,
+    /// A press in the message is dragging out a selection.
+    message_dragging: bool,
+    /// The next message the model writes is a new wording, asked for with
+    /// its mark.
+    rewrite: bool,
     /// Earlier and undone messages, for ⌘Z and ⇧⌘Z, and whether the last
     /// change was a typed letter, which the next one joins.
     message_undo: Vec<String>,
@@ -222,7 +227,8 @@ enum StackItem {
     /// Staged or unstaged files, with how many.
     Section(bool, usize),
     Header(usize),
-    Row(usize, usize),
+    /// A file's diff row, and which of its lines when wrapped.
+    Row(usize, usize, usize),
     /// A hunk of a worktree file: its first row and the row after its last.
     Hunk(usize, usize, usize),
     Gap,
@@ -424,6 +430,15 @@ pub struct RepoView {
     diff: Option<FileDiff>,
     selected_file: Option<usize>,
     diff_mode: DiffMode,
+    /// Long diff lines wrap; otherwise they run on and scroll sideways.
+    wrap_lines: bool,
+    /// How far the diff's code is scrolled sideways, and how far it can go.
+    diff_x: Cell<f32>,
+    diff_max_x: Cell<f32>,
+    /// The diff's width when last drawn, and the characters a side then
+    /// holds, which the wrapped all-files view is laid out at.
+    diff_width: Cell<(f32, f32)>,
+    wrap_cols: Option<usize>,
     stacked: Vec<StackItem>,
     stacked_diffs: Vec<Result<FileDiff, String>>,
     /// The files `stacked_diffs` were made from: until a refresh brings
@@ -601,6 +616,11 @@ impl RepoView {
             diff: None,
             selected_file: None,
             diff_mode: DiffMode::Text,
+            wrap_lines: false,
+            diff_x: Cell::new(0.),
+            diff_max_x: Cell::new(0.),
+            diff_width: Cell::new((-1., -1.)),
+            wrap_cols: None,
             stacked: Vec::new(),
             stacked_diffs: Vec::new(),
             stacked_files: Vec::new(),
@@ -1950,6 +1970,22 @@ impl RepoView {
                 return self.with_header(placeholder("Loading…", None, theme), theme, window, cx);
             }
             let spacers = self.header_rows();
+            let width = self
+                .stacked_scroll
+                .0
+                .borrow()
+                .base_handle
+                .bounds()
+                .size
+                .width;
+            let widest = self
+                .stacked_diffs
+                .iter()
+                .flatten()
+                .map(|diff| diff_view::widest(&diff.rows))
+                .max()
+                .unwrap_or(0);
+            self.track_widest(widest, f32::from(width), true, window);
             let list = uniform_list(
                 "stacked",
                 spacers + self.stacked.len(),
@@ -2004,6 +2040,7 @@ impl RepoView {
                 .flex()
                 .flex_col()
                 .size_full()
+                .on_scroll_wheel(cx.listener(Self::scroll_diff_sideways))
                 .when(
                     self.worktree_split.is_some() && self.stash_view.is_none(),
                     |pane| pane.child(self.commit_box(theme, window, cx)),
@@ -2034,20 +2071,45 @@ impl RepoView {
         let shown = match &self.diff {
             Some(diff) if !diff.rows.is_empty() => {
                 let spacers = self.header_rows();
+                let width = self.diff_scroll.0.borrow().base_handle.bounds().size.width;
+                let cols = self.wrap_cols_for(f32::from(width), false, window);
+                let widest = diff_view::widest(&diff.rows);
+                self.track_widest(widest, f32::from(width), false, window);
+                // Wrapped, each row takes as many list rows as it has lines.
+                let lines: Rc<Vec<(usize, usize)>> = Rc::new(match cols {
+                    Some(cols) => diff
+                        .rows
+                        .iter()
+                        .enumerate()
+                        .flat_map(|(i, row)| {
+                            (0..diff_view::parts(row, cols)).map(move |part| (i, part))
+                        })
+                        .collect(),
+                    None => (0..diff.rows.len()).map(|i| (i, 0)).collect(),
+                });
+                let count = lines.len();
                 let list = uniform_list(
                     "diff",
-                    spacers + diff.rows.len(),
+                    spacers + count,
                     cx.processor(move |this, range: std::ops::Range<usize>, window, _| {
                         let theme = Theme::for_appearance(window.appearance());
                         let rows = this.diff.as_ref().map_or(&[][..], |diff| &diff.rows);
                         range
                             .filter_map(|index| match index.checked_sub(spacers) {
                                 None => Some(spacer()),
-                                Some(index) => rows.get(index).map(|row| {
-                                    let colors = this.diff_colors(None, &theme);
-                                    diff_view::row(row, &theme, colors.as_deref())
+                                Some(index) => {
+                                    let &(i, part) = lines.get(index)?;
+                                    rows.get(i).map(|row| {
+                                        let colors = this.diff_colors(None, &theme);
+                                        diff_view::row(
+                                            row,
+                                            &theme,
+                                            colors.as_deref(),
+                                            this.fit(cols, part),
+                                        )
                                         .into_any_element()
-                                }),
+                                    })
+                                }
                             })
                             .collect()
                     }),
@@ -2066,6 +2128,7 @@ impl RepoView {
                     .flex()
                     .flex_col()
                     .size_full()
+                    .on_scroll_wheel(cx.listener(Self::scroll_diff_sideways))
                     .child(self.under_header(
                         list.into_any_element(),
                         scroll_y,
@@ -2262,6 +2325,7 @@ impl Render for RepoView {
         self.request_summary(cx);
         self.sync_snapshot(cx);
         self.sync_log(cx);
+        self.sync_wrap(window, cx);
         div()
             .track_focus(&self.focus)
             .on_action(cx.listener(|this, _: &OpenRepository, window, cx| {
@@ -2386,6 +2450,25 @@ impl Render for RepoView {
                 ]
                 .iter()
                 .any(|focus| focus.is_focused(window));
+                // Arrows move about the graph while nothing else has the keys;
+                // ⌥← and ⌥→ through the selected node's commits.
+                let modifiers = keystroke.modifiers;
+                let alt = modifiers.alt && !modifiers.platform && !modifiers.control;
+                let arrow = matches!(keystroke.key.as_str(), "left" | "right" | "up" | "down");
+                if arrow && this.focus.is_focused(window) && this.context_menu.is_none() {
+                    match (
+                        modifiers.modified(),
+                        alt && !modifiers.shift,
+                        keystroke.key.as_str(),
+                    ) {
+                        (false, _, key) => drop(this.step_node(key, cx)),
+                        (_, true, "left") => this.step_commit(false, cx),
+                        (_, true, "right") => this.step_commit(true, cx),
+                        _ => return,
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
                 if keystroke.modifiers.platform && keystroke.key == "a" && !typing {
                     this.message_selection = None;
                     if !this.narrowed.is_empty() {
@@ -3317,9 +3400,6 @@ impl RepoView {
     }
 }
 
-/// The cursor drawn in a text field.
-const CARET: &str = "▏";
-
 /// Types a key into a plain text field: Return breaks the line, unless the
 /// field is `single_line`, Backspace deletes and ⌘V pastes, on one line in a
 /// single-line field. False for keys it leaves alone.
@@ -3511,15 +3591,21 @@ mod tests {
     #[test]
     fn staging_splits_files_into_sections() {
         let diffs = vec![Ok(diff(&[true])), Ok(diff(&[true])), Ok(diff(&[true]))];
-        let kinds: Vec<String> =
-            stack_items(&diffs, &[true, true, true], Some(2), [false; 2], false)
-                .iter()
-                .map(|item| match item {
-                    StackItem::Section(staged, count) => format!("{staged}:{count}"),
-                    StackItem::Header(file) => format!("H{file}"),
-                    _ => "?".to_string(),
-                })
-                .collect();
+        let kinds: Vec<String> = stack_items(
+            &diffs,
+            &[true, true, true],
+            Some(2),
+            [false; 2],
+            false,
+            None,
+        )
+        .iter()
+        .map(|item| match item {
+            StackItem::Section(staged, count) => format!("{staged}:{count}"),
+            StackItem::Header(file) => format!("H{file}"),
+            _ => "?".to_string(),
+        })
+        .collect();
         assert_eq!(
             kinds,
             [
@@ -3527,28 +3613,35 @@ mod tests {
             ]
         );
 
-        let folded_unstaged: Vec<String> =
-            stack_items(&diffs, &[true, true, true], Some(2), [true, false], false)
+        let folded_unstaged: Vec<String> = stack_items(
+            &diffs,
+            &[true, true, true],
+            Some(2),
+            [true, false],
+            false,
+            None,
+        )
+        .iter()
+        .map(|item| match item {
+            StackItem::Section(staged, count) => format!("{staged}:{count}"),
+            StackItem::Header(file) => format!("H{file}"),
+            _ => "?".to_string(),
+        })
+        .collect();
+        assert_eq!(folded_unstaged, ["?", "false:2", "?", "true:1", "?", "H2"]);
+
+        // Each hunk of a worktree file gets a header before its rows.
+        let open: Vec<String> =
+            stack_items(&diffs[2..], &[false], Some(0), [false; 2], false, None)
                 .iter()
                 .map(|item| match item {
                     StackItem::Section(staged, count) => format!("{staged}:{count}"),
                     StackItem::Header(file) => format!("H{file}"),
+                    StackItem::Hunk(file, start, end) => format!("@{file}:{start}-{end}"),
+                    StackItem::Row(file, row, _) => format!("{file}:{row}"),
                     _ => "?".to_string(),
                 })
                 .collect();
-        assert_eq!(folded_unstaged, ["?", "false:2", "?", "true:1", "?", "H2"]);
-
-        // Each hunk of a worktree file gets a header before its rows.
-        let open: Vec<String> = stack_items(&diffs[2..], &[false], Some(0), [false; 2], false)
-            .iter()
-            .map(|item| match item {
-                StackItem::Section(staged, count) => format!("{staged}:{count}"),
-                StackItem::Header(file) => format!("H{file}"),
-                StackItem::Hunk(file, start, end) => format!("@{file}:{start}-{end}"),
-                StackItem::Row(file, row) => format!("{file}:{row}"),
-                _ => "?".to_string(),
-            })
-            .collect();
         assert_eq!(
             open,
             ["?", "false:0", "?", "true:1", "?", "H0", "@0:0-1", "0:0"]
@@ -3556,7 +3649,7 @@ mod tests {
 
         // Too many files to open at once: a note says why, and every file
         // keeps its header, folded.
-        let many = stack_items(&diffs, &[true; 3], Some(2), [false; 2], true);
+        let many = stack_items(&diffs, &[true; 3], Some(2), [false; 2], true, None);
         assert!(matches!(&many[0], StackItem::Note(note) if note.starts_with("3 files")));
         let headers = many
             .iter()
@@ -3565,7 +3658,7 @@ mod tests {
         assert_eq!(headers, 3);
         assert!(!many.iter().any(|item| matches!(item, StackItem::Row(..))));
 
-        let nothing_staged = stack_items(&diffs[..1], &[true], Some(1), [false; 2], false);
+        let nothing_staged = stack_items(&diffs[..1], &[true], Some(1), [false; 2], false, None);
         assert!(matches!(
             nothing_staged.last(),
             Some(StackItem::Section(true, 0))
@@ -3630,12 +3723,12 @@ mod tests {
             Err("binary".to_string()),
         ];
         let kinds = |folded: &[bool]| -> Vec<String> {
-            stack_items(&diffs, folded, None, [false; 2], false)
+            stack_items(&diffs, folded, None, [false; 2], false, None)
                 .iter()
                 .map(|item| match item {
                     StackItem::Section(staged, count) => format!("S{staged}:{count}"),
                     StackItem::Header(file) => format!("H{file}"),
-                    StackItem::Row(file, row) => format!("{file}:{row}"),
+                    StackItem::Row(file, row, _) => format!("{file}:{row}"),
                     StackItem::Hunk(..) => "@".to_string(),
                     StackItem::Gap => "…".to_string(),
                     StackItem::Note(text) => text.clone(),
@@ -3679,7 +3772,9 @@ mod tests {
         };
         let edit = |text: &str, cursor: usize, keys: &str| {
             let (mut text, mut cursor) = (text.to_string(), cursor);
-            edit_key(&mut text, &mut cursor, &key(keys), || Some("XY".into()));
+            edit_key(&mut text, &mut cursor, &mut None, &key(keys), || {
+                Some("XY".into())
+            });
             (text, cursor)
         };
         assert_eq!(edit("ac", 1, "b"), ("abc".into(), 2));
@@ -3694,9 +3789,42 @@ mod tests {
         assert_eq!(edit("a\nbc", 4, "cmd-left"), ("a\nbc".into(), 2));
         assert_eq!(edit("a\nbc", 2, "cmd-right"), ("a\nbc".into(), 4));
         assert_eq!(edit("a\nbc", 4, "cmd-backspace"), ("a\n".into(), 2));
-        // The caret drawn at 1 takes room that is no place in the text.
-        assert_eq!(from_shown(1, 1), 1);
-        assert_eq!(from_shown(2, 1), 1);
-        assert_eq!(from_shown(1 + CARET.len() + 1, 1), 2);
+        assert_eq!(edit("abc", 1, "ctrl-t"), ("bac".into(), 2));
+        assert_eq!(edit("abc\nd", 3, "ctrl-t"), ("acb\nd".into(), 3));
+        assert_eq!(edit("a\nb", 2, "ctrl-t"), ("a\nb".into(), 2));
+        assert_eq!(edit("ab\ncd", 1, "ctrl-k"), ("a\ncd".into(), 1));
+        assert_eq!(edit("ab\ncd", 2, "ctrl-k"), ("abcd".into(), 2));
+        assert_eq!(edit("ab\ncd", 4, "ctrl-a"), ("ab\ncd".into(), 3));
+        assert_eq!(edit("ab", 1, "ctrl-o"), ("a\nb".into(), 1));
+    }
+
+    #[test]
+    fn edits_a_selection() {
+        let edit = |text: &str, cursor: usize, anchor: Option<usize>, keys: &str| {
+            let mut keystroke = gpui::Keystroke::parse(keys).unwrap();
+            if keystroke.key.chars().count() == 1 && keystroke.modifiers.number_of_modifiers() == 0
+            {
+                keystroke.key_char = Some(keystroke.key.clone());
+            }
+            let (mut text, mut cursor, mut anchor) = (text.to_string(), cursor, anchor);
+            edit_key(&mut text, &mut cursor, &mut anchor, &keystroke, || None);
+            (text, cursor, anchor)
+        };
+        assert_eq!(
+            edit("abc", 1, None, "shift-right"),
+            ("abc".into(), 2, Some(1))
+        );
+        assert_eq!(
+            edit("abc", 2, Some(1), "shift-left"),
+            ("abc".into(), 1, None)
+        );
+        assert_eq!(edit("abc", 3, Some(1), "left"), ("abc".into(), 1, None));
+        assert_eq!(edit("abc", 1, Some(3), "right"), ("abc".into(), 3, None));
+        assert_eq!(edit("abcd", 3, Some(1), "x"), ("axd".into(), 2, None));
+        assert_eq!(
+            edit("abcd", 1, Some(3), "backspace"),
+            ("ad".into(), 1, None)
+        );
+        assert_eq!(edit("abcd", 3, Some(1), "enter"), ("a\nd".into(), 2, None));
     }
 }

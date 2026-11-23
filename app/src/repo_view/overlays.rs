@@ -17,6 +17,15 @@ impl RepoView {
         let Some((target, _)) = self.context_menu.take() else {
             return;
         };
+        if let Target::Group { remote } = target {
+            let section = if remote {
+                Section::Remote
+            } else {
+                Section::Local
+            };
+            self.attention_group(section, command, cx);
+            return;
+        }
         let repo = self.repo_path.clone().unwrap_or_default();
         let (name, path, commit) = match &target {
             Target::Branch { name, commit, .. } => (Some(name.clone()), None, commit.clone()),
@@ -34,6 +43,7 @@ impl RepoView {
                 commit,
                 ..
             } => (branch.clone(), Some(path.clone()), commit.clone()),
+            Target::Group { .. } => return,
         };
         let copy = |text: String, cx: &mut Context<Self>| {
             cx.write_to_clipboard(ClipboardItem::new_string(text))
@@ -149,17 +159,9 @@ impl RepoView {
                 }
             }
             Command::CheckoutIn(k) => {
-                let Some((path, _)) = self.checkout_worktrees(&target).get(k).cloned() else {
-                    return;
-                };
-                let line = match (&target, name) {
-                    (Target::Commit { .. }, _) => popups::switch_detached(&path, &commit),
-                    // By its name alone, git makes a local branch tracking it.
-                    (Target::Remote { branch, .. }, _) => popups::switch(&path, branch),
-                    (_, Some(name)) => popups::switch(&path, &name),
-                    _ => return,
-                };
-                self.run_in_terminal(line, window, cx);
+                if let Some((path, _)) = self.checkout_worktrees(&target).get(k).cloned() {
+                    self.check_out(&target, &path, window, cx);
+                }
             }
             Command::DeleteWithCommits => {
                 if let Some(name) = name {
@@ -1005,6 +1007,41 @@ impl RepoView {
             None
         } else {
             Some("Treat as Channel")
+        }
+    }
+
+    /// Checks `target` out in the worktree at `path`: a commit detached, a
+    /// branch by its name.
+    fn check_out(
+        &mut self,
+        target: &Target,
+        path: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let line = match target {
+            Target::Commit { commit, .. } => popups::switch_detached(path, commit),
+            // By its name alone, git makes a local branch tracking it.
+            Target::Remote { branch, .. } => popups::switch(path, branch),
+            Target::Branch { name, .. } => popups::switch(path, name),
+            _ => return,
+        };
+        self.run_in_terminal(line, window, cx);
+    }
+
+    /// Checks `target` out in the current worktree, as a double click on a
+    /// label or a commit does; nothing when it is already there.
+    pub fn check_out_here(&mut self, target: &Target, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(here) = self.command_path() else {
+            return;
+        };
+        let here = here.trim_end_matches('/');
+        let found = self
+            .checkout_worktrees(target)
+            .into_iter()
+            .find(|(path, _)| path.trim_end_matches('/') == here);
+        if let Some((path, _)) = found {
+            self.check_out(target, &path, window, cx);
         }
     }
 

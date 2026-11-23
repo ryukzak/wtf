@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
@@ -162,16 +162,73 @@ pub fn worktree_status(path: &str) -> Result<WorktreeStatus, CoreError> {
         path,
         &["diff", "--cached", "--raw", "-z", "--no-abbrev", "-M"],
     )?;
-    let unstaged = run(path, &["diff", "--raw", "-z", "--no-abbrev"])?;
-    let mut status = WorktreeStatus {
+    Ok(WorktreeStatus {
         staged: parse_raw(&staged, None),
-        unstaged: parse_raw(&unstaged, Some(path)),
-    };
-    status.unstaged.extend(untracked_files(path)?);
-    Ok(status)
+        unstaged: worktree_diff(path, &["diff", "--raw", "-z", "--no-abbrev", "-M"])?,
+    })
 }
 
-/// Stages files; all of them when `files` is empty.
+/// Runs a `git diff --raw` of a worktree's files, its untracked ones
+/// counted, so a file moved on disk is a rename rather than a deleted one
+/// and a new one. Untracked files go into a copy of the index as
+/// `git add -N` puts them; the index itself is left alone.
+fn worktree_diff(worktree: &str, args: &[&str]) -> Result<Vec<ChangedFile>, CoreError> {
+    let untracked = untracked_files(worktree)?;
+    let index = run(
+        worktree,
+        &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+    )?;
+    let index = PathBuf::from(index.trim());
+    let copy = std::env::temp_dir().join(format!(
+        "wtf-index-{}-{}",
+        std::process::id(),
+        TEMP_INDEX.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    if untracked.is_empty() || fs::copy(&index, &copy).is_err() {
+        let mut files = parse_raw(&run(worktree, args)?, Some(worktree));
+        files.extend(untracked);
+        return Ok(files);
+    }
+    let diff = (|| {
+        let copy = copy.to_string_lossy();
+        let env = [("GIT_INDEX_FILE", copy.as_ref())];
+        let paths: String = untracked
+            .iter()
+            .map(|file| format!("{}\0", file.path()))
+            .collect();
+        run_with_env(
+            worktree,
+            &["add", "-N", "--pathspec-from-file=-", "--pathspec-file-nul"],
+            Some(&paths),
+            &env,
+        )?;
+        run_with_env(worktree, args, None, &env)
+    })();
+    fs::remove_file(&copy).ok();
+    // Untracked files still new come as they always do; the others are
+    // renames' new names.
+    let new: HashSet<&str> = untracked.iter().map(ChangedFile::path).collect();
+    let mut files: Vec<ChangedFile> = parse_raw(&diff?, Some(worktree))
+        .into_iter()
+        .filter(|file| !(file.status == "A" && new.contains(file.path())))
+        .collect();
+    let renamed: HashSet<&str> = files
+        .iter()
+        .filter_map(|file| file.new_path.as_deref())
+        .collect();
+    let new: Vec<ChangedFile> = untracked
+        .into_iter()
+        .filter(|file| !renamed.contains(file.path()))
+        .collect();
+    files.extend(new);
+    Ok(files)
+}
+
+/// Numbers the copies of the index [`worktree_diff`] makes at once.
+static TEMP_INDEX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Stages files; all of them when `files` is empty. A file renamed on
+/// disk is staged by both its names, the old one going as the new comes.
 pub fn stage(path: &str, files: &[String]) -> Result<(), CoreError> {
     let mut args = vec!["add".to_string(), "-A".into(), "--".into()];
     args.extend(files.iter().cloned());
@@ -220,7 +277,13 @@ pub fn discard(path: &str, files: &[ChangedFile]) -> Result<(), CoreError> {
     for file in files {
         let name = file.path();
         let untracked = file.status == "A" && file.old_id == NULL_ID;
-        if untracked {
+        // A file moved on disk goes back to its old name.
+        if file.status == "R"
+            && let Some(old) = &file.old_path
+        {
+            run(path, &["restore", "--worktree", "--", old])?;
+            run(path, &["clean", "-f", "-x", "-q", "--", name])?;
+        } else if untracked {
             // An intent-to-add entry in the index would keep the file from
             // `git clean`, and so would an ignore rule once it is out: `-x`.
             run(
@@ -487,19 +550,11 @@ pub fn changed_files(
         None => empty_tree(repo_path)?,
     };
     let (dir, rev) = locate(repo_path, tip);
-    let mut args = vec!["diff", "--raw", "-z", "--no-abbrev", "-M", &base];
-    let worktree = match tip {
-        Revision::Worktree(path) => Some(path.as_str()),
-        Revision::Commit(_) => {
-            args.push(rev);
-            None
-        }
-    };
-    let mut files = parse_raw(&run(dir, &args)?, worktree);
-    if let Some(root) = worktree {
-        files.extend(untracked_files(root)?);
+    let args = ["diff", "--raw", "-z", "--no-abbrev", "-M", &base];
+    match tip {
+        Revision::Worktree(path) => worktree_diff(path, &args),
+        Revision::Commit(_) => Ok(parse_raw(&run(dir, &[&args[..], &[rev]].concat())?, None)),
     }
-    Ok(files)
 }
 
 /// A worktree's untracked files as added ones, read from disk.

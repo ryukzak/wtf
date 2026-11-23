@@ -394,6 +394,16 @@ impl RepoView {
                     .child(mode("Structural", DiffMode::Structural))
                     .child(mode("Text", DiffMode::Text)),
             )
+            // Long lines wrap, or run on and scroll sideways.
+            .child(
+                group()
+                    .child(option("Wrap", self.wrap_lines).on_click(
+                        cx.listener(|this, _, window, cx| this.set_wrap_lines(true, window, cx)),
+                    ))
+                    .child(option("No Wrap", !self.wrap_lines).on_click(
+                        cx.listener(|this, _, window, cx| this.set_wrap_lines(false, window, cx)),
+                    )),
+            )
     }
 
     /// The commit header's first line, kept at the top once the rest of it

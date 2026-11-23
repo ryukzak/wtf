@@ -52,6 +52,20 @@ pub(super) fn file_tree(
     rows
 }
 
+/// A renamed or copied file's old name, as the file list shows it next to
+/// the new one: by its name alone when its folder stayed the same.
+pub(super) fn old_name(file: &ChangedFile) -> Option<&str> {
+    let (old, new) = (file.old_path.as_deref()?, file.new_path.as_deref()?);
+    if old == new {
+        return None;
+    }
+    let folder = |path: &str| path.rfind('/').map_or(0, |i| i + 1);
+    Some(match old[..folder(old)] == new[..folder(new)] {
+        true => &old[folder(old)..],
+        false => old,
+    })
+}
+
 /// Names as a tree of their `/` folders: folders first, by name, then the
 /// names in the given order; or, `mixed`, folders and names together by
 /// name. Folders in `folded` hide what is in them.
