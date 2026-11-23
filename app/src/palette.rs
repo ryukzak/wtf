@@ -7,9 +7,8 @@ use crate::menus::{
     ToggleRemotes, ToggleTags,
 };
 use crate::repo_view::{
-    Fetch, GoTo, OpenRepository, OpenWorktreeWith, Prune, ShowAllFiles, ShowOneFile, StashChanges,
-    StructuralDiff, TextDiff, ToggleCombineCommits, ToggleConsole, ToggleRefreshCommands,
-    ToggleSidePanel, ToggleSnapshot,
+    Fetch, GoTo, OpenRepository, OpenWorktreeWith, Prune, StashChanges, StructuralDiff, TextDiff,
+    ToggleCombineCommits, ToggleConsole, ToggleRefreshCommands, ToggleSidePanel, ToggleSnapshot,
 };
 use crate::workspace::{CloseTab, NewTab, NextTab, PreviousTab, ReopenClosedTab};
 
@@ -24,8 +23,6 @@ pub fn commands() -> Vec<(&'static str, Box<dyn Action>)> {
         ("Text Diff", Box::new(TextDiff)),
         ("Toggle Snapshot", Box::new(ToggleSnapshot)),
         ("Structural Diff", Box::new(StructuralDiff)),
-        ("All Files", Box::new(ShowAllFiles)),
-        ("File by File", Box::new(ShowOneFile)),
         ("Toggle Combine Commits", Box::new(ToggleCombineCommits)),
         ("Toggle Side Panel", Box::new(ToggleSidePanel)),
         ("Toggle Attention Panel", Box::new(ToggleAttentionPanel)),

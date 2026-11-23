@@ -16,17 +16,19 @@ impl RepoView {
             self.is_loading_stacked = true;
         }
         let (files, mode) = (self.files.clone(), self.diff_mode);
-        // File by file, only the file shown needs its diff.
-        let only = self
-            .file_by_file_worktree()
-            .then(|| self.selected_file.unwrap_or(0));
+        // With too many files to open at once, folded ones wait to be opened
+        // before their diffs are worked out.
+        let skip: Vec<bool> = files
+            .iter()
+            .map(|file| self.many_files() && self.is_folded(file.path()))
+            .collect();
         let load = cx.background_executor().spawn(async move {
             let diffs = files
                 .iter()
-                .enumerate()
-                .map(|(i, file)| match only {
-                    Some(only) if only != i => Err("Loading…".to_string()),
-                    _ => {
+                .zip(skip)
+                .map(|(file, skip)| match skip {
+                    true => Err(NOT_LOADED.to_string()),
+                    false => {
                         wtf_core::file_diff(repo_path.clone(), file.clone(), mode).map_err(message)
                     }
                 })
@@ -59,22 +61,14 @@ impl RepoView {
         let folded: Vec<bool> = self
             .files
             .iter()
-            .map(|file| self.folded.contains(file.path()))
+            .map(|file| self.is_folded(file.path()))
             .collect();
-        let only = match self.file_by_file_worktree() {
-            true => Some(self.selected_file.unwrap_or(0)),
-            false => None,
-        };
-        // A worktree too big for all files keeps its sections, to stage
-        // them all at once, as the all-files view would.
-        let sections = self.changes_layout == ChangesLayout::AllFiles;
         self.stacked = stack_items(
             &self.stacked_diffs,
             &folded,
             self.worktree_split,
             self.folded_sections,
-            only,
-            sections,
+            self.many_files(),
         );
     }
 
@@ -100,25 +94,47 @@ impl RepoView {
             .iter()
             .map(|file| file.path().to_string())
             .collect();
-        if paths.iter().all(|path| self.folded.contains(path)) {
-            for path in &paths {
-                self.folded.remove(path);
-            }
-        } else {
-            self.folded.extend(paths);
+        let unfold = paths.iter().all(|path| self.is_folded(path));
+        for path in paths {
+            self.set_folded(path, !unfold);
         }
-        self.restack();
-        cx.notify();
+        self.after_fold(cx);
     }
 
     fn toggle_fold(&mut self, file: usize, cx: &mut Context<Self>) {
         let Some(path) = self.files.get(file).map(|file| file.path().to_string()) else {
             return;
         };
-        if !self.folded.remove(&path) {
-            self.folded.insert(path);
-        }
+        let folded = self.is_folded(&path);
+        self.set_folded(path, !folded);
+        self.after_fold(cx);
+    }
+
+    /// Folds or opens a file; with many files, opening is what is noted.
+    pub(super) fn set_folded(&mut self, path: String, fold: bool) {
+        match (self.many_files(), fold) {
+            (true, true) => self.unfolded.remove(&path),
+            (true, false) => self.unfolded.insert(path),
+            (false, true) => self.folded.insert(path),
+            (false, false) => self.folded.remove(&path),
+        };
+    }
+
+    /// Shows the folds; a file opened before its diff was worked out gets
+    /// it now.
+    pub(super) fn after_fold(&mut self, cx: &mut Context<Self>) {
+        let missing = self
+            .files
+            .iter()
+            .zip(&self.stacked_diffs)
+            .any(|(file, diff)| {
+                !self.is_folded(file.path())
+                    && diff.as_ref().is_err_and(|error| error == NOT_LOADED)
+            });
         self.restack();
+        if missing {
+            self.load_stacked(true, cx);
+        }
         cx.notify();
     }
 
@@ -260,13 +276,10 @@ impl RepoView {
                     "Unstaged Files"
                 };
                 let label = if staged { "Unstage All" } else { "Stage All" };
-                // One file at a time, the section only titles it and stages
-                // it all: nothing in it folds.
-                let foldable = !self.file_by_file_worktree();
-                let section_folded = foldable && self.folded_sections[usize::from(staged)];
+                let section_folded = self.folded_sections[usize::from(staged)];
                 let all_folded = self.files[self.section_files(staged)]
                     .iter()
-                    .all(|file| self.folded.contains(file.path()));
+                    .all(|file| self.is_folded(file.path()));
                 let fold_label = if all_folded {
                     "Expand Files"
                 } else {
@@ -288,7 +301,7 @@ impl RepoView {
                     // so titles go up to stand over the diff.
                     .text_size(px(crate::preferences::code_size() * 1.2))
                     .font_weight(gpui::FontWeight::BOLD)
-                    .when(foldable, |section| {
+                    .map(|section| {
                         section
                             .cursor_pointer()
                             .on_click(
@@ -302,7 +315,7 @@ impl RepoView {
                     })
                     .child(format!("{title} ({count})"))
                     .child(div().flex_1())
-                    .when(foldable && count > 0 && !section_folded, |section| {
+                    .when(count > 0 && !section_folded, |section| {
                         section.child(
                             button(
                                 SharedString::from(format!("fold-files-{staged}")),
@@ -332,7 +345,7 @@ impl RepoView {
             &StackItem::Header(index) => {
                 let button = tall;
                 let file = &self.files[index];
-                let folded = self.folded.contains(file.path());
+                let folded = self.is_folded(file.path());
                 // A stash shows read-only: no buttons.
                 let staged = self
                     .worktree_split
@@ -603,18 +616,27 @@ impl RepoView {
 /// folded, its changes with context or a note when there is nothing to show.
 /// With `split`, the files before it are unstaged and the rest staged, each
 /// group under its section.
+/// Stands for a diff not worked out yet: its file was folded among too many
+/// to open at once.
+const NOT_LOADED: &str = "Loading…";
+
 pub(super) fn stack_items(
     diffs: &[Result<FileDiff, String>],
     folded: &[bool],
     split: Option<usize>,
     folded_sections: [bool; 2],
-    only: Option<usize>,
-    keep_sections: bool,
+    many: bool,
 ) -> Vec<StackItem> {
     let mut items = Vec::new();
-    // File by file shows the one file alone, as for a commit: no sections,
-    // unless kept, and folding is left to the all-files view.
-    let sections = split.filter(|_| only.is_none() || keep_sections);
+    // Why every file is folded, when there are too many to open at once.
+    if many {
+        items.push(StackItem::Note(format!(
+            "{} files: too many to open at once. Open them one by one, or a \
+             section's at a time.",
+            diffs.len()
+        )));
+    }
+    let sections = split;
     if let Some(split) = sections {
         items.extend([StackItem::HeaderPad, StackItem::Section(false, split)]);
     }
@@ -625,18 +647,13 @@ pub(super) fn stack_items(
                 StackItem::Section(true, diffs.len() - file),
             ]);
         }
-        // One file at a time shows that file, whatever is folded.
         if let Some(split) = sections
-            && only.is_none()
             && folded_sections[usize::from(file >= split)]
         {
             continue;
         }
-        if only.is_some_and(|only| only != file) {
-            continue;
-        }
         items.extend([StackItem::HeaderPad, StackItem::Header(file)]);
-        if only.is_none() && folded.get(file).copied().unwrap_or(false) {
+        if folded.get(file).copied().unwrap_or(false) {
             continue;
         }
         let hunks = match diff {

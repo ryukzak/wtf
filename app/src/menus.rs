@@ -7,9 +7,9 @@ use crate::workspace::{
 };
 
 use crate::repo_view::{
-    CommandPalette, Fetch, GoTo, Minimize, OpenRepository, OpenWorktreeWith, Prune, ShowAllFiles,
-    ShowOneFile, StashChanges, StructuralDiff, TextDiff, ToggleCombineCommits, ToggleConsole,
-    ToggleRefreshCommands, ToggleSidePanel, ToggleSnapshot, Zoom,
+    CommandPalette, Fetch, GoTo, Minimize, OpenRepository, OpenWorktreeWith, Prune, StashChanges,
+    StructuralDiff, TextDiff, ToggleCombineCommits, ToggleConsole, ToggleRefreshCommands,
+    ToggleSidePanel, ToggleSnapshot, Zoom,
 };
 
 actions!(
@@ -320,9 +320,6 @@ pub fn menus(state: &MenuState) -> Vec<Menu> {
                 MenuItem::action("Structural", StructuralDiff),
                 MenuItem::action("Text", TextDiff),
                 MenuItem::action("Snapshot", ToggleSnapshot),
-                MenuItem::separator(),
-                MenuItem::action("File by File", ShowOneFile),
-                MenuItem::action("All Files", ShowAllFiles),
             ],
         },
         Menu {

@@ -102,16 +102,20 @@ fn main() {
         cx.set_menus(menus::menus(&menus::MenuState::default()));
 
         cx.on_action(|_: &NewWindow, cx| open_window(Vec::new(), cx));
-        // Without repositories to open, the windows from last time return.
-        let restored = match paths.is_empty() {
-            true => session::load(),
-            false => Vec::new(),
-        };
+        // The windows from last time always return; repositories named on
+        // the command line open as tabs in the front one, as folders handed
+        // to a running app do. Opening only those would save them over the
+        // session, losing its tabs.
+        let restored = session::load();
         if restored.is_empty() {
             open_window(paths, cx);
-        }
-        for (active, tabs) in restored {
-            workspace::open_window_at(tabs, active, cx);
+        } else {
+            for (active, tabs) in restored {
+                workspace::open_window_at(tabs, active, cx);
+            }
+            if !paths.is_empty() {
+                workspace::open_paths(paths, cx);
+            }
         }
         cx.activate(true);
     });

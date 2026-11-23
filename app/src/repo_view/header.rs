@@ -352,7 +352,7 @@ impl RepoView {
         commits
     }
 
-    /// The one-file or all-files and structural or text switches, reading
+    /// The changes or snapshot and structural or text switches, reading
     /// down the strip.
     pub(super) fn view_toggles(
         &self,
@@ -368,10 +368,6 @@ impl RepoView {
             ))
         };
         let group = || strip_group(theme);
-        let layout = |label: &'static str, layout: ChangesLayout| {
-            option(label, self.changes_layout == layout)
-                .on_click(cx.listener(move |this, _, _, cx| this.set_changes_layout(layout, cx)))
-        };
         let mode = |label: &'static str, mode: DiffMode| {
             option(label, self.diff_mode == mode)
                 .on_click(cx.listener(move |this, _, _, cx| this.set_diff_mode(mode, cx)))
@@ -392,11 +388,6 @@ impl RepoView {
                     .child(option("Snapshot", self.snapshot_mode).on_click(
                         cx.listener(|this, _, window, cx| this.set_snapshot_mode(true, window, cx)),
                     )),
-            )
-            .child(
-                group()
-                    .child(layout("File by file", ChangesLayout::OneFile))
-                    .child(layout("All files", ChangesLayout::AllFiles)),
             )
             .child(
                 group()

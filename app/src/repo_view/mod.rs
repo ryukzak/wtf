@@ -110,8 +110,6 @@ actions!(
         Fetch,
         StashChanges,
         OpenWorktreeWith,
-        ShowOneFile,
-        ShowAllFiles,
         ToggleSnapshot,
         Minimize,
         Zoom,
@@ -155,14 +153,6 @@ struct Snapshot {
     tints: RefCell<Option<(String, Rc<HashSet<u32>>)>>,
     /// Code colors of the open text, for the appearance they were made for.
     colors: RefCell<Option<(bool, Rc<syntax::Colors>)>>,
-}
-
-/// How the diff pane shows the changed files.
-#[derive(Clone, Copy, PartialEq)]
-enum ChangesLayout {
-    OneFile,
-    /// All files in one scrollable list, like Sublime Merge.
-    AllFiles,
 }
 
 /// A row of the file list.
@@ -247,8 +237,8 @@ enum Border {
 #[derive(Clone, Copy, PartialEq)]
 enum SidePanel {
     Attention,
-    /// The changed files as a tree: a table of contents for all files, or
-    /// the file to show one at a time.
+    /// The changed files as a tree: a table of contents for the changes, or
+    /// the file a snapshot shows.
     Files,
 }
 
@@ -416,7 +406,6 @@ pub struct RepoView {
     diff: Option<FileDiff>,
     selected_file: Option<usize>,
     diff_mode: DiffMode,
-    changes_layout: ChangesLayout,
     stacked: Vec<StackItem>,
     stacked_diffs: Vec<Result<FileDiff, String>>,
     /// The files `stacked_diffs` were made from: until a refresh brings
@@ -454,6 +443,9 @@ pub struct RepoView {
     reword_focus: FocusHandle,
     /// Paths of files folded to their headers in the all-files view.
     folded: HashSet<String>,
+    /// With more files than [`MAX_STACKED_FILES`] they all start folded:
+    /// these are the ones opened since.
+    unfolded: HashSet<String>,
     /// The unstaged and staged sections, folded to their titles.
     folded_sections: [bool; 2],
     /// Folders folded in the file list, by section and path.
@@ -576,7 +568,6 @@ impl RepoView {
             diff: None,
             selected_file: None,
             diff_mode: DiffMode::Text,
-            changes_layout: ChangesLayout::AllFiles,
             stacked: Vec::new(),
             stacked_diffs: Vec::new(),
             stacked_files: Vec::new(),
@@ -598,6 +589,7 @@ impl RepoView {
             copied: None,
             reword_focus: cx.focus_handle(),
             folded: HashSet::new(),
+            unfolded: HashSet::new(),
             folded_sections: [false; 2],
             collapsed_dirs: HashSet::new(),
             collapsed_branch_dirs: HashSet::new(),
@@ -1397,19 +1389,22 @@ impl RepoView {
         }));
     }
 
-    /// In the all-files view, selecting a file scrolls to it.
+    /// Selecting a file scrolls the changes to it; among too many files to
+    /// open at once, it opens it too.
     fn select_file(&mut self, index: Option<usize>, cx: &mut Context<Self>) {
         self.selected_file = index;
         if !self.is_stacked() {
             self.load_diff(false, cx);
             return;
         }
-        if self.file_by_file_worktree() {
-            self.restack();
-            self.stacked_scroll.scroll_to_item(0, ScrollStrategy::Top);
-            // Only the file shown has its diff; this one's comes now.
-            self.load_stacked(true, cx);
-            return;
+        if self.many_files()
+            && let Some(path) = index
+                .and_then(|i| self.files.get(i))
+                .map(|f| f.path().to_string())
+            && self.is_folded(&path)
+        {
+            self.set_folded(path, false);
+            self.after_fold(cx);
         }
         let header = index.and_then(|file| {
             self.stacked
@@ -1431,22 +1426,6 @@ impl RepoView {
         }
     }
 
-    fn set_changes_layout(&mut self, layout: ChangesLayout, cx: &mut Context<Self>) {
-        // A snapshot shows one file at a time: all files leave it.
-        if layout == ChangesLayout::AllFiles {
-            self.snapshot_mode = false;
-        }
-        if self.changes_layout != layout {
-            self.changes_layout = layout;
-            // File by file picks files in the files panel.
-            if layout == ChangesLayout::OneFile {
-                self.side_panel = Some(SidePanel::Files);
-                self.update_menus(cx);
-            }
-            self.reload_changes(cx);
-        }
-    }
-
     fn reload_changes(&mut self, cx: &mut Context<Self>) {
         if self.is_stacked() {
             self.load_stacked(false, cx);
@@ -1455,24 +1434,23 @@ impl RepoView {
         }
     }
 
-    /// File by file in a worktree: the list picks the file, and its changes
-    /// show in the staging view, under the sections, one file at a time.
-    fn file_by_file_worktree(&self) -> bool {
-        self.worktree_split.is_some()
-            && (self.changes_layout == ChangesLayout::OneFile
-                || self.files.len() > MAX_STACKED_FILES)
+    /// Whether changes show in the stacked view: always, once there are
+    /// files; a worktree's even without, as the commit box lives there.
+    fn is_stacked(&self) -> bool {
+        self.worktree_split.is_some() || !self.files.is_empty()
     }
 
-    /// Whether changes show in the stacked view; a worktree's always do, as
-    /// staging and the commit box live there.
-    fn is_stacked(&self) -> bool {
-        match self.worktree_split {
-            Some(_) => true,
-            None => {
-                self.changes_layout == ChangesLayout::AllFiles
-                    && !self.files.is_empty()
-                    && self.files.len() <= MAX_STACKED_FILES
-            }
+    /// Too many files to open at once: they all start folded, and each
+    /// loads its diff when opened.
+    pub(super) fn many_files(&self) -> bool {
+        self.files.len() > MAX_STACKED_FILES
+    }
+
+    /// Whether a file of the stacked view shows only its header.
+    pub(super) fn is_folded(&self, path: &str) -> bool {
+        match self.many_files() {
+            true => !self.unfolded.contains(path),
+            false => self.folded.contains(path),
         }
     }
 
@@ -2083,12 +2061,6 @@ impl Render for RepoView {
                 }),
             )
             .on_action(cx.listener(|this, _: &ToggleSidePanel, _, cx| this.toggle_side_panel(cx)))
-            .on_action(cx.listener(|this, _: &ShowOneFile, _, cx| {
-                this.set_changes_layout(ChangesLayout::OneFile, cx)
-            }))
-            .on_action(cx.listener(|this, _: &ShowAllFiles, _, cx| {
-                this.set_changes_layout(ChangesLayout::AllFiles, cx)
-            }))
             .on_action(
                 cx.listener(|this, _: &ToggleConsole, window, cx| this.toggle_console(window, cx)),
             )
@@ -2233,22 +2205,12 @@ impl Render for RepoView {
                                         cx,
                                     ))
                                     .child(
-                                        div()
-                                            .flex()
-                                            .flex_col()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .h_full()
-                                            // A snapshot picks its file in the tree.
-                                            .when(!self.snapshot_mode, |pane| {
-                                                pane.children(self.file_stepper(&theme, cx))
-                                            })
-                                            .child(
-                                                div()
-                                                    .flex_1()
-                                                    .min_h_0()
-                                                    .child(self.detail(&theme, window, cx)),
-                                            ),
+                                        div().flex().flex_col().flex_1().min_w_0().h_full().child(
+                                            div()
+                                                .flex_1()
+                                                .min_h_0()
+                                                .child(self.detail(&theme, window, cx)),
+                                        ),
                                     ),
                             )
                             .when(self.console_open, |view| view.child(self.dock(&theme, cx))),
@@ -2302,9 +2264,10 @@ impl RepoView {
     /// Switches between the changes and the snapshot; a snapshot opens on
     /// the file in view, or the first changed one.
     fn set_snapshot_mode(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
-        // A snapshot shows one file at a time.
-        if on {
-            self.set_changes_layout(ChangesLayout::OneFile, cx);
+        // A snapshot shows one file at a time, picked in the files panel.
+        if on && self.side_panel != Some(SidePanel::Files) {
+            self.side_panel = Some(SidePanel::Files);
+            self.update_menus(cx);
         }
         self.snapshot_mode = on;
         if on && self.snapshot.path.is_none() {
@@ -3257,21 +3220,15 @@ mod tests {
     #[test]
     fn staging_splits_files_into_sections() {
         let diffs = vec![Ok(diff(&[true])), Ok(diff(&[true])), Ok(diff(&[true]))];
-        let kinds: Vec<String> = stack_items(
-            &diffs,
-            &[true, true, true],
-            Some(2),
-            [false; 2],
-            None,
-            false,
-        )
-        .iter()
-        .map(|item| match item {
-            StackItem::Section(staged, count) => format!("{staged}:{count}"),
-            StackItem::Header(file) => format!("H{file}"),
-            _ => "?".to_string(),
-        })
-        .collect();
+        let kinds: Vec<String> =
+            stack_items(&diffs, &[true, true, true], Some(2), [false; 2], false)
+                .iter()
+                .map(|item| match item {
+                    StackItem::Section(staged, count) => format!("{staged}:{count}"),
+                    StackItem::Header(file) => format!("H{file}"),
+                    _ => "?".to_string(),
+                })
+                .collect();
         assert_eq!(
             kinds,
             [
@@ -3279,76 +3236,45 @@ mod tests {
             ]
         );
 
-        let folded_unstaged: Vec<String> = stack_items(
-            &diffs,
-            &[true, true, true],
-            Some(2),
-            [true, false],
-            None,
-            false,
-        )
-        .iter()
-        .map(|item| match item {
-            StackItem::Section(staged, count) => format!("{staged}:{count}"),
-            StackItem::Header(file) => format!("H{file}"),
-            _ => "?".to_string(),
-        })
-        .collect();
-        assert_eq!(folded_unstaged, ["?", "false:2", "?", "true:1", "?", "H2"]);
-
-        // Each hunk of a worktree file gets a header before its rows.
-        let open: Vec<String> =
-            stack_items(&diffs[2..], &[false], Some(0), [false; 2], None, false)
+        let folded_unstaged: Vec<String> =
+            stack_items(&diffs, &[true, true, true], Some(2), [true, false], false)
                 .iter()
                 .map(|item| match item {
                     StackItem::Section(staged, count) => format!("{staged}:{count}"),
                     StackItem::Header(file) => format!("H{file}"),
-                    StackItem::Hunk(file, start, end) => format!("@{file}:{start}-{end}"),
-                    StackItem::Row(file, row) => format!("{file}:{row}"),
                     _ => "?".to_string(),
                 })
                 .collect();
+        assert_eq!(folded_unstaged, ["?", "false:2", "?", "true:1", "?", "H2"]);
+
+        // Each hunk of a worktree file gets a header before its rows.
+        let open: Vec<String> = stack_items(&diffs[2..], &[false], Some(0), [false; 2], false)
+            .iter()
+            .map(|item| match item {
+                StackItem::Section(staged, count) => format!("{staged}:{count}"),
+                StackItem::Header(file) => format!("H{file}"),
+                StackItem::Hunk(file, start, end) => format!("@{file}:{start}-{end}"),
+                StackItem::Row(file, row) => format!("{file}:{row}"),
+                _ => "?".to_string(),
+            })
+            .collect();
         assert_eq!(
             open,
             ["?", "false:0", "?", "true:1", "?", "H0", "@0:0-1", "0:0"]
         );
 
-        // File by file: the one file, without sections, even when folded.
-        let one: Vec<String> = stack_items(
-            &diffs,
-            &[true, true, true],
-            Some(2),
-            [true; 2],
-            Some(1),
-            false,
-        )
-        .iter()
-        .map(|item| match item {
-            StackItem::Section(staged, count) => format!("{staged}:{count}"),
-            StackItem::Header(file) => format!("H{file}"),
-            StackItem::Hunk(file, start, end) => format!("@{file}:{start}-{end}"),
-            StackItem::Row(file, row) => format!("{file}:{row}"),
-            _ => "?".to_string(),
-        })
-        .collect();
-        assert_eq!(one, ["?", "H1", "@1:0-1", "1:0"]);
-
-        // Too many files for all of them: one at a time, under its sections,
-        // shown even when its section was folded.
-        let kept = stack_items(&diffs, &[false; 3], Some(2), [true; 2], Some(1), true);
-        let sections = kept
+        // Too many files to open at once: a note says why, and every file
+        // keeps its header, folded.
+        let many = stack_items(&diffs, &[true; 3], Some(2), [false; 2], true);
+        assert!(matches!(&many[0], StackItem::Note(note) if note.starts_with("3 files")));
+        let headers = many
             .iter()
-            .filter(|item| matches!(item, StackItem::Section(..)))
+            .filter(|item| matches!(item, StackItem::Header(_)))
             .count();
-        assert_eq!(sections, 2);
-        assert!(
-            !kept
-                .iter()
-                .any(|item| matches!(item, StackItem::Header(0 | 2)))
-        );
-        assert!(kept.iter().any(|item| matches!(item, StackItem::Header(1))));
+        assert_eq!(headers, 3);
+        assert!(!many.iter().any(|item| matches!(item, StackItem::Row(..))));
 
-        let nothing_staged = stack_items(&diffs[..1], &[true], Some(1), [false; 2], None, false);
+        let nothing_staged = stack_items(&diffs[..1], &[true], Some(1), [false; 2], false);
         assert!(matches!(
             nothing_staged.last(),
             Some(StackItem::Section(true, 0))
@@ -3413,7 +3339,7 @@ mod tests {
             Err("binary".to_string()),
         ];
         let kinds = |folded: &[bool]| -> Vec<String> {
-            stack_items(&diffs, folded, None, [false; 2], None, false)
+            stack_items(&diffs, folded, None, [false; 2], false)
                 .iter()
                 .map(|item| match item {
                     StackItem::Section(staged, count) => format!("S{staged}:{count}"),
