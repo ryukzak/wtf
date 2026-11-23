@@ -621,6 +621,15 @@ fn row(label: &'static str, theme: &Theme) -> gpui::Div {
         )
 }
 
+/// Between the Fonts section's rows, and more between its groups.
+const FONT_ROW_GAP: f32 = 10.;
+const FONT_GROUP_GAP: f32 = 8.;
+
+/// A row with a note under it, kept close to it whatever the section's gap.
+fn with_note(row: gpui::Div) -> gpui::Div {
+    div().flex().flex_col().gap(px(2.)).child(row)
+}
+
 /// A note under a row, lined up with its control.
 fn note(text: &'static str, theme: &Theme) -> gpui::Div {
     div()
@@ -998,10 +1007,12 @@ impl Render for Preferences {
                         &theme,
                     )))
             }
+            // Rows apart, each note by its row, and a little more between the
+            // interface, the code font and the line heights.
             Section::Fonts => div()
                 .flex()
                 .flex_col()
-                .gap(px(4.))
+                .gap(px(FONT_ROW_GAP))
                 .child(row("Interface font", &theme).child(self.font_button(
                     FontSetting::Interface,
                     settings.ui_font.clone(),
@@ -1015,12 +1026,16 @@ impl Render for Preferences {
                     &theme,
                     cx,
                 )))
-                .child(row("Code font", &theme).child(self.font_button(
-                    FontSetting::Code,
-                    settings.code_font.clone(),
-                    &theme,
-                    cx,
-                )))
+                .child(
+                    row("Code font", &theme)
+                        .mt(px(FONT_GROUP_GAP))
+                        .child(self.font_button(
+                            FontSetting::Code,
+                            settings.code_font.clone(),
+                            &theme,
+                            cx,
+                        )),
+                )
                 .child(row("Code size", &theme).child(self.stepper(
                     "code",
                     format!("{}", settings.code_size),
@@ -1028,41 +1043,49 @@ impl Render for Preferences {
                     &theme,
                     cx,
                 )))
-                .child(row("Code weight", &theme).child(self.stepper(
-                    "code-weight",
-                    format!(
-                        "{} {}",
-                        weight_name(settings.code_weight),
-                        settings.code_weight
-                    ),
-                    move |s, d| s.code_weight += d * 100.,
-                    &theme,
-                    cx,
-                )))
-                .child(note(
-                    "A font without this weight shows its nearest one; many monospace \
-                     fonts have only Regular and Bold.",
-                    &theme,
-                ))
-                .child(row("Code line height", &theme).child(self.stepper(
-                    "code-line",
-                    format!("{:.1}", settings.code_line),
-                    move |s, d| s.code_line += d * 0.1,
-                    &theme,
-                    cx,
-                )))
-                .child(row("Terminal line height", &theme).child(self.stepper(
-                    "terminal-line",
-                    format!("{:.2}", settings.terminal_line),
-                    move |s, d| s.terminal_line += d * 0.05,
-                    &theme,
-                    cx,
-                )))
-                .child(note(
-                    "Times the code size. Diffs read well at 1.5 to 1.7; terminals at \
-                     1.15 to 1.25, where box drawing joins up.",
-                    &theme,
-                )),
+                .child(
+                    with_note(row("Code weight", &theme).child(self.stepper(
+                        "code-weight",
+                        format!(
+                            "{} {}",
+                            weight_name(settings.code_weight),
+                            settings.code_weight
+                        ),
+                        move |s, d| s.code_weight += d * 100.,
+                        &theme,
+                        cx,
+                    )))
+                    .child(note(
+                        "A font without this weight shows its nearest one; many monospace \
+                         fonts have only Regular and Bold.",
+                        &theme,
+                    )),
+                )
+                .child(
+                    row("Code line height", &theme)
+                        .mt(px(FONT_GROUP_GAP))
+                        .child(self.stepper(
+                            "code-line",
+                            format!("{:.1}", settings.code_line),
+                            move |s, d| s.code_line += d * 0.1,
+                            &theme,
+                            cx,
+                        )),
+                )
+                .child(
+                    with_note(row("Terminal line height", &theme).child(self.stepper(
+                        "terminal-line",
+                        format!("{:.2}", settings.terminal_line),
+                        move |s, d| s.terminal_line += d * 0.05,
+                        &theme,
+                        cx,
+                    )))
+                    .child(note(
+                        "Times the code size. Diffs read well at 1.5 to 1.7; terminals at \
+                         1.15 to 1.25, where box drawing joins up.",
+                        &theme,
+                    )),
+                ),
             Section::Review => {
                 let on = settings.summaries == Some(true);
                 div()

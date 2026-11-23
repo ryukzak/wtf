@@ -370,8 +370,10 @@ impl RepoView {
                 "Amend with {staged} file{}",
                 if staged == 1 { "" } else { "s" }
             ),
+            (false, 0) => "Nothing staged".to_string(),
             (false, _) => format!("Commit {staged} file{}", if staged == 1 { "" } else { "s" }),
         };
+        let has_changes = !self.files.is_empty();
         div()
             .flex()
             .flex_none()
@@ -485,80 +487,113 @@ impl RepoView {
                             )
                     })),
             )
+            // The button over the column's width, its shortcut in it; under
+            // it, Amend and Stash on one line.
             .child(
                 div()
                     .flex()
                     .flex_col()
                     .flex_none()
-                    .items_end()
-                    .gap(px(4.))
+                    .w(gpui::rems(COMMIT_COLUMN))
+                    .gap(px(8.))
                     .child(
                         div()
                             .id("commit-button")
-                            .px(px(12.))
-                            .py(px(4.))
-                            .rounded(px(4.))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(8.))
+                            .w_full()
+                            .px(px(10.))
+                            .py(px(5.))
+                            .rounded(px(6.))
+                            .border_1()
                             .map(|button| match ready {
                                 true => button
                                     .bg(theme.accent)
+                                    .border_color(theme.accent)
                                     .text_color(theme.tag_head_text)
-                                    .cursor_pointer(),
+                                    .cursor_pointer()
+                                    .hover(|button| button.opacity(0.85)),
                                 false => button
-                                    .border_1()
+                                    .justify_center()
                                     .border_color(theme.separator)
                                     .text_color(theme.secondary),
                             })
                             .on_click(cx.listener(|this, _, _, cx| this.commit(cx)))
-                            .child(label),
+                            .child(div().truncate().child(label))
+                            .when(ready, |button| {
+                                button.child(div().flex_none().opacity(0.75).child("⌘↩"))
+                            }),
                     )
                     .child(
                         div()
-                            .id("amend")
                             .flex()
                             .items_center()
-                            .gap(px(4.))
+                            .justify_between()
                             .text_xs()
-                            .cursor_pointer()
-                            .on_click(cx.listener(|this, _, _, cx| this.toggle_amend(cx)))
                             .child(
                                 div()
+                                    .id("amend")
                                     .flex()
                                     .items_center()
-                                    .justify_center()
-                                    .size(px(12.))
-                                    .rounded(px(3.))
-                                    .border_1()
-                                    .border_color(theme.secondary)
-                                    .when(self.draft.amend, |check| {
-                                        check
-                                            .bg(theme.accent)
-                                            .border_color(theme.accent)
-                                            .text_color(theme.tag_head_text)
-                                            .child("✓")
-                                    }),
+                                    .gap(px(5.))
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|this, _, _, cx| this.toggle_amend(cx)))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .size(px(12.))
+                                            .rounded(px(3.))
+                                            .border_1()
+                                            .border_color(theme.secondary)
+                                            .when(self.draft.amend, |check| {
+                                                check
+                                                    .bg(theme.accent)
+                                                    .border_color(theme.accent)
+                                                    .text_color(theme.tag_head_text)
+                                                    .child("✓")
+                                            }),
+                                    )
+                                    .child("Amend"),
                             )
-                            .child("Amend"),
-                    )
-                    // Puts all the changes, untracked files too, aside in a
-                    // stash, named by the message box when it says something.
-                    .child(
-                        div()
-                            .id("stash-changes")
-                            .text_xs()
-                            .text_color(theme.accent)
-                            .cursor_pointer()
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                if let Some(path) = this.staging_worktree() {
-                                    let line = popups::stash_push(&path, &this.draft.message, &[]);
-                                    this.run_in_terminal(line, window, cx);
-                                }
-                            }))
-                            .child("Stash"),
-                    )
-                    .child(div().text_xs().text_color(theme.secondary).child("⌘↩")),
+                            // Puts all the changes, untracked files too,
+                            // aside in a stash, named by the message box when
+                            // it says something.
+                            .when(has_changes, |row| {
+                                row.child(
+                                    div()
+                                        .id("stash-changes")
+                                        .px(px(8.))
+                                        .py(px(1.))
+                                        .rounded(px(4.))
+                                        .border_1()
+                                        .border_color(theme.separator)
+                                        .cursor_pointer()
+                                        .hover(|button| button.bg(theme.selection))
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            if let Some(path) = this.staging_worktree() {
+                                                let line = popups::stash_push(
+                                                    &path,
+                                                    &this.draft.message,
+                                                    &[],
+                                                );
+                                                this.run_in_terminal(line, window, cx);
+                                            }
+                                        }))
+                                        .child("Stash"),
+                                )
+                            }),
+                    ),
             )
     }
 }
+
+/// The commit box's column of buttons, in rems so it grows with the text:
+/// wide enough for "Amend with 12 files ⌘↩".
+const COMMIT_COLUMN: f32 = 12.5;
 
 /// A text field's content: the text, or a placeholder, with a caret at the
 /// end while it has focus. Over a placeholder the caret is laid on top, so
