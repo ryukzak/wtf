@@ -194,6 +194,14 @@ impl RepoView {
             }
             Command::Hide => self.hide_branch(&popups::attention_name(&target), cx),
             Command::FollowFilters => self.follow_filters(&popups::attention_name(&target), cx),
+            Command::ToggleChannel => {
+                if let Some(name) = self.channel_name(&target) {
+                    match self.graph.channels.contains(&name) {
+                        true => self.remove_channel(&name, cx),
+                        false => self.add_channel(&name, cx),
+                    }
+                }
+            }
             Command::Pin => {
                 let name = popups::attention_name(&target);
                 self.change_attention(
@@ -299,8 +307,14 @@ impl RepoView {
 
     /// Lists the stale branches and worktrees, all ticked to go.
     pub(super) fn open_prune(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let stale = self
-            .graph
+        self.prune = Some(self.stale_branches());
+        self.prune_focus.focus(window);
+        cx.notify();
+    }
+
+    /// Branches the prune dialog offers, each with whether it starts ticked.
+    pub(super) fn stale_branches(&self) -> Vec<(String, bool)> {
+        self.graph
             .branches
             .iter()
             .filter(|branch| !branch.remote && !branch.unrelated && branch.name != self.graph.main)
@@ -311,10 +325,7 @@ impl RepoView {
                 let merged = branch.stale.iter().any(|reason| reason == "merged");
                 (branch.name.clone(), merged)
             })
-            .collect();
-        self.prune = Some(stale);
-        self.prune_focus.focus(window);
-        cx.notify();
+            .collect()
     }
 
     fn close_prune(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -857,7 +868,7 @@ impl RepoView {
         Some(dialog_overlay(panel, GOTO_WIDTH, 60., window))
     }
 
-    fn show_prompt(&mut self, kind: PromptKind, input: String, window: &mut Window) {
+    pub(super) fn show_prompt(&mut self, kind: PromptKind, input: String, window: &mut Window) {
         self.prompt = Some(Prompt { kind, input });
         self.prompt_focus.focus(window);
     }
@@ -918,6 +929,7 @@ impl RepoView {
             PromptKind::WorktreeFor(branch) => {
                 self.run_in_terminal(popups::add_worktree(&repo, &input, &branch), window, cx);
             }
+            PromptKind::AddChannel => self.add_channel(&input, cx),
             PromptKind::NewBranch {
                 commit,
                 worktree: false,
@@ -930,6 +942,33 @@ impl RepoView {
                 let line = popups::add_worktree_at(&repo, &path, &input, &commit);
                 self.run_in_terminal(line, window, cx);
             }
+        }
+    }
+
+    /// The name a branch would be a channel by: a local branch's, or a remote
+    /// one's without its remote. Never the main branch, always one.
+    fn channel_name(&self, target: &Target) -> Option<String> {
+        let name = match target {
+            Target::Branch { name, .. } => name,
+            Target::Remote { branch, .. } => branch,
+            _ => return None,
+        };
+        (*name != self.graph.main).then(|| name.clone())
+    }
+
+    /// The menu's channel item for a branch, if it offers one.
+    fn channel_label(&self, target: &Target) -> Option<&'static str> {
+        let name = self.channel_name(target)?;
+        let patterns = &self.graph.channels;
+        if patterns.contains(&name) {
+            Some("Stop Treating as Channel")
+        } else if patterns
+            .iter()
+            .any(|pattern| wtf_core::glob(pattern, &name))
+        {
+            None
+        } else {
+            Some("Treat as Channel")
         }
     }
 
@@ -990,7 +1029,7 @@ impl RepoView {
             .collect();
         let overridden =
             self.attention.pinned.contains(&name) || self.attention.hidden.contains(&name);
-        for (k, item) in popups::commands(
+        let mut items = popups::commands(
             target,
             main,
             self.graph.main_worktree.as_deref(),
@@ -998,10 +1037,22 @@ impl RepoView {
             shown,
             overridden,
             &worktrees,
-        )
-        .into_iter()
-        .enumerate()
-        {
+        );
+        // A branch becomes a channel by its name, next to what attention
+        // makes of it; one a wider pattern names already offers nothing.
+        if let Some(label) = self.channel_label(target) {
+            let at = items
+                .iter()
+                .position(|item| {
+                    matches!(
+                        item,
+                        Some((Command::Hide | Command::Pin | Command::FollowFilters, _))
+                    )
+                })
+                .map_or(items.len(), |at| at + 1);
+            items.insert(at, Some((Command::ToggleChannel, label.to_string())));
+        }
+        for (k, item) in items.into_iter().enumerate() {
             menu = match item {
                 None => menu.child(div().h(px(1.)).my(px(4.)).bg(theme.separator)),
                 Some((command, label)) => menu.child(
@@ -1052,6 +1103,33 @@ impl RepoView {
                 "New worktree at {} on a new branch named",
                 popups::short_hash(commit)
             ),
+            PromptKind::AddChannel => {
+                "Channel branches: a name, or a pattern such as v[0-9][0-9][0-9][0-9]".to_string()
+            }
+        };
+        // A pattern shows what it would name before it is added, so one too
+        // loose shows at once.
+        let hint = match &prompt.kind {
+            PromptKind::AddChannel => {
+                let input = prompt.input.trim();
+                let names = self.channel_matches(input);
+                let shown: Vec<&str> = names.iter().take(8).map(String::as_str).collect();
+                match (input.is_empty(), names.len()) {
+                    (true, _) => "* matches any run of characters, ? one, [0-9] one of a set. \
+                                  Enter to add · Esc to cancel"
+                        .to_string(),
+                    (false, 0) => {
+                        "Matches no branch yet · Enter to add · Esc to cancel".to_string()
+                    }
+                    (false, n) => format!(
+                        "Matches {n} branch{}: {}{} · Enter to add",
+                        if n == 1 { "" } else { "es" },
+                        shown.join(", "),
+                        if n > shown.len() { ", …" } else { "" }
+                    ),
+                }
+            }
+            _ => "Enter to run in the terminal · Esc to cancel".to_string(),
         };
         let panel = div()
             .flex()
@@ -1079,12 +1157,7 @@ impl RepoView {
                     .child(prompt.input.clone())
                     .child(div().w(px(1.5)).h(px(14.)).bg(theme.foreground)),
             )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.secondary)
-                    .child("Enter to run in the terminal · Esc to cancel"),
-            );
+            .child(div().text_xs().text_color(theme.secondary).child(hint));
         Some(dialog_overlay(panel, PROMPT_WIDTH, 80., window))
     }
 

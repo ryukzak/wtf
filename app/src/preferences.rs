@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::{LazyLock, RwLock};
 
 use gpui::{
-    AnyElement, App, Bounds, Context, FocusHandle, Global, KeyDownEvent, SharedString, Stateful,
+    AnyElement, App, Bounds, Context, FocusHandle, Global, KeyDownEvent, SharedString,
     TitlebarOptions, Window, WindowBounds, WindowHandle, WindowOptions, div, prelude::*, px, size,
 };
 
@@ -32,14 +32,14 @@ pub struct GraphStyle {
 impl Default for GraphStyle {
     fn default() -> Self {
         Self {
-            row_height: 24.,
-            column: 64.,
+            row_height: 22.,
+            column: 32.,
             bead_spacing: 7.,
             beads: 20,
             dot: 10.,
             line: 2.,
             hover_line: 4.,
-            curve: 20.,
+            curve: 16.,
         }
     }
 }
@@ -93,7 +93,11 @@ impl Settings {
         self.code_line = ((self.code_line * 10.).round() / 10.).clamp(1.3, 2.);
         self.terminal_line = ((self.terminal_line * 20.).round() / 20.).clamp(1., 1.6);
         self.idle_days = self.idle_days.clamp(1, 365);
-        self.pull_option = self.pull_option.min(sync::PULL.len() - 1);
+        // A choice gone from the list, such as the fetches Pull once offered,
+        // goes back to the default rather than to whatever took its place.
+        if self.pull_option >= sync::PULL.len() {
+            self.pull_option = Settings::default().pull_option;
+        }
         self.push_option = self.push_option.min(sync::PUSH.len() - 1);
         let graph = &mut self.graph;
         graph.row_height = graph.row_height.clamp(16., 48.);
@@ -227,7 +231,150 @@ pub fn set_sync_option(push: bool, option: usize, cx: &mut App) {
 }
 
 /// The background fetch intervals offered, in minutes; 0 is off.
-const FETCH_MINUTES: [u32; 6] = [0, 1, 5, 15, 30, 60];
+const FETCH_MINUTES: [f32; 6] = [0., 1., 5., 15., 30., 60.];
+
+/// Idle days offered: close together where they matter, far apart beyond.
+const IDLE_DAYS: [f32; 15] = [
+    1., 2., 3., 5., 7., 10., 14., 21., 30., 45., 60., 90., 120., 180., 365.,
+];
+
+/// A slider's track and its knob.
+const SLIDER_WIDTH: f32 = 180.;
+const KNOB_SIZE: f32 = 14.;
+
+/// A number of the settings that a slider sets.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum Knob {
+    UiSize,
+    CodeSize,
+    CodeWeight,
+    CodeLine,
+    TerminalLine,
+    FetchMinutes,
+    RowHeight,
+    Column,
+    Curve,
+    Dot,
+    BeadSpacing,
+    Beads,
+    Line,
+    HoverLine,
+    IdleDays,
+}
+
+/// The values a slider runs over: evenly from one to another, or a list.
+enum Steps {
+    Even { min: f32, max: f32, step: f32 },
+    List(&'static [f32]),
+}
+
+impl Knob {
+    /// The same ranges [`Settings::clamp`] keeps the numbers in.
+    fn steps(self) -> Steps {
+        let even = |min, max, step| Steps::Even { min, max, step };
+        match self {
+            Knob::UiSize => even(12., 22., 1.),
+            Knob::CodeSize => even(9., 24., 1.),
+            Knob::CodeWeight => even(100., 900., 100.),
+            Knob::CodeLine => even(1.3, 2., 0.1),
+            Knob::TerminalLine => even(1., 1.6, 0.05),
+            Knob::FetchMinutes => Steps::List(&FETCH_MINUTES),
+            Knob::RowHeight => even(16., 48., 2.),
+            Knob::Column => even(32., 160., 8.),
+            Knob::Curve => even(8., 64., 4.),
+            Knob::Dot => even(6., 18., 2.),
+            Knob::BeadSpacing => even(4., 16., 1.),
+            Knob::Beads => even(5., 200., 5.),
+            Knob::Line => even(1., 4., 0.5),
+            Knob::HoverLine => even(2., 8., 1.),
+            Knob::IdleDays => Steps::List(&IDLE_DAYS),
+        }
+    }
+
+    fn get(self, s: &Settings) -> f32 {
+        match self {
+            Knob::UiSize => s.ui_size,
+            Knob::CodeSize => s.code_size,
+            Knob::CodeWeight => s.code_weight,
+            Knob::CodeLine => s.code_line,
+            Knob::TerminalLine => s.terminal_line,
+            Knob::FetchMinutes => s.fetch_minutes as f32,
+            Knob::RowHeight => s.graph.row_height,
+            Knob::Column => s.graph.column,
+            Knob::Curve => s.graph.curve,
+            Knob::Dot => s.graph.dot,
+            Knob::BeadSpacing => s.graph.bead_spacing,
+            Knob::Beads => s.graph.beads as f32,
+            Knob::Line => s.graph.line,
+            Knob::HoverLine => s.graph.hover_line,
+            Knob::IdleDays => s.idle_days as f32,
+        }
+    }
+
+    fn set(self, s: &mut Settings, value: f32) {
+        match self {
+            Knob::UiSize => s.ui_size = value,
+            Knob::CodeSize => s.code_size = value,
+            Knob::CodeWeight => s.code_weight = value,
+            Knob::CodeLine => s.code_line = value,
+            Knob::TerminalLine => s.terminal_line = value,
+            Knob::FetchMinutes => s.fetch_minutes = value as u32,
+            Knob::RowHeight => s.graph.row_height = value,
+            Knob::Column => s.graph.column = value,
+            Knob::Curve => s.graph.curve = value,
+            Knob::Dot => s.graph.dot = value,
+            Knob::BeadSpacing => s.graph.bead_spacing = value,
+            Knob::Beads => s.graph.beads = value as usize,
+            Knob::Line => s.graph.line = value,
+            Knob::HoverLine => s.graph.hover_line = value,
+            Knob::IdleDays => s.idle_days = value as u32,
+        }
+    }
+
+    /// How far along its track a value sits, from 0 to 1.
+    fn fraction(self, value: f32) -> f32 {
+        match self.steps() {
+            Steps::Even { min, max, .. } => ((value - min) / (max - min)).clamp(0., 1.),
+            // A value between two of the list sits at the nearer one.
+            Steps::List(list) => {
+                let at = (0..list.len())
+                    .min_by(|&a, &b| (list[a] - value).abs().total_cmp(&(list[b] - value).abs()))
+                    .unwrap_or(0);
+                at as f32 / (list.len() - 1).max(1) as f32
+            }
+        }
+    }
+
+    /// The value at a place along the track, on one of the steps.
+    fn at(self, frac: f32) -> f32 {
+        match self.steps() {
+            Steps::Even { min, max, step } => {
+                let value = min + ((frac * (max - min)) / step).round() * step;
+                // Rounded as the settings keep it, so steps of 0.1 stay exact.
+                ((value * 100.).round() / 100.).clamp(min, max)
+            }
+            Steps::List(list) => list[(frac * (list.len() - 1) as f32).round() as usize],
+        }
+    }
+
+    /// The value as the slider says it.
+    fn label(self, value: f32) -> String {
+        match self {
+            Knob::CodeWeight => format!("{} {value}", weight_name(value)),
+            Knob::CodeLine => format!("{value:.1}"),
+            Knob::TerminalLine => format!("{value:.2}"),
+            Knob::FetchMinutes => match value as u32 {
+                0 => "Off".to_string(),
+                n => format!("every {n} min"),
+            },
+            Knob::IdleDays => match value as u32 {
+                1 => "1 day".to_string(),
+                n => format!("{n} days"),
+            },
+            _ => format!("{value}"),
+        }
+    }
+}
 
 pub fn summaries() -> bool {
     read().summaries == Some(true)
@@ -494,6 +641,8 @@ pub fn open(cx: &mut App) {
                 font_menu: None,
                 font_query: String::new(),
                 prompt_focus: [cx.focus_handle(), cx.focus_handle()],
+                dragging: None,
+                tracks: Default::default(),
             }
         })
     });
@@ -513,6 +662,9 @@ pub struct Preferences {
     font_query: String,
     /// The prompt fields, each with its own focus.
     prompt_focus: [FocusHandle; 2],
+    /// The slider being dragged, and where each slider's track was drawn.
+    dragging: Option<Knob>,
+    tracks: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<Knob, Bounds<gpui::Pixels>>>>,
 }
 
 /// Which prompt a field edits.
@@ -621,6 +773,131 @@ fn row(label: &'static str, theme: &Theme) -> gpui::Div {
         )
 }
 
+/// A small graph drawn with the graph settings as they stand, at the size
+/// the graph has: a main line with a bar of commits, a branch that leaves
+/// and comes back, and one hovered, in its wider line.
+fn graph_preview(g: GraphStyle, theme: &Theme) -> impl IntoElement {
+    let rgb = |color: gpui::Hsla| {
+        let rgba = gpui::Rgba::from(color);
+        let byte = |channel: f32| (channel * 255.).round() as u8;
+        format!("rgb({},{},{})", byte(rgba.r), byte(rgba.g), byte(rgba.b))
+    };
+    let lanes = theme.lanes.map(rgb);
+    // Beads are upright ellipses, a little over half as wide as tall.
+    let bead = g.dot * 0.6;
+    let pad = 14.;
+    let y = |row: f32| pad + g.row_height * (row + 0.5);
+    // A rail leaves its row and arrives in the next as the graph draws it:
+    // two half-curves over at most the curve length.
+    let s_curve = |(x1, y1): (f32, f32), (x2, y2): (f32, f32)| {
+        let (mx, my) = ((x1 + x2) / 2., (y1 + y2) / 2.);
+        format!("Q{mx},{y1} {mx},{my} Q{mx},{y2} {x2},{y2}")
+    };
+    let fork = |from: (f32, f32), to: (f32, f32)| {
+        let bend = (to.0 - from.0).clamp(0., g.curve);
+        let corner = (from.0 + bend, to.1);
+        format!(
+            "M{},{} {} L{},{}",
+            from.0,
+            from.1,
+            s_curve(from, corner),
+            to.0,
+            to.1
+        )
+    };
+    let merge = |from: (f32, f32), to: (f32, f32)| {
+        let bend = (to.0 - from.0).clamp(0., g.curve);
+        let corner = (to.0 - bend, from.1);
+        format!(
+            "M{},{} L{},{} {}",
+            from.0,
+            from.1,
+            corner.0,
+            corner.1,
+            s_curve(corner, to)
+        )
+    };
+    let rail = |d: String, width: f32, color: &str| {
+        format!(
+            r#"<path d="{d}" fill="none" stroke="{color}" stroke-width="{width}" stroke-linecap="round"/>"#
+        )
+    };
+    let mark = |x: f32, y: f32, color: &str| {
+        format!(
+            r#"<rect x="{}" y="{}" width="{bead}" height="{}" rx="{}" fill="{color}"/>"#,
+            x - bead / 2.,
+            y - g.dot / 2.,
+            g.dot,
+            bead / 2.
+        )
+    };
+    // Main: a commit, a bar of many, two commits.
+    let count = g.beads.min(24);
+    let x0 = pad + g.dot;
+    let bar = (
+        x0 + g.column,
+        x0 + g.column + (count - 1) as f32 * g.bead_spacing,
+    );
+    let xc = bar.1 + g.column;
+    let xd = xc + g.column;
+    let (y0, y1, y2) = (y(0.), y(1.), y(2.));
+    let mut rails = vec![
+        rail(format!("M{x0},{y0} L{xd},{y0}"), g.line, &lanes[0]),
+        // A branch off the first commit, back into the main line.
+        rail(fork((x0, y0), (bar.0, y1)), g.line, &lanes[1]),
+        rail(
+            format!("M{},{y1} L{},{y1}", bar.0, bar.1),
+            g.line,
+            &lanes[1],
+        ),
+        rail(merge((bar.1, y1), (xc, y0)), g.line, &lanes[1]),
+    ];
+    // A hovered branch, off the third commit.
+    rails.push(rail(fork((xc, y0), (xd, y2)), g.hover_line, &lanes[2]));
+    rails.push(rail(
+        format!("M{xd},{y2} L{},{y2}", xd + g.column),
+        g.hover_line,
+        &lanes[2],
+    ));
+    let mut marks = vec![
+        mark(x0, y0, &lanes[0]),
+        mark(xc, y0, &lanes[0]),
+        mark(xd, y0, &lanes[0]),
+    ];
+    marks.extend((0..count).map(|k| mark(bar.0 + k as f32 * g.bead_spacing, y0, &lanes[0])));
+    marks.extend([mark(bar.0, y1, &lanes[1]), mark(bar.1, y1, &lanes[1])]);
+    marks.extend([mark(xd, y2, &lanes[2]), mark(xd + g.column, y2, &lanes[2])]);
+    let (w, h) = (
+        (xd + g.column + pad + g.dot).ceil(),
+        (y(2.) + g.row_height / 2. + pad).ceil(),
+    );
+    // Drawn at twice its size to stay sharp, as the strip's labels are.
+    let svg = format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{}" height="{}" viewBox="0 0 {w} {h}">{}{}</svg>"#,
+        w * 2.,
+        h * 2.,
+        rails.concat(),
+        marks.concat()
+    );
+    div()
+        .w_full()
+        .h(px(h))
+        .mb(px(FONT_GROUP_GAP))
+        .rounded(px(6.))
+        .border_1()
+        .border_color(theme.separator)
+        .bg(theme.graph_background)
+        .overflow_hidden()
+        .child(
+            gpui::img(std::sync::Arc::new(gpui::Image::from_bytes(
+                gpui::ImageFormat::Svg,
+                svg.into_bytes(),
+            )))
+            .w(px(w))
+            .h(px(h)),
+        )
+}
+
 /// Between the Fonts section's rows, and more between its groups.
 const FONT_ROW_GAP: f32 = 10.;
 const FONT_GROUP_GAP: f32 = 8.;
@@ -669,62 +946,95 @@ fn segmented<T: Copy + PartialEq + 'static>(
         .children(buttons)
 }
 
-fn small_button(id: SharedString, label: &'static str, theme: &Theme) -> Stateful<gpui::Div> {
-    div()
-        .id(id)
-        .flex()
-        .items_center()
-        .justify_center()
-        .w(px(22.))
-        .h(px(20.))
-        .rounded(px(4.))
-        .border_1()
-        .border_color(theme.separator)
-        .hover(|button| button.bg(theme.selection))
-        .cursor_pointer()
-        .child(label)
-}
-
 impl Preferences {
-    /// A − value + stepper changing one number of the settings.
-    fn stepper(
-        &self,
-        id: &'static str,
-        value: String,
-        step: impl Fn(&mut Settings, f32) + Clone + 'static,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> gpui::Div {
-        let down = step.clone();
-        div()
-            .flex()
-            .items_center()
-            .gap(px(8.))
+    /// A slider for one number of the settings: drag along it, or click
+    /// where the value should be; the value reads after it.
+    fn slider(&self, knob: Knob, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
+        let value = knob.get(&read());
+        let frac = knob.fraction(value);
+        let tracks = self.tracks.clone();
+        let travel = SLIDER_WIDTH - KNOB_SIZE;
+        let track = div()
+            .id(("slider", knob as usize))
+            .relative()
+            .flex_none()
+            .w(px(SLIDER_WIDTH))
+            .h(px(20.))
+            .cursor_pointer()
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                    this.dragging = Some(knob);
+                    this.drag_to(knob, event.position.x, cx);
+                }),
+            )
+            // Where the track is drawn, to read a pointer's place along it.
             .child(
-                small_button(SharedString::from(format!("{id}-down")), "−", theme).on_click(
-                    cx.listener(move |_, _, _, cx| {
-                        let down = down.clone();
-                        change(move |settings| down(settings, -1.), cx)
-                    }),
-                ),
+                gpui::canvas(
+                    move |bounds, _, _| {
+                        tracks.borrow_mut().insert(knob, bounds);
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
             )
             .child(
                 div()
-                    .min_w(px(48.))
-                    .px(px(4.))
-                    .flex()
-                    .justify_center()
-                    .whitespace_nowrap()
-                    .child(value),
+                    .absolute()
+                    .left(px(KNOB_SIZE / 2.))
+                    .right(px(KNOB_SIZE / 2.))
+                    .top(px(8.))
+                    .h(px(4.))
+                    .rounded(px(2.))
+                    .bg(theme.separator),
             )
             .child(
-                small_button(SharedString::from(format!("{id}-up")), "+", theme).on_click(
-                    cx.listener(move |_, _, _, cx| {
-                        let step = step.clone();
-                        change(move |settings| step(settings, 1.), cx)
-                    }),
-                ),
+                div()
+                    .absolute()
+                    .left(px(KNOB_SIZE / 2.))
+                    .top(px(8.))
+                    .h(px(4.))
+                    .w(px(frac * travel))
+                    .rounded(px(2.))
+                    .bg(theme.accent),
             )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(frac * travel))
+                    .top(px((20. - KNOB_SIZE) / 2.))
+                    .size(px(KNOB_SIZE))
+                    .rounded_full()
+                    .border_1()
+                    .border_color(match self.dragging == Some(knob) {
+                        true => theme.accent,
+                        false => theme.secondary,
+                    })
+                    .bg(theme.background)
+                    .shadow_sm(),
+            );
+        div()
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .child(track)
+            .child(div().whitespace_nowrap().child(knob.label(value)))
+    }
+
+    /// Sets a slider's number from a pointer's place along its track, in
+    /// the slider's steps; settings change only when the number does.
+    fn drag_to(&mut self, knob: Knob, x: gpui::Pixels, cx: &mut Context<Self>) {
+        let Some(bounds) = self.tracks.borrow().get(&knob).copied() else {
+            return;
+        };
+        let travel = f32::from(bounds.size.width) - KNOB_SIZE;
+        let frac = (f32::from(x - bounds.left()) - KNOB_SIZE / 2.) / travel.max(1.);
+        let value = knob.at(frac.clamp(0., 1.));
+        if knob.get(&read()) != value {
+            change(|settings| knob.set(settings, value), cx);
+        }
+        cx.notify();
     }
 
     /// Typing filters an open font dropdown; Esc closes it, then the window.
@@ -1019,13 +1329,7 @@ impl Render for Preferences {
                     &theme,
                     cx,
                 )))
-                .child(row("Interface size", &theme).child(self.stepper(
-                    "ui",
-                    format!("{}", settings.ui_size),
-                    move |s, d| s.ui_size += d,
-                    &theme,
-                    cx,
-                )))
+                .child(row("Interface size", &theme).child(self.slider(Knob::UiSize, &theme, cx)))
                 .child(
                     row("Code font", &theme)
                         .mt(px(FONT_GROUP_GAP))
@@ -1036,22 +1340,10 @@ impl Render for Preferences {
                             cx,
                         )),
                 )
-                .child(row("Code size", &theme).child(self.stepper(
-                    "code",
-                    format!("{}", settings.code_size),
-                    move |s, d| s.code_size += d,
-                    &theme,
-                    cx,
-                )))
+                .child(row("Code size", &theme).child(self.slider(Knob::CodeSize, &theme, cx)))
                 .child(
-                    with_note(row("Code weight", &theme).child(self.stepper(
-                        "code-weight",
-                        format!(
-                            "{} {}",
-                            weight_name(settings.code_weight),
-                            settings.code_weight
-                        ),
-                        move |s, d| s.code_weight += d * 100.,
+                    with_note(row("Code weight", &theme).child(self.slider(
+                        Knob::CodeWeight,
                         &theme,
                         cx,
                     )))
@@ -1064,19 +1356,11 @@ impl Render for Preferences {
                 .child(
                     row("Code line height", &theme)
                         .mt(px(FONT_GROUP_GAP))
-                        .child(self.stepper(
-                            "code-line",
-                            format!("{:.1}", settings.code_line),
-                            move |s, d| s.code_line += d * 0.1,
-                            &theme,
-                            cx,
-                        )),
+                        .child(self.slider(Knob::CodeLine, &theme, cx)),
                 )
                 .child(
-                    with_note(row("Terminal line height", &theme).child(self.stepper(
-                        "terminal-line",
-                        format!("{:.2}", settings.terminal_line),
-                        move |s, d| s.terminal_line += d * 0.05,
+                    with_note(row("Terminal line height", &theme).child(self.slider(
+                        Knob::TerminalLine,
                         &theme,
                         cx,
                     )))
@@ -1108,21 +1392,8 @@ impl Render for Preferences {
                     .child(self.prompt_field(PromptSetting::Message, &theme, window, cx))
             }
             Section::Remote => {
-                let minutes = settings.fetch_minutes;
-                let fetch = row("Fetch in background", &theme).child(self.stepper(
-                    "fetch",
-                    match minutes {
-                        0 => "Off".to_string(),
-                        n => format!("every {n} min"),
-                    },
-                    move |s, d| {
-                        let at = FETCH_MINUTES
-                            .iter()
-                            .position(|&m| m >= s.fetch_minutes)
-                            .unwrap_or(FETCH_MINUTES.len() - 1);
-                        let at = (at as f32 + d).clamp(0., (FETCH_MINUTES.len() - 1) as f32);
-                        s.fetch_minutes = FETCH_MINUTES[at as usize];
-                    },
+                let fetch = row("Fetch in background", &theme).child(self.slider(
+                    Knob::FetchMinutes,
                     &theme,
                     cx,
                 ));
@@ -1151,73 +1422,42 @@ impl Render for Preferences {
                         &theme,
                     ))
             }
+            // A sample graph, drawn as the settings stand, over them in groups:
+            // where things go, how commits look, how lines look.
             Section::Graph => div()
                 .flex()
                 .flex_col()
-                .gap(px(4.))
-                .child(row("Row height", &theme).child(self.stepper(
-                    "row",
-                    format!("{}", graph.row_height),
-                    move |s, d| s.graph.row_height += 2. * d,
+                .gap(px(FONT_ROW_GAP))
+                .child(graph_preview(graph, &theme))
+                .child(row("Row height", &theme).child(self.slider(Knob::RowHeight, &theme, cx)))
+                .child(row("Node spacing", &theme).child(self.slider(Knob::Column, &theme, cx)))
+                .child(row("Curve length", &theme).child(self.slider(Knob::Curve, &theme, cx)))
+                .child(
+                    row("Dot size", &theme)
+                        .mt(px(FONT_GROUP_GAP))
+                        .child(self.slider(Knob::Dot, &theme, cx)),
+                )
+                .child(row("Bead spacing", &theme).child(self.slider(
+                    Knob::BeadSpacing,
                     &theme,
                     cx,
                 )))
-                .child(row("Node spacing", &theme).child(self.stepper(
-                    "column",
-                    format!("{}", graph.column),
-                    move |s, d| s.graph.column += 8. * d,
+                .child(row("Beads per node", &theme).child(self.slider(Knob::Beads, &theme, cx)))
+                .child(
+                    row("Line width", &theme)
+                        .mt(px(FONT_GROUP_GAP))
+                        .child(self.slider(Knob::Line, &theme, cx)),
+                )
+                .child(row("Hover line width", &theme).child(self.slider(
+                    Knob::HoverLine,
                     &theme,
                     cx,
                 )))
-                .child(row("Bead spacing", &theme).child(self.stepper(
-                    "bead",
-                    format!("{}", graph.bead_spacing),
-                    move |s, d| s.graph.bead_spacing += d,
-                    &theme,
-                    cx,
-                )))
-                .child(row("Beads per node", &theme).child(self.stepper(
-                    "beads",
-                    format!("{}", graph.beads),
-                    move |s, d| s.graph.beads = (s.graph.beads as f32 + 5. * d) as usize,
-                    &theme,
-                    cx,
-                )))
-                .child(row("Dot size", &theme).child(self.stepper(
-                    "dot",
-                    format!("{}", graph.dot),
-                    move |s, d| s.graph.dot += 2. * d,
-                    &theme,
-                    cx,
-                )))
-                .child(row("Line width", &theme).child(self.stepper(
-                    "line",
-                    format!("{}", graph.line),
-                    move |s, d| s.graph.line += 0.5 * d,
-                    &theme,
-                    cx,
-                )))
-                .child(row("Hover line width", &theme).child(self.stepper(
-                    "hover",
-                    format!("{}", graph.hover_line),
-                    move |s, d| s.graph.hover_line += d,
-                    &theme,
-                    cx,
-                )))
-                .child(row("Curve length", &theme).child(self.stepper(
-                    "curve",
-                    format!("{}", graph.curve),
-                    move |s, d| s.graph.curve += 4. * d,
-                    &theme,
-                    cx,
-                )))
-                .child(row("Branch idle after", &theme).child(self.stepper(
-                    "idle-days",
-                    format!("{} days", settings.idle_days),
-                    move |s, d| s.idle_days = (s.idle_days as f32 + d) as u32,
-                    &theme,
-                    cx,
-                )))
+                .child(
+                    row("Branch idle after", &theme)
+                        .mt(px(FONT_GROUP_GAP))
+                        .child(self.slider(Knob::IdleDays, &theme, cx)),
+                )
                 .child(
                     div().mt(px(8.)).child(
                         div()
@@ -1258,6 +1498,28 @@ impl Render for Preferences {
             .id("preferences")
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::key_down))
+            // A slider follows the pointer anywhere in the window while the
+            // button is down, and lets go with it.
+            .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
+                let Some(knob) = this.dragging else {
+                    return;
+                };
+                match event.pressed_button {
+                    Some(gpui::MouseButton::Left) => this.drag_to(knob, event.position.x, cx),
+                    _ => {
+                        this.dragging = None;
+                        cx.notify();
+                    }
+                }
+            }))
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    if this.dragging.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
             .on_action(|_: &CloseTab, window, _| window.remove_window())
             .on_action(|_: &CloseWindow, window, _| window.remove_window())
             .flex()
@@ -1347,6 +1609,11 @@ mod tests {
         assert_eq!(settings.ui_size, 12.);
         assert_eq!(settings.code_size, Settings::default().code_size);
         assert_eq!(settings.push_option, sync::PUSH.len() - 1);
+        // A pull option no longer offered goes back to the default.
+        assert_eq!(
+            parse("pull_option=4\n").pull_option,
+            Settings::default().pull_option
+        );
     }
 
     #[test]
@@ -1365,5 +1632,41 @@ mod tests {
         let settings = parse("code_line=1\nterminal_line=3\n");
         assert_eq!(settings.code_line, 1.3);
         assert_eq!(settings.terminal_line, 1.6);
+    }
+
+    #[test]
+    fn sliders_stay_on_what_settings_keep() {
+        let knobs = [
+            Knob::UiSize,
+            Knob::CodeSize,
+            Knob::CodeWeight,
+            Knob::CodeLine,
+            Knob::TerminalLine,
+            Knob::FetchMinutes,
+            Knob::RowHeight,
+            Knob::Column,
+            Knob::Curve,
+            Knob::Dot,
+            Knob::BeadSpacing,
+            Knob::Beads,
+            Knob::Line,
+            Knob::HoverLine,
+            Knob::IdleDays,
+        ];
+        for knob in knobs {
+            for k in 0..=40 {
+                let frac = k as f32 / 40.;
+                let value = knob.at(frac);
+                let mut settings = Settings::default();
+                knob.set(&mut settings, value);
+                settings.clamp();
+                assert_eq!(knob.get(&settings), value, "{knob:?} at {frac}");
+                // The knob sits where the value is.
+                assert_eq!(knob.at(knob.fraction(value)), value, "{knob:?} {value}");
+            }
+            assert!(knob.at(0.) < knob.at(1.), "{knob:?} runs one way");
+        }
+        assert_eq!(Knob::CodeLine.at(Knob::CodeLine.fraction(1.6)), 1.6);
+        assert_eq!(Knob::IdleDays.at(Knob::IdleDays.fraction(14.)), 14.);
     }
 }

@@ -51,11 +51,17 @@ use time::*;
 use trees::*;
 use widgets::*;
 
-pub use time::now_seconds;
+pub use time::{now_seconds, short_age};
 pub use widgets::chevron;
 
 const CONTEXT_ROWS: usize = 3;
 const REFRESH: Duration = Duration::from_secs(2);
+/// How often the tab in front refreshes while its window is not: often
+/// enough to follow agents at work from another screen.
+const BACKGROUND_REFRESH: Duration = Duration::from_secs(10);
+/// A refresh waits at least this many times as long as the last one took,
+/// so a large repository never keeps git busy all the time.
+const REFRESH_SHARE: u32 = 3;
 const MAX_GRAPH_HEIGHT: f32 = 300.;
 /// The graph's starting height when it has few lanes, such as one branch.
 const MIN_GRAPH_HEIGHT: f32 = 160.;
@@ -267,6 +273,7 @@ enum Section {
     Remote,
     Tags,
     Stashes,
+    Channels,
 }
 
 /// A dropdown of the attention sidebar.
@@ -293,6 +300,8 @@ enum PromptKind {
     NewBranch { commit: String, worktree: bool },
     /// The branch of a new worktree for a stash, at the commit it was made on.
     StashWorktree { stash: String, base: String },
+    /// A glob pattern naming channel branches.
+    AddChannel,
 }
 
 /// Code colors are cached by path, appearance and all-files entry.
@@ -461,6 +470,8 @@ pub struct RepoView {
     error_message: Option<String>,
 
     console_open: bool,
+    /// The window is the one in front; with `active`, how often to refresh.
+    window_active: bool,
     hide_refresh: bool,
     log_seq: u64,
     /// The directory of the last command printed in the terminal.
@@ -600,6 +611,7 @@ impl RepoView {
             error_message: None,
             console_open: false,
             hide_refresh: true,
+            window_active: true,
             log_seq: 0,
             announced_dir: None,
             dock_height: DOCK_HEIGHT,
@@ -632,12 +644,34 @@ impl RepoView {
 
     /// The workspace shows one tab at a time; the active one takes focus and
     /// the menu bar.
+    /// Shows or hides the tab. Only the tab shown refreshes, so one coming
+    /// to the front catches up at once.
     pub fn set_active(&mut self, active: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let was_refreshing = self.active && self.window_active;
         self.active = active;
+        self.window_active = window.is_window_active();
         if active {
             self.focus.focus(window);
             self.menus_for = None;
             self.update_menus(cx);
+            if !was_refreshing {
+                self.start_refresh(cx);
+            }
+        }
+    }
+
+    /// The window went to the back: the tab refreshes less often.
+    pub fn set_window_inactive(&mut self) {
+        self.window_active = false;
+    }
+
+    /// How long to wait for the next refresh; `None` stops refreshing, for a
+    /// tab not shown.
+    fn refresh_interval(&self) -> Option<Duration> {
+        match (self.active, self.window_active) {
+            (false, _) => None,
+            (true, true) => Some(REFRESH),
+            (true, false) => Some(BACKGROUND_REFRESH),
         }
     }
 
@@ -670,7 +704,8 @@ impl RepoView {
         cx.notify();
     }
 
-    /// Rebuilds the graph now and then every few seconds; unchanged graphs are ignored.
+    /// Rebuilds the graph now and then every few seconds while the tab is
+    /// shown; unchanged graphs are ignored, and nothing is redrawn for them.
     fn start_refresh(&mut self, cx: &mut Context<Self>) {
         let Some(path) = self.repo_path.clone() else {
             return;
@@ -684,24 +719,28 @@ impl RepoView {
                     break;
                 };
                 let path = path.clone();
+                let started = std::time::Instant::now();
                 let result =
                     cx.background_executor()
                         .spawn(async move {
                             wtf_core::workflow_graph(&path, &attention, combine, history)
                         })
                         .await;
-                let applied = this.update(cx, |this, cx| {
+                let took = started.elapsed();
+                let interval = this.update(cx, |this, cx| {
                     this.apply_graph(result, cx);
                     this.fetch_when_due(cx);
-                    // Shows the refresh commands in an open console.
-                    if this.console_open {
-                        cx.notify();
-                    }
+                    // The terminal prints the refresh's commands itself; the
+                    // view is not redrawn for them.
+                    this.sync_log(cx);
+                    this.refresh_interval()
                 });
-                if applied.is_err() {
+                let Ok(Some(interval)) = interval else {
                     break;
-                }
-                cx.background_executor().timer(REFRESH).await;
+                };
+                cx.background_executor()
+                    .timer(interval.max(took * REFRESH_SHARE))
+                    .await;
             }
         }));
     }
@@ -723,27 +762,49 @@ impl RepoView {
 
     /// Fetches every remote, then rebuilds the graph to show what came.
     fn fetch(&mut self, background: bool, cx: &mut Context<Self>) {
+        self.fetch_with(background, preferences::fetch_prune(), cx);
+    }
+
+    fn fetch_with(&mut self, background: bool, prune: bool, cx: &mut Context<Self>) {
         // A fetch under way already brings what another would.
         let Some(path) = self.repo_path.clone().filter(|_| self.fetch_task.is_none()) else {
             return;
         };
-        let prune = preferences::fetch_prune();
         let load = cx
             .background_executor()
             .spawn(async move { wtf_core::fetch(&path, prune, background) });
         self.fetch_task = Some(cx.spawn(async move |this, cx| {
-            // A failed fetch is only logged, in red in the terminal: it is
-            // tried again soon, and the user did not ask for it.
-            load.await.ok();
+            let result = load.await;
             this.update(cx, |this, cx| {
                 this.fetch_task = None;
                 this.fetched_at = Some(now_seconds());
+                // A background fetch that failed is only logged, in red in
+                // the terminal: it is tried again soon. One the user asked
+                // for says why.
+                if let (false, Err(error)) = (background, result) {
+                    this.error_message = Some(message(error));
+                }
                 this.start_refresh(cx);
                 cx.notify();
             })
             .ok();
         }));
         cx.notify();
+    }
+
+    /// Fetches now, as the background fetches do: the graph then marks
+    /// branches whose remote is gone. Nothing is deleted.
+    pub fn fetch_now(&mut self, cx: &mut Context<Self>) {
+        self.fetch(false, cx);
+    }
+
+    pub fn fetching(&self) -> bool {
+        self.fetch_task.is_some()
+    }
+
+    /// When the remotes were last fetched, for the Fetch button's tooltip.
+    pub fn fetched_at(&self) -> Option<i64> {
+        self.fetched_at
     }
 
     /// Runs a Pull or Push option in the worktree commands run in, then
@@ -757,7 +818,6 @@ impl RepoView {
             return;
         }
         let args = option.args;
-        let fetch = args.first() == Some(&"fetch");
         let to = self.push_remote.clone();
         let run = cx.background_executor().spawn(async move {
             match push {
@@ -769,7 +829,9 @@ impl RepoView {
             let result = run.await;
             this.update(cx, |this, cx| {
                 this.sync_task = None;
-                if fetch {
+                // A pull fetches its remote on the way: the next background
+                // fetch waits from now.
+                if !push {
                     this.fetched_at = Some(now_seconds());
                 }
                 // The user asked for it, so a failure shows in the review
@@ -856,6 +918,53 @@ impl RepoView {
             cx.set_menus(menus::menus(&state));
             self.menus_for = Some(state);
         }
+    }
+
+    /// Adds a channel pattern to the repository's git config, then shows
+    /// what it makes of the branches.
+    pub(super) fn add_channel(&mut self, pattern: &str, cx: &mut Context<Self>) {
+        self.change_channels(|repo| wtf_core::add_channel(repo, pattern), cx);
+    }
+
+    pub(super) fn remove_channel(&mut self, pattern: &str, cx: &mut Context<Self>) {
+        self.change_channels(|repo| wtf_core::remove_channel(repo, pattern), cx);
+    }
+
+    fn change_channels(
+        &mut self,
+        change: impl FnOnce(&str) -> Result<(), CoreError>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repo) = self.repo_path.clone() else {
+            return;
+        };
+        if let Err(error) = change(&repo) {
+            self.error_message = Some(message(error));
+        }
+        self.start_refresh(cx);
+        cx.notify();
+    }
+
+    /// The branches a channel pattern names, each once, without its remote:
+    /// `v2410` for `origin/v2410` and a local `v2410` alike.
+    pub(super) fn channel_matches(&self, pattern: &str) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .graph
+            .branches
+            .iter()
+            .map(|branch| match branch.remote {
+                true => branch
+                    .name
+                    .split_once('/')
+                    .map_or(&*branch.name, |(_, n)| n),
+                false => &branch.name,
+            })
+            .filter(|name| wtf_core::glob(pattern, name))
+            .map(str::to_string)
+            .collect();
+        names.sort();
+        names.dedup();
+        names
     }
 
     fn change_attention(&mut self, change: impl FnOnce(&mut Attention), cx: &mut Context<Self>) {
@@ -2675,16 +2784,19 @@ impl RepoView {
     /// Folders of the snapshot tree that are closed: those without changes,
     /// unless opened, and those with changes the user closed. A filter
     /// opens them all.
-    fn snapshot_closed(&self, entries: &[ChangedFile]) -> HashSet<String> {
+    /// `folders` are the tree's, from [`snapshot_folders`]: worked out once
+    /// per drawing, as they take a walk over every file.
+    fn snapshot_closed(&self, folders: &HashMap<String, bool>) -> HashSet<String> {
         if !self.snapshot.filter.trim().is_empty() {
             return HashSet::new();
         }
         // Folders open and close by hand only, so stepping through versions
         // leaves the tree as it is: closed at first, but for the way to the
         // open file. A click turns one from how it starts.
-        snapshot_folders(entries)
-            .into_keys()
-            .filter(|folder| !self.snapshot.open_folders.contains(folder))
+        folders
+            .keys()
+            .filter(|folder| !self.snapshot.open_folders.contains(*folder))
+            .cloned()
             .collect()
     }
 
@@ -2695,7 +2807,8 @@ impl RepoView {
         let only = self.snapshot.only_changed;
         let count = {
             let entries = self.snapshot_entries();
-            file_tree(&entries, None, &self.snapshot_closed(&entries)).len()
+            let closed = self.snapshot_closed(&snapshot_folders(&entries));
+            file_tree(&entries, None, &closed).len()
         };
         let list = uniform_list(
             "snapshot-files",
@@ -2703,7 +2816,10 @@ impl RepoView {
             cx.processor(|this, range: std::ops::Range<usize>, window, cx| {
                 let theme = Theme::for_appearance(window.appearance());
                 let entries = this.snapshot_entries();
-                let rows = file_tree(&entries, None, &this.snapshot_closed(&entries));
+                // Once for all the rows drawn, not once a row.
+                let folders = snapshot_folders(&entries);
+                let closed = this.snapshot_closed(&folders);
+                let rows = file_tree(&entries, None, &closed);
                 range
                     .filter_map(|k| rows.get(k).map(|row| (k, row)))
                     .map(|(k, row)| {
@@ -2722,13 +2838,10 @@ impl RepoView {
                         let indent = |depth: usize| px(8. + depth as f32 * 14.);
                         match row {
                             TreeRow::Dir { key, label, depth } => {
-                                let closed = this.snapshot_closed(&entries).contains(key);
+                                let closed = closed.contains(key);
                                 // Something changed inside: a mark, the
                                 // folder stays as it is.
-                                let changed = snapshot_folders(&entries)
-                                    .get(key)
-                                    .copied()
-                                    .unwrap_or(false);
+                                let changed = folders.get(key).copied().unwrap_or(false);
                                 let key = key.clone();
                                 item.pl(indent(*depth))
                                     .on_click(cx.listener(move |this, _, _, cx| {

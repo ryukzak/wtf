@@ -120,6 +120,8 @@ impl Workspace {
         cx.observe_window_activation(window, |this, window, cx| {
             if window.is_window_active() {
                 this.activate(this.active, window, cx);
+            } else if let Some(tab) = this.tabs.get(this.active) {
+                tab.update(cx, |tab, _| tab.set_window_inactive());
             }
         })
         .detach();
@@ -375,10 +377,64 @@ impl Workspace {
                         .flex()
                         .items_center()
                         .child(self.sync_button(false, theme, cx))
-                        .child(self.sync_button(true, theme, cx)),
+                        .child(self.sync_button(true, theme, cx))
+                        .child(self.fetch_button(theme, cx)),
                 )
             },
         )
+    }
+
+    /// Fetches every remote now, as the background fetches do; the graph
+    /// then marks branches whose remote is gone. It deletes nothing.
+    fn fetch_button(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = self.tabs[self.active].read(cx);
+        let running = view.fetching();
+        let last = view
+            .fetched_at()
+            .map(|at| crate::repo_view::short_age(at, crate::repo_view::now_seconds()));
+        div()
+            .id("fetch-run")
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .ml(px(6.))
+            .px(px(8.))
+            .h(px(TAB_BAR_HEIGHT - 12.))
+            .rounded(px(5.))
+            .border_1()
+            .border_color(theme.separator)
+            .bg(theme.background)
+            .cursor_pointer()
+            .hover(|button| button.bg(theme.selection))
+            .when(running, |button| button.text_color(theme.secondary))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, _| {
+                    this.tab_pressed = true;
+                    set_window_movable(window, false);
+                }),
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.sync_menu = None;
+                this.tabs[this.active].update(cx, |view, cx| view.fetch_now(cx));
+            }))
+            // ⟳ draws smaller than the arrows of Pull and Push: it is set
+            // larger to match them, without growing the button.
+            .child(
+                div()
+                    .text_size(px((crate::preferences::ui_size() * 1.25).round()))
+                    .line_height(px(TAB_BAR_HEIGHT - 14.))
+                    .child("⟳"),
+            )
+            .when(running, |button| button.child("…"))
+            .tooltip(move |_, cx| {
+                let text = match &last {
+                    Some(age) => format!("Fetch all remotes · last {age} ago"),
+                    None => "Fetch all remotes".to_string(),
+                };
+                cx.new(|_| TabPreview(text)).into()
+            })
     }
 
     /// The Pull or Push button: its main part runs the chosen option, its

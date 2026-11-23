@@ -1667,6 +1667,7 @@ mod tests {
             remotes: Vec::new(),
             main_worktree: None,
             on_main: Vec::new(),
+            channels: Vec::new(),
         };
         WorkflowGraph {
             on_main: graph.main_history(),

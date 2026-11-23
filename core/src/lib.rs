@@ -1,4 +1,5 @@
 mod attention;
+mod channels;
 mod console;
 mod difft;
 mod git;
@@ -14,6 +15,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use attention::{Attention, Scope};
+pub use channels::{add_channel, glob, is_channel, remove_channel};
 pub use console::{LogEntry, log_since};
 pub use git::{
     changed_files, commit, discard, discard_lines, head_message, push, range_commits, reword,

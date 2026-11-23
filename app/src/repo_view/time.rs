@@ -3,7 +3,7 @@
 use super::*;
 
 /// A compact age for lists: "5h", "3d", "2w", "4mo", "1y".
-pub(super) fn short_age(time: i64, now: i64) -> String {
+pub fn short_age(time: i64, now: i64) -> String {
     let seconds = (now - time).max(0);
     match seconds {
         0..3_600 => format!("{}m", seconds / 60),

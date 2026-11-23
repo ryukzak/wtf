@@ -71,6 +71,9 @@ pub struct WorkflowGraph {
     pub main_worktree: Option<String>,
     /// Which nodes the main branch's history holds, by node.
     pub on_main: Vec<bool>,
+    /// The repository's channel patterns, as its git config keeps them;
+    /// the main branch is a channel besides.
+    pub channels: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -92,6 +95,9 @@ pub struct Branch {
     pub stale: Vec<String>,
     /// Its worktree has uncommitted changes: work in progress.
     pub busy: bool,
+    /// A channel: the main branch, or one the channel patterns name. Work
+    /// merged into one is done; a channel itself is never left behind.
+    pub channel: bool,
     /// Shares no history with the main branch, as a `gh-pages` branch, so the
     /// graph cannot draw it.
     pub unrelated: bool,
@@ -174,7 +180,9 @@ pub fn build(
     now: i64,
 ) -> Result<WorkflowGraph, CoreError> {
     let remotes = remote_names(repo_path)?;
-    let (mut tips, mut branches, main_worktree) = tips(repo_path, attention, now, &remotes)?;
+    let channels = crate::channels::channel_patterns(repo_path);
+    let (mut tips, mut branches, main_worktree) =
+        tips(repo_path, attention, now, &remotes, &channels)?;
     let base = match octopus_base(repo_path, &tips) {
         Ok(base) => base,
         Err(_) => {
@@ -446,6 +454,7 @@ pub fn build(
         on_main: Vec::new(),
         tags,
         stashes,
+        channels,
     };
     graph.on_main = graph.main_history();
     Ok(graph)
@@ -577,6 +586,7 @@ fn tips(
     attention: &Attention,
     now: i64,
     remotes: &[String],
+    channels: &[String],
 ) -> Result<Tips, CoreError> {
     let main = main_branch(repo_path);
     let main_id = git::run(
@@ -680,16 +690,39 @@ fn tips(
     }
     // The main branch first, then the newest.
     branches.sort_by_key(|branch| (branch.name != main, std::cmp::Reverse(branch.time)));
-    mark_stale(repo_path, &main, &mut branches)?;
+    mark_stale(repo_path, &main, channels, &mut branches)?;
     Ok((tips, branches, main_worktree))
 }
 
-/// Notes why local branches look left behind: the main branch has merged
-/// them, or their remote branch is gone. How long one sat idle is up to the
-/// reader, from its time. Notes too how far each is from its upstream.
-fn mark_stale(repo_path: &str, main: &str, branches: &mut [Branch]) -> Result<(), CoreError> {
-    let format = "--format=%(refname:short)";
-    let merged = git::run(repo_path, &["branch", format, "--merged", main])?;
+/// Notes why local branches look left behind: a channel has merged them,
+/// or their remote branch is gone. How long one sat idle is up to the
+/// reader, from its time. Notes too how far each is from its upstream, and
+/// which branches are channels, which are never left behind.
+fn mark_stale(
+    repo_path: &str,
+    main: &str,
+    channels: &[String],
+    branches: &mut [Branch],
+) -> Result<(), CoreError> {
+    for branch in branches.iter_mut() {
+        branch.channel = crate::channels::is_channel(channels, main, &branch.name, branch.remote);
+    }
+    // Merged into any channel at all, in one go: git lists a branch once
+    // any of the `--merged` commits holds it.
+    let mut args = vec![
+        "for-each-ref".to_string(),
+        "--format=%(refname:short)".to_string(),
+        format!("--merged={main}"),
+    ];
+    args.extend(
+        branches
+            .iter()
+            .filter(|branch| branch.channel && branch.remote)
+            .map(|branch| format!("--merged=refs/remotes/{}", branch.name)),
+    );
+    args.push("refs/heads".to_string());
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let merged = git::run(repo_path, &args)?;
     let merged: HashSet<&str> = merged.lines().collect();
     let tracks = git::run(
         repo_path,
@@ -714,11 +747,11 @@ fn mark_stale(repo_path: &str, main: &str, branches: &mut [Branch]) -> Result<()
             let (ahead, behind) = parse_track(track);
             branch.upstream = (!upstream.is_empty()).then(|| upstream.to_string());
             (branch.ahead, branch.behind) = (ahead, behind);
-            if track == "gone" && branch.name != main {
+            if track == "gone" && !branch.channel {
                 branch.stale.push("remote gone".to_string());
             }
         }
-        if branch.name != main && merged.contains(branch.name.as_str()) {
+        if !branch.channel && merged.contains(branch.name.as_str()) {
             branch.stale.insert(0, "merged".to_string());
         }
     }
@@ -803,8 +836,14 @@ fn worktrees(repo_path: &str) -> Result<Worktrees, CoreError> {
 }
 
 /// Lines added and removed in the worktree, untracked files included.
+/// Work inside submodules is left out: git would look into each of them
+/// on every refresh, and their lines are not the worktree's. A submodule
+/// moved to another commit still counts.
 fn worktree_stats(path: &str) -> Result<(u32, u32), CoreError> {
-    let (mut added, removed) = numstat(&git::run(path, &["diff", "--numstat", "HEAD"])?);
+    let (mut added, removed) = numstat(&git::run(
+        path,
+        &["diff", "--numstat", "--ignore-submodules=dirty", "HEAD"],
+    )?);
     for file in git::untracked(path)? {
         let file = Path::new(path).join(file);
         if fs::metadata(&file).is_ok_and(|meta| meta.len() <= MAX_COUNTED_FILE)
@@ -1142,6 +1181,37 @@ mod tests {
         assert_eq!(stale("done"), ["merged"]);
         assert!(stale("feature").is_empty());
         assert!(stale("master").is_empty());
+    }
+
+    #[test]
+    fn branches_merged_into_a_channel_are_merged() {
+        // A release branch on the remote has the fix; master does not.
+        let fixture = forked();
+        let path = fixture.path();
+        fixture.git(".", &["branch", "v2410", "feature"]);
+        fixture.git(".", &["branch", "fix", "feature~1"]);
+        fixture.git(".", &["remote", "add", "origin", &path]);
+        fixture.git(".", &["fetch", "-q", "origin"]);
+        fixture.git(".", &["branch", "-q", "-D", "v2410"]);
+        let stale = |graph: &WorkflowGraph, name: &str| {
+            let branch = graph.branches.iter().find(|b| b.name == name).unwrap();
+            (branch.channel, branch.stale.clone())
+        };
+        let graph = fixture.graph();
+        assert_eq!(stale(&graph, "fix"), (false, vec![]));
+
+        crate::add_channel(&path, "v[0-9][0-9][0-9][0-9]").unwrap();
+        crate::add_channel(&path, "v[0-9][0-9][0-9][0-9]").unwrap();
+        let graph = fixture.graph();
+        assert_eq!(graph.channels, ["v[0-9][0-9][0-9][0-9]"], "added once");
+        assert_eq!(stale(&graph, "fix"), (false, vec!["merged".to_string()]));
+        assert_eq!(stale(&graph, "origin/v2410"), (true, vec![]));
+        assert_eq!(stale(&graph, "master"), (true, vec![]));
+
+        crate::remove_channel(&path, "v[0-9][0-9][0-9][0-9]").unwrap();
+        let graph = fixture.graph();
+        assert!(graph.channels.is_empty());
+        assert_eq!(stale(&graph, "fix"), (false, vec![]));
     }
 
     #[test]

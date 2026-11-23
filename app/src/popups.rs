@@ -79,6 +79,8 @@ pub enum Command {
     Pin,
     /// Drops a pin or hide, back to the filters.
     FollowFilters,
+    /// Adds the branch's name as a channel, or takes it away.
+    ToggleChannel,
 }
 
 /// The name attention knows a target by: its branch, or a detached
