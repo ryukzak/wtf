@@ -1,0 +1,2622 @@
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::rc::Rc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use gpui::{
+    Animation, AnimationExt, AnyElement, ClickEvent, ClipboardItem, Context, CursorStyle, Entity,
+    FocusHandle, HighlightStyle, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent,
+    MouseMoveEvent, PathPromptOptions, Pixels, Point, PromptLevel, ScrollHandle, ScrollStrategy,
+    SharedString, Stateful, StyledText, Task, UniformListScrollHandle, Window, actions, anchored,
+    canvas, deferred, div, point, prelude::*, pulsating_between, px, rems, uniform_list,
+};
+use wtf_core::{
+    Attention, ChangedFile, Commit, CoreError, DiffMode, FileDiff, LogEntry, Revision, Scope,
+    WorkflowGraph,
+};
+
+use crate::console_view;
+use crate::diff_view;
+use crate::goto;
+use crate::graph_view::{self, WorktreeNames, WorktreeOrder};
+use crate::menus::{
+    self, AllAuthors, MenuState, ResetBranches, SetScope, SetTimeWindow, SetWorktreeNames,
+    SetWorktreeOrder, ToggleAttentionPanel, ToggleAuthor, ToggleBranch, ToggleRemotes, ToggleTags,
+};
+use crate::palette;
+use crate::popups::{self, Command, Target};
+use crate::preferences;
+use crate::recent;
+use crate::syntax;
+use crate::terminal_view::TerminalView;
+use crate::theme::Theme;
+use crate::workspace::{self, OpenPath};
+
+mod attention_panel;
+mod commit_box;
+mod graph_band;
+mod header;
+mod lists;
+mod overlays;
+mod stack;
+mod staging;
+mod time;
+mod trees;
+mod widgets;
+
+use attention_panel::*;
+use commit_box::*;
+use header::*;
+use time::*;
+use trees::*;
+use widgets::*;
+
+pub use time::now_seconds;
+pub use widgets::chevron;
+
+const CONTEXT_ROWS: usize = 3;
+const REFRESH: Duration = Duration::from_secs(2);
+const MAX_GRAPH_HEIGHT: f32 = 300.;
+/// The graph's starting height when it has few lanes, such as one branch.
+const MIN_GRAPH_HEIGHT: f32 = 160.;
+const DOCK_HEIGHT: f32 = 260.;
+const STATUS_HEIGHT: f32 = 24.;
+const MIN_PANEL_HEIGHT: f32 = 60.;
+/// Room left for the commit, file and diff panes when panels grow.
+const MIN_MAIN_HEIGHT: f32 = 200.;
+const MIN_COLUMN_WIDTH: f32 = 120.;
+const MIN_DIFF_WIDTH: f32 = 300.;
+/// How many more commits each scroll to the graph's left edge brings in.
+const HISTORY_STEP: usize = 100;
+/// The commit message's line height, in rems.
+const MESSAGE_LINE: f32 = 1.25;
+/// How long staging stays put before the model writes a commit message.
+const SUGGEST_DELAY: Duration = Duration::from_millis(600);
+/// How far to scroll on past the graph's left edge to bring them.
+const PULL_DISTANCE: f32 = 160.;
+/// The Go To picker's width and how many results it lists.
+const GOTO_WIDTH: f32 = 600.;
+const GOTO_ROWS: usize = 14;
+/// How many nodes back the commit list offers under a node's commits.
+const EARLIER_NODES: usize = 3;
+const PROMPT_WIDTH: f32 = 420.;
+const ATTENTION_PANEL_WIDTH: f32 = 240.;
+const MIN_SIDEBAR_WIDTH: f32 = 180.;
+const MAX_SIDEBAR_WIDTH: f32 = 500.;
+/// The closed sidebar: a strip holding its toggle.
+/// Room for the strip's boxes and a margin on either side of them.
+const SIDEBAR_STRIP_WIDTH: f32 = 34.;
+/// The all-files view falls back to one file at a time above this; a
+/// worktree's staging view then shows its files one by one.
+const MAX_STACKED_FILES: usize = 100;
+/// The commit header's padding and line height, in rems; the summary bar
+/// repeats its first line just as it is drawn there.
+const HEADER_PADDING: f32 = 8.;
+const HEADER_LINE: f32 = 1.25;
+
+actions!(
+    wtf,
+    [
+        OpenRepository,
+        StructuralDiff,
+        TextDiff,
+        ToggleCombineCommits,
+        ToggleConsole,
+        ToggleRefreshCommands,
+        ToggleSidePanel,
+        GoTo,
+        CommandPalette,
+        Prune,
+        Fetch,
+        StashChanges,
+        OpenWorktreeWith,
+        ShowOneFile,
+        ShowAllFiles,
+        Minimize,
+        Zoom,
+    ]
+);
+
+/// How the diff pane shows the changed files.
+#[derive(Clone, Copy, PartialEq)]
+enum ChangesLayout {
+    OneFile,
+    /// All files in one scrollable list, like Sublime Merge.
+    AllFiles,
+}
+
+/// A row of the file list.
+#[derive(Debug, PartialEq)]
+enum TreeRow {
+    /// Unstaged or staged files, with how many.
+    Section(bool, usize),
+    /// A folder; chains of folders holding only one folder show as one.
+    Dir {
+        key: String,
+        label: String,
+        depth: usize,
+    },
+    File {
+        index: usize,
+        name: String,
+        depth: usize,
+    },
+}
+
+const FILE_ROW_HEIGHT: f32 = 22.;
+
+/// The commit box of a worktree: its message, and the model's part in it.
+#[derive(Default)]
+struct CommitDraft {
+    /// The worktree the draft belongs to.
+    worktree: Option<String>,
+    message: String,
+    /// Where the message's cursor is, as a byte offset; `None` at its end.
+    message_cursor: Option<usize>,
+    /// The message as last laid out, to place the cursor by a click and
+    /// move it between lines.
+    message_layout: RefCell<Option<gpui::TextLayout>>,
+    /// All of the message is selected, by ⌘A.
+    message_selected: bool,
+    /// Earlier and undone messages, for ⌘Z and ⇧⌘Z, and whether the last
+    /// change was a typed letter, which the next one joins.
+    message_undo: Vec<String>,
+    message_redo: Vec<String>,
+    typing_run: bool,
+    /// The commit rewrites the worktree's latest commit instead.
+    amend: bool,
+    /// The model is writing a message for an empty box, and whether a
+    /// commit waits for it.
+    writing_message: bool,
+    commit_when_written: bool,
+    /// The message the model last put in the box, which it may replace as
+    /// staging goes on until the user edits it; what was staged then; and
+    /// the wait before writing the next one.
+    suggested: Option<String>,
+    suggest_key: Option<String>,
+    suggest_task: Option<Task<()>>,
+}
+
+/// A row of the all-files view.
+enum StackItem {
+    /// Staged or unstaged files, with how many.
+    Section(bool, usize),
+    Header(usize),
+    Row(usize, usize),
+    /// A hunk of a worktree file: its first row and the row after its last.
+    Hunk(usize, usize, usize),
+    Gap,
+    Note(String),
+    /// The row a section's or file's header reaches up into: headers are
+    /// two rows tall.
+    HeaderPad,
+}
+
+/// A panel border being dragged.
+#[derive(Clone, Copy)]
+enum Border {
+    Graph,
+    Dock,
+    Sidebar,
+    Commits,
+}
+
+/// The panels the strip at the right edge opens, one at a time.
+#[derive(Clone, Copy, PartialEq)]
+enum SidePanel {
+    Attention,
+    /// The changed files as a tree: a table of contents for all files, or
+    /// the file to show one at a time.
+    Files,
+}
+
+/// A row of a branch tree: a folder of branch names, or a branch.
+#[derive(Debug, PartialEq)]
+enum NameRow {
+    /// `path` ends with `/`; chains of folders holding only one folder show
+    /// as one row.
+    Folder {
+        path: String,
+        label: String,
+        depth: usize,
+    },
+    Leaf {
+        index: usize,
+        name: String,
+        depth: usize,
+    },
+}
+
+/// A group of branches in the attention sidebar.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Section {
+    Worktrees,
+    Local,
+    Remote,
+    Tags,
+    Stashes,
+}
+
+/// A dropdown of the attention sidebar.
+#[derive(Clone, Copy)]
+enum Dropdown {
+    Window,
+    Authors,
+}
+
+/// A small panel asking for one line of text.
+struct Prompt {
+    kind: PromptKind,
+    input: String,
+}
+
+enum PromptKind {
+    /// The new name of a branch.
+    Rename(String),
+    /// A command to open a worktree's path with.
+    OpenWith(String),
+    /// Where to put a worktree for an existing branch.
+    WorktreeFor(String),
+    /// The name of a new branch at a commit, with a worktree when asked.
+    NewBranch { commit: String, worktree: bool },
+    /// The branch of a new worktree for a stash, at the commit it was made on.
+    StashWorktree { stash: String, base: String },
+}
+
+/// Code colors are cached by path, appearance and all-files entry.
+type ColorKey = (String, bool, Option<usize>);
+
+/// What a graph's layout depends on besides the graph: the worktree order,
+/// the graph's look, the settings that change label widths, and the hour,
+/// as branches' idle days grow.
+type LayoutKey = (WorktreeOrder, preferences::GraphStyle, u32, bool, i64);
+
+pub struct RepoView {
+    /// Keeps menu actions reaching the view when nothing else has focus.
+    focus: FocusHandle,
+    /// The tab shown in its window.
+    active: bool,
+    repo_path: Option<String>,
+    graph: WorkflowGraph,
+    graph_error: Option<String>,
+    /// Linear runs of commits share a node.
+    combine_commits: bool,
+    attention: Attention,
+    graph_scroll: ScrollHandle,
+    /// What the menu bar was last built from.
+    menus_for: Option<MenuState>,
+    worktree_names: WorktreeNames,
+    worktree_order: WorktreeOrder,
+    context_menu: Option<(Target, Point<Pixels>)>,
+    prompt: Option<Prompt>,
+    prompt_focus: FocusHandle,
+    /// The prune list, when open: stale branches by name, and whether each is
+    /// ticked to go.
+    prune: Option<Vec<(String, bool)>>,
+    prune_focus: FocusHandle,
+    /// The Go To picker or the command palette, when open: the query, the
+    /// highlighted result, and whether it lists commands.
+    goto: Option<(String, usize, bool)>,
+    /// The Stash picker, open on a worktree: its path and the highlighted
+    /// row, the first one running the stash.
+    stash_picker: Option<(String, usize)>,
+    /// The flags the Stash picker has on, by their place in its list.
+    stash_flags: [bool; popups::STASH_FLAGS.len()],
+    stash_focus: FocusHandle,
+    goto_focus: FocusHandle,
+    /// The last commands used to open a worktree, newest first.
+    open_with: Vec<String>,
+    /// Shell commands run from the palette, newest first.
+    shell_commands: Vec<String>,
+    /// File names a Tab in the palette left to choose from.
+    completions: Vec<String>,
+    /// The open side panel, and the one ⌘R opens.
+    side_panel: Option<SidePanel>,
+    last_panel: SidePanel,
+    sidebar_width: f32,
+    attention_search: String,
+    attention_search_focus: FocusHandle,
+    collapsed_sections: HashSet<Section>,
+    dropdown: Option<(Dropdown, Point<Pixels>)>,
+    /// The graph's width when last drawn, to keep the view still as it changes.
+    graph_width: Cell<f32>,
+    /// The graph's layout as last made, and what it was made from besides
+    /// the graph, which drops it when it changes.
+    graph_layout: RefCell<Option<(LayoutKey, Rc<graph_view::Layout>)>>,
+    /// What shows is a branch the graph cannot draw, so a new graph keeps it.
+    outside_graph: bool,
+    /// The stash shown, read-only, in the staging view's sections.
+    stash_view: Option<wtf_core::Stash>,
+    /// A stash to scroll the graph to once a rebuild shows its marker.
+    reveal_stash: bool,
+    /// The staging view's line under the mouse, which shows its buttons.
+    hovered_line: Cell<Option<(usize, usize)>>,
+    /// Code colors of the diffs shown, by file, appearance and view.
+    syntax: RefCell<HashMap<ColorKey, Rc<syntax::Colors>>>,
+    /// A drag of the graph: where the mouse went down and the scroll then.
+    graph_drag: Option<(Point<Pixels>, Point<Pixels>)>,
+    /// Set when a repository opens, until the graph is first laid out.
+    scroll_to_end: Cell<bool>,
+    /// The graph is scrolled away from its oldest and newest work, or has
+    /// older commits to load, as last drawn.
+    graph_away: Cell<(bool, bool)>,
+    /// Once the whole history is in, the graph scrolls to its first commit.
+    scroll_to_start: Cell<bool>,
+    /// How many commits before the graph's oldest node to bring in, grown
+    /// by scrolling to its left edge; and whether more are on the way.
+    history: usize,
+    loading_older: bool,
+    /// How far the graph has been pulled past its left edge, while a pull
+    /// is on, and whether the last scroll left it at that edge.
+    pull: Cell<Option<f32>>,
+    at_left_edge: bool,
+    /// A node selected from outside the graph, to scroll into view.
+    reveal: Cell<Option<usize>>,
+
+    selected_nodes: Vec<usize>,
+    hovered_node: Option<usize>,
+    /// The diff of the selected nodes, `None` when they are not on one line.
+    range: Option<(Option<String>, Revision)>,
+    commits: Vec<Commit>,
+    /// Commits the diff is narrowed to; empty for the whole selection.
+    narrowed: Vec<usize>,
+    /// Where Shift-click ranges in the commit list start.
+    commit_anchor: Option<usize>,
+    files: Vec<ChangedFile>,
+    diff: Option<FileDiff>,
+    selected_file: Option<usize>,
+    diff_mode: DiffMode,
+    changes_layout: ChangesLayout,
+    stacked: Vec<StackItem>,
+    stacked_diffs: Vec<Result<FileDiff, String>>,
+    /// The files `stacked_diffs` were made from: until a refresh brings
+    /// new diffs, `files` may hold others at the same places.
+    stacked_files: Vec<ChangedFile>,
+    /// For a selected worktree, where staged files start in `files`.
+    worktree_split: Option<usize>,
+    /// Diff rows picked for staging, all in one file.
+    line_selection: Option<(usize, Vec<usize>)>,
+    line_anchor: Option<usize>,
+    /// The commit box: what is typed in it and the model's part in it.
+    draft: CommitDraft,
+    /// The drafts of worktrees not selected, kept for their return.
+    drafts: HashMap<String, CommitDraft>,
+    commit_focus: FocusHandle,
+    /// A commit picked in the graph, to select once its node's commits load.
+    pending_commit: Option<String>,
+    commit_scroll: UniformListScrollHandle,
+    message_scroll: ScrollHandle,
+    /// A commit message being edited: the commit, the worktree whose latest
+    /// commit it is, and the text so far.
+    rewording: Option<(String, String, String)>,
+    /// Text picked in a commit's message: the commit, where the pick started
+    /// and where it ends, and whether a drag is extending it.
+    message_selection: Option<(String, usize, usize)>,
+    /// Summaries of selections of several commits, by their commits: `None`
+    /// while the model writes one.
+    summaries: HashMap<String, Option<Result<wtf_core::Summary, String>>>,
+    /// The commits' own subjects show under a summary.
+    show_subjects: bool,
+    selecting_message: bool,
+    message_focus: FocusHandle,
+    /// The commit whose hash was just copied, shown so for a moment.
+    copied: Option<String>,
+    reword_focus: FocusHandle,
+    /// Paths of files folded to their headers in the all-files view.
+    folded: HashSet<String>,
+    /// The unstaged and staged sections, folded to their titles.
+    folded_sections: [bool; 2],
+    /// Folders folded in the file list, by section and path.
+    collapsed_dirs: HashSet<String>,
+    /// Folders folded in the sidebar's branch tree, by `local:` or `remote:`
+    /// and path.
+    collapsed_branch_dirs: HashSet<String>,
+    is_loading_stacked: bool,
+    stacked_scroll: UniformListScrollHandle,
+    /// The commit header's height, as last laid out; the diff starts below it.
+    header_height: f32,
+    is_loading_diff: bool,
+    error_message: Option<String>,
+
+    console_open: bool,
+    hide_refresh: bool,
+    /// The last command logged here, and the last not run by a refresh,
+    /// for the status bar.
+    last_entry: Option<LogEntry>,
+    last_own_entry: Option<LogEntry>,
+    log_seq: u64,
+    /// The directory of the last command printed in the terminal.
+    announced_dir: Option<String>,
+    dock_height: f32,
+    terminal: Option<Entity<TerminalView>>,
+    /// Set by dragging the graph's border; otherwise the graph fits its rows.
+    graph_height: Option<f32>,
+    dragging: Option<Border>,
+    commits_width: f32,
+
+    // Replacing a task drops, and so cancels, the previous one.
+    refresh_task: Option<Task<()>>,
+    /// A fetch of the remotes under way.
+    fetch_task: Option<Task<()>>,
+    /// A pull or push under way: whether it is a push, and its task.
+    sync_task: Option<(bool, Task<()>)>,
+    /// The remote picked in the Push menu; `None` for where the branch
+    /// tracks.
+    push_remote: Option<String>,
+    /// When the remotes were last fetched, and why the last fetch failed.
+    fetched_at: Option<i64>,
+    fetch_error: Option<String>,
+    commits_task: Option<Task<()>>,
+    files_task: Option<Task<()>>,
+    diff_task: Option<Task<()>>,
+    stacked_task: Option<Task<()>>,
+    diff_scroll: UniformListScrollHandle,
+}
+
+fn message(error: CoreError) -> String {
+    let CoreError::Failed { message } = error;
+    message
+}
+
+impl RepoView {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        cx.observe_window_appearance(window, |_, _, cx| cx.notify())
+            .detach();
+        let focus = cx.focus_handle();
+        focus.focus(window);
+        Self {
+            focus,
+            active: false,
+            repo_path: None,
+            graph: WorkflowGraph::default(),
+            graph_error: None,
+            combine_commits: true,
+            attention: Attention::default(),
+            graph_scroll: ScrollHandle::new(),
+            menus_for: None,
+            worktree_names: WorktreeNames::FolderAndBranch,
+            worktree_order: WorktreeOrder::LastCommit,
+            context_menu: None,
+            prompt: None,
+            prompt_focus: cx.focus_handle(),
+            goto: None,
+            stash_picker: None,
+            stash_flags: [true, false, false],
+            stash_focus: cx.focus_handle(),
+            goto_focus: cx.focus_handle(),
+            prune: None,
+            prune_focus: cx.focus_handle(),
+            open_with: popups::load_recent("open-with"),
+            shell_commands: popups::load_recent("commands"),
+            completions: Vec::new(),
+            side_panel: None,
+            last_panel: SidePanel::Attention,
+            sidebar_width: ATTENTION_PANEL_WIDTH,
+            attention_search: String::new(),
+            attention_search_focus: cx.focus_handle(),
+            collapsed_sections: HashSet::new(),
+            dropdown: None,
+            graph_width: Cell::new(0.),
+            graph_layout: RefCell::new(None),
+            outside_graph: false,
+            stash_view: None,
+            reveal_stash: false,
+            hovered_line: Cell::new(None),
+            syntax: RefCell::new(HashMap::new()),
+            graph_drag: None,
+            scroll_to_end: Cell::new(true),
+            graph_away: Cell::new((false, false)),
+            scroll_to_start: Cell::new(false),
+            history: 0,
+            loading_older: false,
+            pull: Cell::new(None),
+            at_left_edge: false,
+            reveal: Cell::new(None),
+            selected_nodes: Vec::new(),
+            hovered_node: None,
+            range: None,
+            commits: Vec::new(),
+            narrowed: Vec::new(),
+            commit_anchor: None,
+            files: Vec::new(),
+            diff: None,
+            selected_file: None,
+            diff_mode: DiffMode::Text,
+            changes_layout: ChangesLayout::AllFiles,
+            stacked: Vec::new(),
+            stacked_diffs: Vec::new(),
+            stacked_files: Vec::new(),
+            worktree_split: None,
+            line_selection: None,
+            line_anchor: None,
+            draft: CommitDraft::default(),
+            drafts: HashMap::new(),
+            commit_focus: cx.focus_handle(),
+            pending_commit: None,
+            commit_scroll: UniformListScrollHandle::new(),
+            message_scroll: ScrollHandle::new(),
+            rewording: None,
+            message_selection: None,
+            summaries: HashMap::new(),
+            show_subjects: false,
+            selecting_message: false,
+            message_focus: cx.focus_handle(),
+            copied: None,
+            reword_focus: cx.focus_handle(),
+            folded: HashSet::new(),
+            folded_sections: [false; 2],
+            collapsed_dirs: HashSet::new(),
+            collapsed_branch_dirs: HashSet::new(),
+            is_loading_stacked: false,
+            stacked_scroll: UniformListScrollHandle::new(),
+            header_height: 0.,
+            is_loading_diff: false,
+            error_message: None,
+            console_open: false,
+            hide_refresh: true,
+            last_entry: None,
+            last_own_entry: None,
+            log_seq: 0,
+            announced_dir: None,
+            dock_height: DOCK_HEIGHT,
+            terminal: None,
+            graph_height: None,
+            dragging: None,
+            commits_width: 300.,
+            refresh_task: None,
+            fetch_task: None,
+            sync_task: None,
+            push_remote: None,
+            fetched_at: None,
+            fetch_error: None,
+            commits_task: None,
+            files_task: None,
+            diff_task: None,
+            stacked_task: None,
+            diff_scroll: UniformListScrollHandle::new(),
+        }
+    }
+
+    pub fn repo_path(&self) -> Option<&str> {
+        self.repo_path.as_deref()
+    }
+
+    pub fn repo_name(&self) -> Option<String> {
+        self.repo_path.as_deref().map(workspace::folder_name)
+    }
+
+    /// The workspace shows one tab at a time; the active one takes focus and
+    /// the menu bar.
+    pub fn set_active(&mut self, active: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.active = active;
+        if active {
+            self.focus.focus(window);
+            self.menus_for = None;
+            self.update_menus(cx);
+        }
+    }
+
+    pub fn open(&mut self, path: String, cx: &mut Context<Self>) {
+        self.repo_path = Some(path.clone());
+        self.graph = WorkflowGraph::default();
+        self.graph_layout.take();
+        self.scroll_to_end.set(true);
+        self.history = 0;
+        self.graph_error = None;
+        // A shell for this repository from the start, so the terminal shows
+        // every command the window runs; older commands are skipped.
+        self.log_seq = wtf_core::log_since(self.log_seq)
+            .last()
+            .map_or(self.log_seq, |entry| entry.seq);
+        self.announced_dir = None;
+        let dir = path.clone();
+        self.terminal = Some(cx.new(|cx| TerminalView::new(dir, cx)));
+        self.selected_nodes.clear();
+        self.range = None;
+        self.narrowed.clear();
+        self.commit_anchor = None;
+        self.commits.clear();
+        self.files.clear();
+        self.select_file(None, cx);
+        self.attention = Attention::load(&path);
+        recent::remember(&path);
+        self.update_menus(cx);
+        self.start_refresh(cx);
+        cx.notify();
+    }
+
+    /// Rebuilds the graph now and then every few seconds; unchanged graphs are ignored.
+    fn start_refresh(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.repo_path.clone() else {
+            return;
+        };
+        self.refresh_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                let settings = this.update(cx, |this, _| {
+                    (this.attention.clone(), this.combine_commits, this.history)
+                });
+                let Ok((attention, combine, history)) = settings else {
+                    break;
+                };
+                let path = path.clone();
+                let result =
+                    cx.background_executor()
+                        .spawn(async move {
+                            wtf_core::workflow_graph(&path, &attention, combine, history)
+                        })
+                        .await;
+                let applied = this.update(cx, |this, cx| {
+                    this.apply_graph(result, cx);
+                    this.fetch_when_due(cx);
+                    // Shows the refresh commands in an open console.
+                    if this.console_open {
+                        cx.notify();
+                    }
+                });
+                if applied.is_err() {
+                    break;
+                }
+                cx.background_executor().timer(REFRESH).await;
+            }
+        }));
+    }
+
+    /// Fetches in the background as often as Settings ask, first when the
+    /// repository opens.
+    fn fetch_when_due(&mut self, cx: &mut Context<Self>) {
+        let minutes = preferences::fetch_minutes();
+        if minutes == 0 || self.fetch_task.is_some() {
+            return;
+        }
+        let due = self
+            .fetched_at
+            .is_none_or(|at| now_seconds() - at >= i64::from(minutes) * 60);
+        if due {
+            self.fetch(true, cx);
+        }
+    }
+
+    /// Fetches every remote, then rebuilds the graph to show what came.
+    fn fetch(&mut self, background: bool, cx: &mut Context<Self>) {
+        // A fetch under way already brings what another would.
+        let Some(path) = self.repo_path.clone().filter(|_| self.fetch_task.is_none()) else {
+            return;
+        };
+        let prune = preferences::fetch_prune();
+        let load = cx
+            .background_executor()
+            .spawn(async move { wtf_core::fetch(&path, prune, background) });
+        self.fetch_task = Some(cx.spawn(async move |this, cx| {
+            let result = load.await;
+            this.update(cx, |this, cx| {
+                this.fetch_task = None;
+                this.fetched_at = Some(now_seconds());
+                this.fetch_error = result.err().map(message);
+                this.start_refresh(cx);
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// Runs a Pull or Push option in the worktree commands run in, then
+    /// rebuilds the graph to show what moved.
+    pub fn sync(&mut self, push: bool, option: usize, cx: &mut Context<Self>) {
+        let options = crate::sync::options(push);
+        let (Some(path), Some(option)) = (self.command_path(), options.get(option)) else {
+            return;
+        };
+        if self.sync_task.is_some() {
+            return;
+        }
+        let args = option.args;
+        let fetch = args.first() == Some(&"fetch");
+        let to = self.push_remote.clone();
+        let run = cx.background_executor().spawn(async move {
+            match push {
+                true => wtf_core::push(&path, to.as_deref(), args),
+                false => wtf_core::pull(&path, args),
+            }
+        });
+        let task = cx.spawn(async move |this, cx| {
+            let result = run.await;
+            this.update(cx, |this, cx| {
+                this.sync_task = None;
+                if fetch {
+                    this.fetched_at = Some(now_seconds());
+                    this.fetch_error = result.err().map(message);
+                }
+                // A failure shows in red in the status bar, as Git said it.
+                this.start_refresh(cx);
+                cx.notify();
+            })
+            .ok();
+        });
+        self.sync_task = Some((push, task));
+        cx.notify();
+    }
+
+    /// The repository's remotes, to push to.
+    pub fn remotes(&self) -> &[String] {
+        &self.graph.remotes
+    }
+
+    /// Where a push goes: the remote picked in the menu, else the one the
+    /// branch tracks, else `origin`.
+    pub fn push_remote(&self) -> String {
+        if let Some(remote) = &self.push_remote {
+            return remote.clone();
+        }
+        self.sync_branch()
+            .and_then(|branch| branch.upstream.as_deref())
+            .and_then(|upstream| upstream.split_once('/'))
+            .map(|(remote, _)| remote.to_string())
+            .unwrap_or_else(|| "origin".to_string())
+    }
+
+    pub fn set_push_remote(&mut self, remote: String, cx: &mut Context<Self>) {
+        self.push_remote = Some(remote);
+        cx.notify();
+    }
+
+    /// A pull (`false`) or push (`true`) under way.
+    pub fn syncing(&self) -> Option<bool> {
+        self.sync_task.as_ref().map(|(push, _)| *push)
+    }
+
+    /// The branch checked out where commands run.
+    fn sync_branch(&self) -> Option<&wtf_core::Branch> {
+        let path = self.command_path();
+        self.graph
+            .nodes
+            .iter()
+            .find(|node| matches!(&node.tip, Revision::Worktree(p) if Some(p) == path.as_ref()))
+            .and_then(|node| node.branch.as_ref())
+            .and_then(|name| {
+                self.graph
+                    .branches
+                    .iter()
+                    .find(|b| &b.name == name && !b.remote)
+            })
+    }
+
+    /// How far the branch commands run on is ahead of and behind its upstream.
+    pub fn sync_counts(&self) -> (u32, u32) {
+        self.sync_branch()
+            .map_or((0, 0), |branch| (branch.ahead, branch.behind))
+    }
+
+    /// Rebuilds the menu bar when the attention or the branches change.
+    /// The menu bar is shared by all tabs and windows, so only the active tab
+    /// builds it.
+    fn update_menus(&mut self, cx: &mut Context<Self>) {
+        if !self.active {
+            return;
+        }
+        let state = MenuState {
+            recent: recent::load(),
+            attention: self.attention.clone(),
+            branches: self.graph.branches.clone(),
+            combine: self.combine_commits,
+            names: self.worktree_names,
+            order: self.worktree_order,
+            panel: self.side_panel == Some(SidePanel::Attention),
+        };
+        if self.menus_for.as_ref() != Some(&state) {
+            cx.set_menus(menus::menus(&state));
+            self.menus_for = Some(state);
+        }
+    }
+
+    fn change_attention(&mut self, change: impl FnOnce(&mut Attention), cx: &mut Context<Self>) {
+        change(&mut self.attention);
+        // The sidebar's checkmarks follow at once; the graph catches up when the
+        // rebuild finishes.
+        let now = now_seconds();
+        let main = self.graph.main.clone();
+        for branch in &mut self.graph.branches {
+            branch.shown = branch.name == main || self.attention.shows_branch(branch, now);
+        }
+        if let Some(path) = &self.repo_path
+            && let Err(error) = self.attention.save(path)
+        {
+            self.error_message = Some(message(error));
+        }
+        self.update_menus(cx);
+        self.start_refresh(cx);
+        cx.notify();
+    }
+
+    pub fn hide_branch(&mut self, name: &str, cx: &mut Context<Self>) {
+        self.change_attention(
+            |attention| {
+                attention.pinned.retain(|pinned| pinned != name);
+                if !attention.hidden.iter().any(|hidden| hidden == name) {
+                    attention.hidden.push(name.to_string());
+                }
+            },
+            cx,
+        );
+    }
+
+    fn toggle_branch(&mut self, name: &str, cx: &mut Context<Self>) {
+        // The main branch is always shown; one with no history in common with
+        // it cannot be.
+        let unrelated = self
+            .graph
+            .branches
+            .iter()
+            .any(|branch| branch.name == name && branch.unrelated);
+        if name == self.graph.main {
+            return;
+        }
+        if unrelated {
+            return;
+        }
+        let shown = self
+            .graph
+            .branches
+            .iter()
+            .any(|branch| branch.name == name && branch.shown);
+        self.change_attention(
+            |attention| {
+                attention.pinned.retain(|pinned| pinned != name);
+                attention.hidden.retain(|hidden| hidden != name);
+                if shown {
+                    attention.hidden.push(name.to_string());
+                } else {
+                    attention.pinned.push(name.to_string());
+                }
+            },
+            cx,
+        );
+    }
+
+    fn attention_summary(&self) -> String {
+        let attention = &self.attention;
+        let mut parts = vec![match (attention.scope, attention.window_days) {
+            (Scope::Worktrees, _) => "worktrees only".to_string(),
+            (Scope::Branches, Some(1)) => "last day".to_string(),
+            (Scope::Branches, Some(days)) => format!("last {days} days"),
+            (Scope::Branches, None) => "all time".to_string(),
+        }];
+        if !attention.authors.is_empty() {
+            parts.push(attention.authors.join(", "));
+        }
+        if !attention.pinned.is_empty() {
+            parts.push(format!("{} pinned", attention.pinned.len()));
+        }
+        if !attention.hidden.is_empty() {
+            parts.push(format!("{} hidden", attention.hidden.len()));
+        }
+        let branches = &self.graph.branches;
+        let shown = branches.iter().filter(|branch| branch.shown).count();
+        format!(
+            "Attention: {shown} of {} branches · {}",
+            branches.len(),
+            parts.join(" · ")
+        )
+    }
+
+    /// Like pulling a list down to refresh: scrolling stops at the graph's
+    /// left edge, and only scrolling on past it, in a new swipe or with more
+    /// wheel clicks, brings older commits in. A swipe's momentum that carries
+    /// it to the edge does not.
+    fn pull_older(
+        &mut self,
+        event: &gpui::ScrollWheelEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // The First and Latest buttons come and go as the view leaves either end.
+        if self.graph_away_now() != self.graph_away.get() {
+            cx.notify();
+        }
+        let was_at_edge = self.at_left_edge;
+        self.at_left_edge = self.graph_scroll.offset().x >= px(-2.);
+        let dx = f32::from(event.delta.pixel_delta(px(20.)).x);
+        let pull = self.pull.get();
+        let next = match (&event.delta, event.touch_phase) {
+            _ if !self.at_left_edge || self.graph.older == 0 => None,
+            // A trackpad: a swipe that starts at the edge may pull; it ends
+            // with the fingers lifting.
+            (gpui::ScrollDelta::Pixels(_), gpui::TouchPhase::Started) => Some(0.),
+            (gpui::ScrollDelta::Pixels(_), gpui::TouchPhase::Ended) => None,
+            (gpui::ScrollDelta::Pixels(_), _) => pull.map(|pull| pull + dx),
+            // A wheel: clicks once at the edge pull.
+            (gpui::ScrollDelta::Lines(_), _) if was_at_edge && dx > 0. => {
+                Some(pull.unwrap_or(0.) + dx)
+            }
+            (gpui::ScrollDelta::Lines(_), _) => pull.filter(|_| dx >= 0.),
+        };
+        let next = next.map(|pull| pull.max(0.));
+        if next.is_some_and(|pull| pull >= PULL_DISTANCE) {
+            self.pull.set(None);
+            self.load_older(cx);
+        } else if next != pull {
+            self.pull.set(next);
+            cx.notify();
+        }
+    }
+
+    fn apply_graph(&mut self, result: Result<WorkflowGraph, CoreError>, cx: &mut Context<Self>) {
+        self.loading_older = false;
+        let graph = match result {
+            Ok(graph) => graph,
+            // A failed refresh keeps the last graph; the terminal shows why.
+            Err(_) if !self.graph.nodes.is_empty() => return,
+            Err(error) => {
+                self.graph_error = Some(message(error));
+                cx.notify();
+                return;
+            }
+        };
+        self.graph_error = None;
+        if graph == self.graph {
+            return;
+        }
+
+        // Keeps the selection by node identity, falling back to the opened
+        // worktree's current state, or else the main branch.
+        let keys: Vec<String> = self
+            .selected_nodes
+            .iter()
+            .map(|&i| self.graph.nodes[i].key.clone())
+            .collect();
+        self.graph = graph;
+        self.graph_layout.take();
+        // Drafts of worktrees the graph no longer has go, so a new one at
+        // the same path starts empty.
+        let worktrees: HashSet<&str> = self
+            .graph
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.tip {
+                Revision::Worktree(path) => Some(path.as_str()),
+                Revision::Commit(_) => None,
+            })
+            .collect();
+        self.drafts
+            .retain(|path, _| worktrees.contains(path.as_str()));
+        self.hovered_node = None;
+        self.update_menus(cx);
+        let mut selected: Vec<usize> = keys
+            .iter()
+            .filter_map(|key| self.graph.nodes.iter().position(|node| &node.key == key))
+            .collect();
+        if selected.is_empty() {
+            let root = self
+                .repo_path
+                .as_deref()
+                .map(|path| path.trim_end_matches('/'));
+            let current = self.graph.nodes.iter().position(|node| {
+                matches!(&node.tip, Revision::Worktree(path)
+                    if Some(path.trim_end_matches('/')) == root)
+            });
+            selected.extend(current.or(self.graph.main_node));
+        }
+
+        // A branch shown from outside the graph stays shown.
+        if self.outside_graph {
+            if std::mem::take(&mut self.reveal_stash)
+                && let Some(stash) = &self.stash_view
+            {
+                self.reveal.set(self.stash_node(&stash.name));
+            }
+            cx.notify();
+            return;
+        }
+        let range = self.graph.range(&selected);
+        if range != self.range {
+            self.set_selection(selected, cx);
+        } else {
+            self.selected_nodes = selected;
+            // Uncommitted changes may have changed under the same range.
+            let live = matches!(range, Some((_, Revision::Worktree(_))));
+            if live && self.narrowed.is_empty() {
+                let keep = self.selected_file.map(|i| self.files[i].path().to_string());
+                self.load_files(keep, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    fn choose_repository(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: None,
+        });
+        // The workspace decides the tab: this one when empty, otherwise a new one.
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = paths.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let path = path.to_string_lossy().into_owned();
+            this.update_in(cx, |_, window, cx| {
+                window.dispatch_action(Box::new(OpenPath { path }), cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub fn hover_node(&mut self, index: usize, hovered: bool, cx: &mut Context<Self>) {
+        let next = match hovered {
+            true => Some(index),
+            false if self.hovered_node == Some(index) => None,
+            false => self.hovered_node,
+        };
+        if next != self.hovered_node {
+            self.hovered_node = next;
+            cx.notify();
+        }
+    }
+
+    /// A plain click selects one node; Cmd-click toggles it in the selection.
+    pub fn click_node(&mut self, index: usize, toggle: bool, cx: &mut Context<Self>) {
+        let mut selected = self.selected_nodes.clone();
+        if !toggle {
+            selected = vec![index];
+        } else if let Some(at) = selected.iter().position(|&i| i == index) {
+            selected.remove(at);
+        } else {
+            selected.push(index);
+        }
+        if selected == self.selected_nodes && self.narrowed.is_empty() {
+            return;
+        }
+        self.set_selection(selected, cx);
+    }
+
+    /// Shows a branch with no history in common with the main branch, which
+    /// the graph cannot draw: all its commits, from nothing to its tip.
+    fn show_unrelated(&mut self, name: &str, cx: &mut Context<Self>) {
+        let Some(tip) = self
+            .graph
+            .branches
+            .iter()
+            .find(|branch| branch.name == name)
+            .map(|branch| branch.commit.clone())
+        else {
+            return;
+        };
+        self.set_selection(Vec::new(), cx);
+        self.range = Some((None, Revision::Commit(tip)));
+        self.outside_graph = true;
+        self.load_commits(cx);
+        self.load_files(None, cx);
+        cx.notify();
+    }
+
+    /// Shows a stash: what it held staged and unstaged, untracked files
+    /// with the unstaged, as the staging view would, but read-only.
+    pub fn show_stash(&mut self, name: &str, cx: &mut Context<Self>) {
+        let Some(stash) = self.graph.stashes.iter().find(|s| s.name == name).cloned() else {
+            return;
+        };
+        self.set_selection(Vec::new(), cx);
+        self.range = Some((Some(stash.base.clone()), Revision::Commit(stash.id.clone())));
+        self.outside_graph = true;
+        self.commits = vec![Commit {
+            id: stash.id.clone(),
+            short_id: popups::short_hash(&stash.id),
+            summary: format!("{} — {}", stash.name, stash.message),
+            body: match &stash.branch {
+                Some(branch) => format!("Stashed on {branch}."),
+                None => "Stashed on a detached HEAD.".to_string(),
+            },
+            author: String::new(),
+            time: stash.time,
+            parent: Some(stash.base.clone()),
+        }];
+        self.stash_view = Some(stash);
+        self.load_files(None, cx);
+        // The graph scrolls to its marker, turning stashes on to draw it.
+        if self.attention.stashes {
+            self.reveal.set(self.stash_node(name));
+        } else {
+            self.reveal_stash = true;
+            self.change_attention(|attention| attention.stashes = true, cx);
+        }
+        cx.notify();
+    }
+
+    /// The node a stash was made on, when the graph reaches back to it.
+    fn stash_node(&self, name: &str) -> Option<usize> {
+        self.graph
+            .nodes
+            .iter()
+            .position(|node| node.stashes.iter().any(|stash| stash == name))
+    }
+
+    fn set_selection(&mut self, selected: Vec<usize>, cx: &mut Context<Self>) {
+        self.worktree_split = None;
+        self.line_selection = None;
+        self.outside_graph = false;
+        self.stash_view = None;
+        self.range = self.graph.range(&selected);
+        self.reveal.set(selected.last().copied());
+        self.selected_nodes = selected;
+        self.narrowed.clear();
+        self.commit_anchor = None;
+        self.commits.clear();
+        self.commits_task = None;
+        self.pending_commit = None;
+        // A commit waiting for the model's message goes only where it was
+        // asked for.
+        self.draft.commit_when_written = false;
+        // Each worktree has a commit box of its own.
+        let worktree = self.staging_worktree();
+        if let Some(path) = worktree.filter(|path| self.draft.worktree.as_ref() != Some(path)) {
+            let next = self.drafts.remove(&path).unwrap_or_else(|| CommitDraft {
+                worktree: Some(path),
+                ..CommitDraft::default()
+            });
+            let mut previous = std::mem::replace(&mut self.draft, next);
+            // What was typed waits for the worktree's return; a message the
+            // model is still writing stops, as it would land in this one,
+            // and is asked for again on the return.
+            if std::mem::take(&mut previous.writing_message) {
+                (previous.suggest_task, previous.suggest_key) = (None, None);
+            }
+            self.message_scroll.set_offset(point(px(0.), px(0.)));
+            if let Some(path) = previous.worktree.clone() {
+                self.drafts.insert(path, previous);
+            }
+        }
+        self.files.clear();
+        self.select_file(None, cx);
+        if self.range.is_none() && !self.selected_nodes.is_empty() {
+            self.error_message = Some("Select nodes on one line of history.".to_string());
+        } else {
+            self.error_message = None;
+            self.load_commits(cx);
+            self.load_files(None, cx);
+        }
+        cx.notify();
+    }
+
+    fn load_commits(&mut self, cx: &mut Context<Self>) {
+        let (Some(repo_path), Some((base, tip))) = (self.repo_path.clone(), self.range.clone())
+        else {
+            return;
+        };
+        let load = cx
+            .background_executor()
+            .spawn(async move { wtf_core::range_commits(&repo_path, base.as_deref(), &tip) });
+        self.commits_task = Some(cx.spawn(async move |this, cx| {
+            let result = load.await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(commits) => this.commits = commits,
+                    Err(error) => this.error_message = Some(message(error)),
+                }
+                if let Some(id) = this.pending_commit.take() {
+                    this.narrow_to(&id, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// A click narrows the diff to one commit, or widens it back when that was
+    /// the only one; Cmd-click toggles a commit and Shift-click selects a range.
+    fn click_commit(&mut self, index: usize, modifiers: Modifiers, cx: &mut Context<Self>) {
+        match self.commit_anchor {
+            Some(anchor) if modifiers.shift => {
+                self.narrowed = (anchor.min(index)..=anchor.max(index)).collect();
+            }
+            _ if modifiers.platform => {
+                match self.narrowed.iter().position(|&i| i == index) {
+                    Some(at) => {
+                        self.narrowed.remove(at);
+                    }
+                    None => self.narrowed.push(index),
+                }
+                self.commit_anchor = Some(index);
+            }
+            _ => {
+                self.narrowed = if self.narrowed == [index] {
+                    Vec::new()
+                } else {
+                    vec![index]
+                };
+                self.commit_anchor = Some(index);
+            }
+        }
+        self.reload_files(cx);
+    }
+
+    /// A bead in the graph: the first click selects its node with all its
+    /// commits; on a selected node, a click picks the bead's commit, and
+    /// another on the same bead goes back to all of them.
+    pub fn click_bead(&mut self, node: usize, commit: String, cx: &mut Context<Self>) {
+        if self.selected_nodes != [node] {
+            self.set_selection(vec![node], cx);
+            return;
+        }
+        let picked = self.commits.iter().position(|c| c.id == commit);
+        if picked.is_some() && self.narrowed == picked.into_iter().collect::<Vec<_>>() {
+            self.show_all_commits(cx);
+        } else {
+            self.narrow_to(&commit, cx);
+        }
+    }
+
+    /// Selects a commit from elsewhere, such as Go To: its node, then the
+    /// commit once the node's commits are loaded.
+    fn select_commit(&mut self, node: usize, commit: String, cx: &mut Context<Self>) {
+        if self.selected_nodes == [node] && !self.commits.is_empty() {
+            self.narrow_to(&commit, cx);
+        } else {
+            self.set_selection(vec![node], cx);
+            self.pending_commit = Some(commit);
+        }
+    }
+
+    /// Narrows the diff to one listed commit.
+    fn narrow_to(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(index) = self.commits.iter().position(|commit| commit.id == id) else {
+            return;
+        };
+        self.narrowed = vec![index];
+        self.commit_anchor = Some(index);
+        self.commit_scroll
+            .scroll_to_item(index, ScrollStrategy::Center);
+        self.reload_files(cx);
+    }
+
+    /// Widens the diff back to the whole selection of nodes.
+    fn show_all_commits(&mut self, cx: &mut Context<Self>) {
+        self.narrowed.clear();
+        self.commit_anchor = None;
+        self.reload_files(cx);
+    }
+
+    fn reload_files(&mut self, cx: &mut Context<Self>) {
+        self.files.clear();
+        self.select_file(None, cx);
+        self.load_files(None, cx);
+        cx.notify();
+    }
+
+    /// Loads the changed files, keeping `keep` selected if it is still there.
+    fn load_files(&mut self, keep: Option<String>, cx: &mut Context<Self>) {
+        let range = commit_range(&self.commits, &self.narrowed).or_else(|| self.range.clone());
+        let (Some(repo_path), Some((base, tip))) = (self.repo_path.clone(), range) else {
+            return;
+        };
+        // A selected worktree alone shows its changes split for staging.
+        let worktree = self.staging_worktree();
+        let stash = self.stash_view.clone();
+        let load = cx.background_executor().spawn(async move {
+            if let Some(stash) = stash {
+                return wtf_core::stash_files(&repo_path, &stash)
+                    .map(|(files, split)| (files, Some(split)));
+            }
+            match worktree {
+                Some(path) => wtf_core::worktree_status(&path).map(|status| {
+                    let split = status.unstaged.len();
+                    let mut files = status.unstaged;
+                    files.extend(status.staged);
+                    (files, Some(split))
+                }),
+                None => wtf_core::changed_files(&repo_path, base.as_deref(), &tip)
+                    .map(|files| (files, None)),
+            }
+        });
+        self.files_task = Some(cx.spawn(async move |this, cx| {
+            let result = load.await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok((files, split)) => {
+                        this.files = files;
+                        this.worktree_split = split;
+                        this.error_message = None;
+                        let kept = keep.and_then(|path| {
+                            this.files.iter().position(|file| file.path() == path)
+                        });
+                        if split.is_some() {
+                            this.suggest_message(cx);
+                        }
+                        if this.is_stacked() {
+                            // Without one to keep, the first file as the tree lists them.
+                            this.selected_file =
+                                kept.or_else(|| this.file_order().first().copied());
+                            this.load_stacked(kept.is_some(), cx);
+                        } else {
+                            match kept {
+                                Some(index) => {
+                                    this.selected_file = Some(index);
+                                    this.load_diff(true, cx);
+                                }
+                                None => this.select_file((!this.files.is_empty()).then_some(0), cx),
+                            }
+                        }
+                    }
+                    Err(error) => this.error_message = Some(message(error)),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// In the all-files view, selecting a file scrolls to it.
+    fn select_file(&mut self, index: Option<usize>, cx: &mut Context<Self>) {
+        self.selected_file = index;
+        if !self.is_stacked() {
+            self.load_diff(false, cx);
+            return;
+        }
+        if self.file_by_file_worktree() {
+            self.restack();
+            self.stacked_scroll.scroll_to_item(0, ScrollStrategy::Top);
+            // Only the file shown has its diff; this one's comes now.
+            self.load_stacked(true, cx);
+            return;
+        }
+        let header = index.and_then(|file| {
+            self.stacked
+                .iter()
+                .position(|item| matches!(item, StackItem::Header(i) if *i == file))
+                .map(|header| header.saturating_sub(1))
+        });
+        if let Some(header) = header {
+            self.stacked_scroll
+                .scroll_to_item_strict(self.below_bar(header), ScrollStrategy::Top);
+        }
+        cx.notify();
+    }
+
+    fn set_diff_mode(&mut self, mode: DiffMode, cx: &mut Context<Self>) {
+        if self.diff_mode != mode {
+            self.diff_mode = mode;
+            self.reload_changes(cx);
+        }
+    }
+
+    fn set_changes_layout(&mut self, layout: ChangesLayout, cx: &mut Context<Self>) {
+        if self.changes_layout != layout {
+            self.changes_layout = layout;
+            // File by file picks files in the files panel.
+            if layout == ChangesLayout::OneFile {
+                self.side_panel = Some(SidePanel::Files);
+                self.update_menus(cx);
+            }
+            self.reload_changes(cx);
+        }
+    }
+
+    fn reload_changes(&mut self, cx: &mut Context<Self>) {
+        if self.is_stacked() {
+            self.load_stacked(false, cx);
+        } else {
+            self.load_diff(false, cx);
+        }
+    }
+
+    /// File by file in a worktree: the list picks the file, and its changes
+    /// show in the staging view, under the sections, one file at a time.
+    fn file_by_file_worktree(&self) -> bool {
+        self.worktree_split.is_some()
+            && (self.changes_layout == ChangesLayout::OneFile
+                || self.files.len() > MAX_STACKED_FILES)
+    }
+
+    /// Whether changes show in the stacked view; a worktree's always do, as
+    /// staging and the commit box live there.
+    fn is_stacked(&self) -> bool {
+        match self.worktree_split {
+            Some(_) => true,
+            None => {
+                self.changes_layout == ChangesLayout::AllFiles
+                    && !self.files.is_empty()
+                    && self.files.len() <= MAX_STACKED_FILES
+            }
+        }
+    }
+
+    /// The worktree to stage in: the only selected node, when it is one.
+    fn staging_worktree(&self) -> Option<String> {
+        if !self.narrowed.is_empty() {
+            return None;
+        }
+        let [index] = self.selected_nodes[..] else {
+            return None;
+        };
+        match &self.graph.nodes.get(index)?.tip {
+            Revision::Worktree(path) => Some(path.clone()),
+            Revision::Commit(_) => None,
+        }
+    }
+
+    /// A refresh keeps the current diff and scroll position until the new one is ready.
+    fn load_diff(&mut self, refresh: bool, cx: &mut Context<Self>) {
+        self.diff_task = None;
+        if !refresh {
+            self.diff = None;
+            self.is_loading_diff = false;
+        }
+        let (Some(repo_path), Some(file)) = (
+            self.repo_path.clone(),
+            self.selected_file.and_then(|index| self.files.get(index)),
+        ) else {
+            self.diff = None;
+            return;
+        };
+        self.is_loading_diff = !refresh;
+        let (file, mode) = (file.clone(), self.diff_mode);
+        let load = cx
+            .background_executor()
+            .spawn(async move { wtf_core::file_diff(repo_path, file, mode) });
+        self.diff_task = Some(cx.spawn(async move |this, cx| {
+            let result = load.await;
+            this.update(cx, |this, cx| {
+                this.is_loading_diff = false;
+                match result {
+                    Ok(diff) => {
+                        if !refresh {
+                            let first = diff_view::first_change(&diff.rows).unwrap_or(0);
+                            // Changes near the top leave the commit header in view.
+                            let row = match first.saturating_sub(CONTEXT_ROWS) {
+                                0 => 0,
+                                row => this.below_bar(row),
+                            };
+                            this.diff_scroll
+                                .scroll_to_item_strict(row, ScrollStrategy::Top);
+                        }
+                        this.diff = Some(diff);
+                        this.syntax.borrow_mut().clear();
+                        this.error_message = None;
+                    }
+                    Err(error) => this.error_message = Some(message(error)),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// Picks up commands recorded since the last call and prints them in the
+    /// terminal, which also flushes lines held during full-screen programs.
+    fn sync_log(&mut self, cx: &mut Context<Self>) {
+        let mut new = wtf_core::log_since(self.log_seq);
+        if let Some(last) = new.last() {
+            self.log_seq = last.seq;
+        }
+        // The log is shared by all windows; this one shows its repository's.
+        new.retain(|entry| self.runs_here(&entry.dir));
+        let lines = console_view::lines(&new, self.hide_refresh, &mut self.announced_dir);
+        if let Some(own) = new.iter().rev().find(|entry| !entry.refresh) {
+            self.last_own_entry = Some(own.clone());
+        }
+        if let Some(last) = new.pop() {
+            self.last_entry = Some(last);
+        }
+        if let Some(terminal) = &self.terminal {
+            terminal.update(cx, |terminal, cx| terminal.announce(lines, cx));
+        }
+    }
+
+    /// Whether a command ran in this window's repository or one of its worktrees.
+    fn runs_here(&self, dir: &str) -> bool {
+        let dir = dir.trim_end_matches('/');
+        let repo = self
+            .repo_path
+            .as_deref()
+            .map(|path| path.trim_end_matches('/'));
+        repo == Some(dir)
+            || self.graph.nodes.iter().any(|node| {
+                matches!(&node.tip, Revision::Worktree(path) if path.trim_end_matches('/') == dir)
+            })
+    }
+
+    /// Opens the terminal dock, starting the shell the first time.
+    fn toggle_console(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.console_open = !self.console_open;
+        if self.console_open {
+            let dir = self
+                .repo_path
+                .clone()
+                .or_else(|| std::env::var("HOME").ok())
+                .unwrap_or_else(|| "/".to_string());
+            let terminal = self
+                .terminal
+                .get_or_insert_with(|| cx.new(|cx| TerminalView::new(dir, cx)));
+            terminal.read(cx).focus(window);
+        } else {
+            self.focus.focus(window);
+        }
+        cx.notify();
+    }
+
+    /// Follows the mouse while a panel border is dragged.
+    fn drag_border(&mut self, event: &MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // The graph follows a drag that started on its empty part.
+        if let Some((start, offset)) = self.graph_drag {
+            if event.pressed_button != Some(MouseButton::Left) {
+                self.graph_drag = None;
+                return;
+            }
+            let max = self.graph_scroll.max_offset();
+            let moved = event.position - start;
+            let x = (offset.x + moved.x).clamp(-max.width, px(0.));
+            let y = (offset.y + moved.y).clamp(-max.height, px(0.));
+            self.graph_scroll.set_offset(point(x, y));
+            cx.notify();
+            return;
+        }
+        let Some(border) = self.dragging else {
+            return;
+        };
+        if event.pressed_button != Some(MouseButton::Left) {
+            self.dragging = None;
+            return;
+        }
+        let height = f32::from(window.viewport_size().height);
+        let y = f32::from(event.position.y);
+        let max = (height - MIN_MAIN_HEIGHT).max(MIN_PANEL_HEIGHT);
+        match border {
+            Border::Dock => {
+                self.dock_height = (height - y - STATUS_HEIGHT).clamp(MIN_PANEL_HEIGHT, max)
+            }
+            Border::Graph => {
+                let top = workspace::TAB_BAR_HEIGHT;
+                self.graph_height = Some((y - top).clamp(MIN_PANEL_HEIGHT, max))
+            }
+            Border::Sidebar => {
+                let x = f32::from(window.viewport_size().width - event.position.x);
+                let width = x - SIDEBAR_STRIP_WIDTH;
+                self.sidebar_width = width.clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
+            }
+            Border::Commits => {
+                let right = match (self.repo_path.is_some(), self.side_panel) {
+                    (false, _) => 0.,
+                    (true, Some(_)) => SIDEBAR_STRIP_WIDTH + self.sidebar_width + 8.,
+                    (true, None) => SIDEBAR_STRIP_WIDTH,
+                };
+                let width = f32::from(window.viewport_size().width) - right;
+                let max = (width - MIN_DIFF_WIDTH).max(MIN_COLUMN_WIDTH);
+                self.commits_width = f32::from(event.position.x).clamp(MIN_COLUMN_WIDTH, max);
+            }
+        }
+        cx.notify();
+    }
+
+    fn dock(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .h(px(self.dock_height))
+            .child(border_handle("dock-border", theme).on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.dragging = Some(Border::Dock);
+                    cx.stop_propagation();
+                }),
+            ))
+            .child(div().flex_1().min_h_0().children(self.terminal.clone()))
+    }
+
+    fn status_bar(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let last = match self.hide_refresh {
+            true => self.last_own_entry.as_ref(),
+            false => self.last_entry.as_ref(),
+        };
+        div()
+            .id("status")
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(10.))
+            .px(px(12.))
+            .h(px(24.))
+            .border_t_1()
+            .border_color(theme.separator)
+            .text_xs()
+            // The terminal's button, boxed like the side panels' ones, with
+            // an arrow to where it goes.
+            .child(
+                div()
+                    .id("terminal-toggle")
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(px(4.))
+                    .px(px(6.))
+                    .h(px(18.))
+                    .rounded(px(4.))
+                    .border_1()
+                    .border_color(theme.separator)
+                    .cursor_pointer()
+                    .hover(|button| button.bg(theme.selection))
+                    .when(self.console_open, |button| button.bg(theme.selection))
+                    .on_click(cx.listener(|this, _, window, cx| this.toggle_console(window, cx)))
+                    .child(
+                        div()
+                            .text_color(theme.secondary)
+                            .child(if self.console_open { "▾" } else { "▴" }),
+                    )
+                    .child("Terminal"),
+            )
+            .children(last.map(|entry| {
+                div()
+                    .truncate()
+                    .font_family(preferences::code_font())
+                    .text_color(if entry.ok {
+                        theme.secondary
+                    } else {
+                        theme.error
+                    })
+                    .child(entry.command.clone())
+            }))
+            .child(div().flex_1())
+            .when(self.repo_path.is_some(), |bar| {
+                bar.child(
+                    div()
+                        .flex_none()
+                        .text_color(theme.secondary)
+                        .child(self.attention_summary()),
+                )
+                .child(self.fetch_status(theme, cx))
+            })
+    }
+
+    /// The last fetch, `⟳ 3m`, or a failed one in red; a click fetches now.
+    fn fetch_status(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let (text, color) = match (&self.fetch_task, &self.fetch_error, self.fetched_at) {
+            (Some(_), _, _) => ("⟳ fetching…".to_string(), theme.secondary),
+            (None, Some(_), _) => ("⟳ fetch failed".to_string(), theme.error),
+            (None, None, Some(at)) => (
+                format!("⟳ {}", short_age(at, now_seconds())),
+                theme.secondary,
+            ),
+            (None, None, None) => ("⟳ fetch".to_string(), theme.secondary),
+        };
+        div()
+            .id("fetch-status")
+            .flex_none()
+            .px(px(6.))
+            .h(px(18.))
+            .flex()
+            .items_center()
+            .rounded(px(4.))
+            .cursor_pointer()
+            .hover(|button| button.bg(theme.selection))
+            .text_color(color)
+            .on_click(cx.listener(|this, _, _, cx| this.fetch(false, cx)))
+            .child(text)
+    }
+
+    fn title(&self) -> String {
+        let name = self
+            .repo_path
+            .as_deref()
+            .and_then(|path| Path::new(path).file_name());
+        let name = name.map_or("wtf".into(), |name| name.to_string_lossy());
+        match &self.diff {
+            Some(diff) => format!("{name} — {}", diff.language),
+            None => name.into_owned(),
+        }
+    }
+
+    fn toggle_combine_commits(&mut self, cx: &mut Context<Self>) {
+        self.combine_commits = !self.combine_commits;
+        self.update_menus(cx);
+        self.start_refresh(cx);
+        cx.notify();
+    }
+
+    fn toggle_refresh_commands(&mut self, cx: &mut Context<Self>) {
+        self.hide_refresh = !self.hide_refresh;
+        cx.notify();
+    }
+
+    fn detail(&self, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        if let Some(message) = &self.error_message {
+            return placeholder("Something went wrong", Some(message.clone()), theme);
+        }
+        if self.repo_path.is_none() {
+            let hint = "Open a Git repository to review its commits.";
+            return placeholder("No repository", Some(hint.into()), theme);
+        }
+        if self.is_stacked() {
+            if self.is_loading_stacked {
+                return self.with_header(placeholder("Loading…", None, theme), theme, window, cx);
+            }
+            let spacers = self.header_rows();
+            let list = uniform_list(
+                "stacked",
+                spacers + self.stacked.len(),
+                cx.processor(move |this, range: std::ops::Range<usize>, window, cx| {
+                    let theme = Theme::for_appearance(window.appearance());
+                    range
+                        .filter_map(|index| match index.checked_sub(spacers) {
+                            None => Some(spacer()),
+                            Some(index) => this
+                                .stacked
+                                .get(index)
+                                .map(|item| this.stack_row(item, &theme, cx)),
+                        })
+                        .collect()
+                }),
+            )
+            .track_scroll(self.stacked_scroll.clone())
+            .flex_1()
+            .size_full()
+            .font_family(preferences::code_font())
+            .text_size(px(preferences::code_size()))
+            // Headers and code lines share one line height, whatever the font.
+            .line_height(px(diff_view::row_height()));
+            // The header of the file at the top stays pinned while its lines
+            // scroll under it.
+            // Rows have one height, so the offset tells the top row. Past the
+            // top, the list holds still as it lays out, and so does the header.
+            let scroll_y =
+                f32::from(-self.stacked_scroll.0.borrow().base_handle.offset().y).max(0.);
+            let bar = match self.range.is_some() && scroll_y > 0. {
+                true => summary_bar_height(),
+                false => 0.,
+            };
+            let top = ((scroll_y + bar) / diff_view::row_height()).max(0.) as usize;
+            let pinned = top
+                .checked_sub(spacers)
+                .and_then(|top| {
+                    self.stacked[..(top + 1).min(self.stacked.len())]
+                        .iter()
+                        .rposition(|item| {
+                            matches!(item, StackItem::Header(_) | StackItem::Section(..))
+                        })
+                        .filter(|&at| at < top)
+                })
+                .and_then(|at| match self.stacked[at] {
+                    StackItem::Header(file) => Some(file),
+                    _ => None,
+                })
+                .filter(|&file| self.stack_item_fits(&StackItem::Header(file)));
+            return div()
+                .flex()
+                .flex_col()
+                .size_full()
+                .when(
+                    self.worktree_split.is_some() && self.stash_view.is_none(),
+                    |pane| pane.child(self.commit_box(theme, window, cx)),
+                )
+                .child(self.under_header(
+                    list.into_any_element(),
+                    scroll_y,
+                    pinned.map(|file| {
+                        div()
+                            .font_family(preferences::code_font())
+                            .text_size(px(preferences::code_size()))
+                            .line_height(px(diff_view::row_height()))
+                            .border_b_1()
+                            .border_color(theme.separator)
+                            .child(self.stack_row_unchecked(&StackItem::Header(file), theme, cx))
+                            .into_any_element()
+                    }),
+                    theme,
+                    window,
+                    cx,
+                ))
+                .into_any_element();
+        }
+        if self.is_loading_diff {
+            return self.with_header(placeholder("Loading…", None, theme), theme, window, cx);
+        }
+        let shown = match &self.diff {
+            Some(diff) if !diff.rows.is_empty() => {
+                let spacers = self.header_rows();
+                let list = uniform_list(
+                    "diff",
+                    spacers + diff.rows.len(),
+                    cx.processor(move |this, range: std::ops::Range<usize>, window, _| {
+                        let theme = Theme::for_appearance(window.appearance());
+                        let rows = this.diff.as_ref().map_or(&[][..], |diff| &diff.rows);
+                        range
+                            .filter_map(|index| match index.checked_sub(spacers) {
+                                None => Some(spacer()),
+                                Some(index) => rows.get(index).map(|row| {
+                                    let colors = this.diff_colors(None, &theme);
+                                    diff_view::row(row, &theme, colors.as_deref())
+                                        .into_any_element()
+                                }),
+                            })
+                            .collect()
+                    }),
+                )
+                .track_scroll(self.diff_scroll.clone())
+                .size_full()
+                .font_family(preferences::code_font())
+                .text_size(px(preferences::code_size()))
+                .line_height(px(diff_view::row_height()));
+                let scroll_y =
+                    f32::from(-self.diff_scroll.0.borrow().base_handle.offset().y).max(0.);
+                // The pane takes its parent's height, as the all-files one does
+                // in its column; otherwise the list has none and shows nothing.
+                return div()
+                    .flex()
+                    .flex_col()
+                    .size_full()
+                    .child(self.under_header(
+                        list.into_any_element(),
+                        scroll_y,
+                        None,
+                        theme,
+                        window,
+                        cx,
+                    ))
+                    .into_any_element();
+            }
+            Some(_) => {
+                let hint = "Difftastic found no differences to show in this file.";
+                placeholder("No visible changes", Some(hint.into()), theme)
+            }
+            None if self.range.is_some() && self.files.is_empty() => {
+                placeholder("No changes", None, theme)
+            }
+            None => placeholder("No file selected", None, theme),
+        };
+        self.with_header(shown, theme, window, cx)
+    }
+}
+
+impl RepoView {
+    fn toggle_attention_panel(&mut self, cx: &mut Context<Self>) {
+        self.toggle_panel(SidePanel::Attention, cx);
+    }
+
+    /// Opens a side panel, or closes it when it is the open one.
+    fn toggle_panel(&mut self, panel: SidePanel, cx: &mut Context<Self>) {
+        self.side_panel = match self.side_panel == Some(panel) {
+            true => None,
+            false => Some(panel),
+        };
+        self.last_panel = panel;
+        self.update_menus(cx);
+        cx.notify();
+    }
+
+    /// Closes the open side panel, or opens the last one.
+    fn toggle_side_panel(&mut self, cx: &mut Context<Self>) {
+        let panel = self.side_panel.unwrap_or(self.last_panel);
+        self.toggle_panel(panel, cx);
+    }
+
+    /// The open side panel and the strip beside it.
+    fn side_panel_view(
+        &self,
+        theme: &Theme,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let content = match self.side_panel {
+            Some(SidePanel::Attention) => Some(self.attention_panel_view(theme, window, cx)),
+            Some(SidePanel::Files) => Some(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_none()
+                    .w(px(self.sidebar_width))
+                    .h_full()
+                    .bg(theme.background)
+                    .text_sm()
+                    .child(self.file_list(cx))
+                    .into_any_element(),
+            ),
+            None => None,
+        };
+        div()
+            .flex()
+            .flex_none()
+            .h_full()
+            .children(content)
+            .child(self.side_strip(theme, window, cx))
+            .into_any_element()
+    }
+
+    /// The strip at the window's right edge, the same with a panel open or
+    /// not: the arrow, the panels by name, then the diff view switches.
+    fn side_strip(&self, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        // Each panel: a box like the mode groups below, of one button
+        // holding its arrow and its name.
+        let tab = |panel: SidePanel, label: &'static str| {
+            let open = self.side_panel == Some(panel);
+            strip_group(theme).child(
+                strip_option(label, open, theme)
+                    .gap(px(2.))
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_panel(panel, cx)))
+                    .child(side_chevron(!open, theme.secondary, 10.))
+                    .child(vertical_label(label, theme.foreground, window)),
+            )
+        };
+        div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .items_center()
+            .gap(px(STRIP_GAP))
+            .pt(px(STRIP_GAP))
+            .w(px(SIDEBAR_STRIP_WIDTH))
+            .h_full()
+            .border_l_1()
+            .border_color(theme.separator)
+            .bg(theme.graph_background)
+            .child(tab(SidePanel::Attention, "Attention"))
+            .child(tab(SidePanel::Files, "Files"))
+            .child(div().w(px(16.)).h(px(1.)).bg(theme.separator))
+            .child(self.view_toggles(theme, window, cx))
+            .into_any_element()
+    }
+
+    /// A column's right edge, with the same grip as the other borders,
+    /// that resizes the column when dragged.
+    fn column_handle(
+        &self,
+        id: &'static str,
+        border: Border,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        side_border_handle(id, theme).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                this.dragging = Some(border);
+                cx.stop_propagation();
+            }),
+        )
+    }
+}
+
+/// The diff covering selected commits of a newest-first list: from the oldest
+/// one's parent to the newest one; `None` when nothing is selected.
+fn commit_range(commits: &[Commit], selected: &[usize]) -> Option<(Option<String>, Revision)> {
+    let newest = commits.get(*selected.iter().min()?)?;
+    let oldest = commits.get(*selected.iter().max()?)?;
+    Some((oldest.parent.clone(), Revision::Commit(newest.id.clone())))
+}
+
+/// The height of a commit list row.
+const LIST_ITEM_HEIGHT: f32 = 40.;
+
+impl Render for RepoView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::for_appearance(window.appearance());
+        window.set_window_title(&self.title());
+        self.request_summary(cx);
+        self.sync_log(cx);
+        div()
+            .track_focus(&self.focus)
+            .on_action(cx.listener(|this, _: &OpenRepository, window, cx| {
+                this.choose_repository(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &StructuralDiff, _, cx| {
+                this.set_diff_mode(DiffMode::Structural, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &TextDiff, _, cx| this.set_diff_mode(DiffMode::Text, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &ToggleCombineCommits, _, cx| {
+                    this.toggle_combine_commits(cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &GoTo, window, cx| this.open_goto(false, window, cx)))
+            .on_action(cx.listener(|this, _: &Prune, window, cx| this.open_prune(window, cx)))
+            .on_action(cx.listener(|this, _: &Fetch, _, cx| this.fetch(false, cx)))
+            // Stashes the changes of the worktree commands run in.
+            .on_action(cx.listener(|this, _: &StashChanges, window, cx| {
+                if let Some(path) = this.command_path() {
+                    this.open_stash_picker(path, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &OpenWorktreeWith, window, cx| {
+                this.open_worktree_with(None, window, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &CommandPalette, window, cx| {
+                    this.open_goto(true, window, cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &ToggleSidePanel, _, cx| this.toggle_side_panel(cx)))
+            .on_action(cx.listener(|this, _: &ShowOneFile, _, cx| {
+                this.set_changes_layout(ChangesLayout::OneFile, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ShowAllFiles, _, cx| {
+                this.set_changes_layout(ChangesLayout::AllFiles, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &ToggleConsole, window, cx| this.toggle_console(window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &ToggleRefreshCommands, _, cx| {
+                this.toggle_refresh_commands(cx)
+            }))
+            .on_action(cx.listener(|this, action: &SetTimeWindow, _, cx| {
+                let days = action.days;
+                this.change_attention(|attention| attention.window_days = days, cx)
+            }))
+            .on_action(cx.listener(|this, action: &ToggleAuthor, _, cx| {
+                let name = action.name.clone();
+                this.change_attention(
+                    |attention| match attention.authors.iter().position(|a| *a == name) {
+                        Some(at) => {
+                            attention.authors.remove(at);
+                        }
+                        None => attention.authors.push(name),
+                    },
+                    cx,
+                )
+            }))
+            .on_action(
+                cx.listener(|this, _: &ToggleAttentionPanel, _, cx| {
+                    this.toggle_attention_panel(cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &ToggleRemotes, _, cx| {
+                this.change_attention(|attention| attention.remotes = !attention.remotes, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ToggleTags, _, cx| {
+                this.change_attention(|attention| attention.tags = !attention.tags, cx)
+            }))
+            .on_action(cx.listener(|this, action: &SetWorktreeOrder, _, cx| {
+                this.worktree_order = action.order;
+                this.update_menus(cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, action: &SetWorktreeNames, _, cx| {
+                this.worktree_names = action.names;
+                this.update_menus(cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, action: &SetScope, _, cx| {
+                let scope = action.scope;
+                this.change_attention(|attention| attention.scope = scope, cx)
+            }))
+            .on_action(cx.listener(|this, _: &AllAuthors, _, cx| {
+                this.change_attention(|attention| attention.authors.clear(), cx)
+            }))
+            .on_action(cx.listener(|this, action: &ToggleBranch, _, cx| {
+                this.toggle_branch(&action.name, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ResetBranches, _, cx| {
+                this.change_attention(
+                    |attention| {
+                        attention.pinned.clear();
+                        attention.hidden.clear();
+                    },
+                    cx,
+                )
+            }))
+            // ⌘A, with nothing more particular in focus, picks every commit
+            // of the selection again, as one picked in the list narrows it.
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                let keystroke = &event.keystroke;
+                // Esc closes an open menu.
+                if keystroke.key == "escape"
+                    && (this.context_menu.is_some() || this.dropdown.is_some())
+                {
+                    this.context_menu = None;
+                    this.dropdown = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+                // Text fields keep ⌘A to themselves.
+                let typing = [
+                    &this.prompt_focus,
+                    &this.goto_focus,
+                    &this.attention_search_focus,
+                    &this.prune_focus,
+                    &this.reword_focus,
+                ]
+                .iter()
+                .any(|focus| focus.is_focused(window));
+                if keystroke.modifiers.platform && keystroke.key == "a" && !typing {
+                    this.message_selection = None;
+                    if !this.narrowed.is_empty() {
+                        this.show_all_commits(cx);
+                    }
+                    cx.stop_propagation();
+                }
+            }))
+            .on_mouse_move(cx.listener(Self::drag_border))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.dragging = None;
+                    // The view stays where the drag left it.
+                    if this.graph_drag.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_action(|_: &Minimize, window, _| window.minimize_window())
+            .on_action(|_: &Zoom, window, _| window.zoom_window())
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(theme.background)
+            .text_color(theme.foreground)
+            .text_sm()
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .when(self.repo_path.is_some(), |view| {
+                                view.child(self.graph_band(&theme, cx))
+                            })
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .child(
+                                        column(self.commits_width)
+                                            .child(self.commit_list(&theme, cx)),
+                                    )
+                                    .child(self.column_handle(
+                                        "commits-border",
+                                        Border::Commits,
+                                        &theme,
+                                        cx,
+                                    ))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .h_full()
+                                            .children(self.file_stepper(&theme, cx))
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_h_0()
+                                                    .child(self.detail(&theme, window, cx)),
+                                            ),
+                                    ),
+                            )
+                            .when(self.console_open, |view| view.child(self.dock(&theme, cx))),
+                    )
+                    // The open sidebar's left edge resizes it.
+                    .when(
+                        self.repo_path.is_some() && self.side_panel.is_some(),
+                        |row| {
+                            // The same grip as the graph's border, standing up.
+                            row.child(side_border_handle("sidebar-border", &theme).on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.dragging = Some(Border::Sidebar);
+                                    cx.stop_propagation();
+                                }),
+                            ))
+                        },
+                    )
+                    .when(self.repo_path.is_some(), |row| {
+                        row.child(self.side_panel_view(&theme, window, cx))
+                    }),
+            )
+            .child(self.status_bar(&theme, cx))
+            .children(self.context_menu_view(&theme, cx))
+            .children(self.dropdown_view(&theme, cx))
+            .children(self.prompt_view(&theme, window, cx))
+            .children(self.goto_view(&theme, window, cx))
+            .children(self.stash_picker_view(&theme, window, cx))
+            .children(self.prune_view(&theme, window, cx))
+    }
+}
+
+/// Space between the side strip's boxes, and above the first.
+const STRIP_GAP: f32 = 6.;
+
+/// The cursor drawn in a text field.
+const CARET: &str = "▏";
+
+/// Types a key into a plain text field: Return breaks the line, unless the
+/// field is `single_line`, Backspace deletes and ⌘V pastes, on one line in a
+/// single-line field. False for keys it leaves alone.
+pub(crate) fn type_key(
+    text: &mut String,
+    keystroke: &gpui::Keystroke,
+    single_line: bool,
+    cx: &gpui::App,
+) -> bool {
+    let modifiers = keystroke.modifiers;
+    match keystroke.key.as_str() {
+        "enter" if !modifiers.platform && !single_line => text.push('\n'),
+        "backspace" => {
+            text.pop();
+        }
+        "v" if modifiers.platform => {
+            if let Some(pasted) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                match single_line {
+                    true => text.push_str(pasted.replace('\n', " ").trim()),
+                    false => text.push_str(&pasted),
+                }
+            }
+        }
+        _ if !modifiers.platform && !modifiers.control => match &keystroke.key_char {
+            Some(typed) if !typed.chars().any(char::is_control) => text.push_str(typed),
+            _ => return false,
+        },
+        _ => return false,
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use wtf_core::{DiffRow, DiffSide, TextRange};
+
+    use super::stack::stack_items;
+    use super::*;
+
+    fn diff(changed: &[bool]) -> FileDiff {
+        let rows = changed
+            .iter()
+            .map(|&changed| {
+                let side = DiffSide {
+                    line_number: 1,
+                    text: String::new(),
+                    changes: if changed {
+                        vec![TextRange { start: 0, end: 1 }]
+                    } else {
+                        Vec::new()
+                    },
+                };
+                DiffRow {
+                    left: Some(side.clone()),
+                    right: Some(side),
+                }
+            })
+            .collect();
+        FileDiff {
+            language: "Text".to_string(),
+            rows,
+        }
+    }
+
+    fn commit(id: &str, parent: &str) -> Commit {
+        Commit {
+            id: id.to_string(),
+            short_id: id.to_string(),
+            summary: String::new(),
+            body: String::new(),
+            author: String::new(),
+            time: 0,
+            parent: Some(parent.to_string()),
+        }
+    }
+
+    #[test]
+    fn selected_commits_span_from_the_oldest_parent_to_the_newest() {
+        let commits = [commit("c3", "c2"), commit("c2", "c1"), commit("c1", "c0")];
+        assert_eq!(commit_range(&commits, &[]), None);
+        assert_eq!(
+            commit_range(&commits, &[2, 0]),
+            Some((Some("c0".to_string()), Revision::Commit("c3".to_string())))
+        );
+        assert_eq!(
+            commit_range(&commits, &[1]),
+            Some((Some("c1".to_string()), Revision::Commit("c2".to_string())))
+        );
+    }
+
+    #[test]
+    fn double_click_picks_a_word() {
+        let text = "Fix the parser-bug now";
+        assert_eq!(word_around(text, 10), (8, 18));
+        assert_eq!(&text[8..18], "parser-bug");
+        assert_eq!(word_around(text, 0), (0, 3));
+    }
+
+    #[test]
+    fn branch_names_nest_by_folder() {
+        let names = ["feature/parser", "bot", "feature/lexer", "origin/x/y/z"];
+        let show = |rows: Vec<NameRow>| -> Vec<String> {
+            rows.into_iter()
+                .map(|row| match row {
+                    NameRow::Folder { label, depth, .. } => format!("{depth}{label}"),
+                    NameRow::Leaf { name, depth, .. } => format!("{depth}{name}"),
+                })
+                .collect()
+        };
+        assert_eq!(
+            show(name_tree(&names, &HashSet::new())),
+            [
+                "0feature/",
+                "1parser",
+                "1lexer",
+                "0origin/x/y/",
+                "1z",
+                "0bot"
+            ]
+        );
+        let folded = HashSet::from(["feature/".to_string()]);
+        assert_eq!(
+            show(name_tree(&names, &folded)),
+            ["0feature/", "0origin/x/y/", "1z", "0bot"]
+        );
+    }
+
+    #[test]
+    fn file_tree_nests_folders_and_joins_lone_ones() {
+        let file = |path: &str| ChangedFile {
+            status: "M".to_string(),
+            old_path: None,
+            new_path: Some(path.to_string()),
+            old_id: String::new(),
+            new_id: String::new(),
+            worktree: None,
+        };
+        let files = [
+            file("app/src/main.rs"),
+            file("README.md"),
+            file("app/src/view/a.rs"),
+            file("core/src/lib/x/y.rs"),
+        ];
+        let show = |rows: Vec<TreeRow>| -> Vec<String> {
+            rows.into_iter()
+                .map(|row| match row {
+                    TreeRow::Section(staged, count) => format!("{staged}:{count}"),
+                    TreeRow::Dir { label, depth, .. } => format!("{depth}{label}/"),
+                    TreeRow::File { name, depth, .. } => format!("{depth}{name}"),
+                })
+                .collect()
+        };
+        let none = HashSet::new();
+        assert_eq!(
+            show(file_tree(&files, None, &none)),
+            [
+                "0app/src/",
+                "1view/",
+                "2a.rs",
+                "1main.rs",
+                "0core/src/lib/x/",
+                "1y.rs",
+                "0README.md"
+            ]
+        );
+        let folded = HashSet::from(["staged:app/src/".to_string()]);
+        assert_eq!(
+            show(file_tree(&files[..2], Some(1), &folded)),
+            ["false:1", "0app/src/", "1main.rs", "true:1", "0README.md"]
+        );
+    }
+
+    #[test]
+    fn staging_splits_files_into_sections() {
+        let diffs = vec![Ok(diff(&[true])), Ok(diff(&[true])), Ok(diff(&[true]))];
+        let kinds: Vec<String> = stack_items(
+            &diffs,
+            &[true, true, true],
+            Some(2),
+            [false; 2],
+            None,
+            false,
+        )
+        .iter()
+        .map(|item| match item {
+            StackItem::Section(staged, count) => format!("{staged}:{count}"),
+            StackItem::Header(file) => format!("H{file}"),
+            _ => "?".to_string(),
+        })
+        .collect();
+        assert_eq!(
+            kinds,
+            [
+                "?", "false:2", "?", "H0", "?", "H1", "?", "true:1", "?", "H2"
+            ]
+        );
+
+        let folded_unstaged: Vec<String> = stack_items(
+            &diffs,
+            &[true, true, true],
+            Some(2),
+            [true, false],
+            None,
+            false,
+        )
+        .iter()
+        .map(|item| match item {
+            StackItem::Section(staged, count) => format!("{staged}:{count}"),
+            StackItem::Header(file) => format!("H{file}"),
+            _ => "?".to_string(),
+        })
+        .collect();
+        assert_eq!(folded_unstaged, ["?", "false:2", "?", "true:1", "?", "H2"]);
+
+        // Each hunk of a worktree file gets a header before its rows.
+        let open: Vec<String> =
+            stack_items(&diffs[2..], &[false], Some(0), [false; 2], None, false)
+                .iter()
+                .map(|item| match item {
+                    StackItem::Section(staged, count) => format!("{staged}:{count}"),
+                    StackItem::Header(file) => format!("H{file}"),
+                    StackItem::Hunk(file, start, end) => format!("@{file}:{start}-{end}"),
+                    StackItem::Row(file, row) => format!("{file}:{row}"),
+                    _ => "?".to_string(),
+                })
+                .collect();
+        assert_eq!(
+            open,
+            ["?", "false:0", "?", "true:1", "?", "H0", "@0:0-1", "0:0"]
+        );
+
+        // File by file: the one file, without sections, even when folded.
+        let one: Vec<String> = stack_items(
+            &diffs,
+            &[true, true, true],
+            Some(2),
+            [true; 2],
+            Some(1),
+            false,
+        )
+        .iter()
+        .map(|item| match item {
+            StackItem::Section(staged, count) => format!("{staged}:{count}"),
+            StackItem::Header(file) => format!("H{file}"),
+            StackItem::Hunk(file, start, end) => format!("@{file}:{start}-{end}"),
+            StackItem::Row(file, row) => format!("{file}:{row}"),
+            _ => "?".to_string(),
+        })
+        .collect();
+        assert_eq!(one, ["?", "H1", "@1:0-1", "1:0"]);
+
+        // Too many files for all of them: one at a time, under its sections,
+        // shown even when its section was folded.
+        let kept = stack_items(&diffs, &[false; 3], Some(2), [true; 2], Some(1), true);
+        let sections = kept
+            .iter()
+            .filter(|item| matches!(item, StackItem::Section(..)))
+            .count();
+        assert_eq!(sections, 2);
+        assert!(
+            !kept
+                .iter()
+                .any(|item| matches!(item, StackItem::Header(0 | 2)))
+        );
+        assert!(kept.iter().any(|item| matches!(item, StackItem::Header(1))));
+
+        let nothing_staged = stack_items(&diffs[..1], &[true], Some(1), [false; 2], None, false);
+        assert!(matches!(
+            nothing_staged.last(),
+            Some(StackItem::Section(true, 0))
+        ));
+    }
+
+    #[test]
+    fn aggregates_authors_and_time_span() {
+        let now = 10_000_000;
+        let mut commits = [commit("c3", "c2"), commit("c2", "c1"), commit("c1", "c0")];
+        let days = [1, 3, 3];
+        let authors = ["Bot", "Ann", "Bot"];
+        for ((commit, days), author) in commits.iter_mut().zip(days).zip(authors) {
+            commit.time = now - days * 86_400;
+            commit.author = author.to_string();
+        }
+        let refs: Vec<&Commit> = commits.iter().collect();
+        assert_eq!(
+            aggregate(&refs, now),
+            "3 commits · Bot, Ann · 3 days ago – 1 day ago"
+        );
+    }
+
+    #[test]
+    fn short_ages_fit_a_list() {
+        let now = 100_000_000;
+        assert_eq!(short_age(now - 120, now), "2m");
+        assert_eq!(short_age(now - 5 * 3_600, now), "5h");
+        assert_eq!(short_age(now - 3 * 86_400, now), "3d");
+        assert_eq!(short_age(now - 21 * 86_400, now), "3w");
+        assert_eq!(short_age(now - 400 * 86_400, now), "1y");
+    }
+
+    #[test]
+    fn ages_read_like_people_say_them() {
+        let now = 10_000_000;
+        assert_eq!(relative_time(now - 5, now), "just now");
+        assert_eq!(relative_time(now - 60, now), "1 minute ago");
+        assert_eq!(relative_time(now - 3 * 86_400, now), "3 days ago");
+        assert_eq!(relative_time(now - 400 * 86_400, now), "1 year ago");
+    }
+
+    #[test]
+    fn stacks_headers_hunks_and_notes() {
+        let mut changed = vec![false; 10];
+        changed[8] = true;
+        let diffs = vec![
+            Ok(diff(&changed)),
+            Ok(diff(&[false, false])),
+            Err("binary".to_string()),
+        ];
+        let kinds = |folded: &[bool]| -> Vec<String> {
+            stack_items(&diffs, folded, None, [false; 2], None, false)
+                .iter()
+                .map(|item| match item {
+                    StackItem::Section(staged, count) => format!("S{staged}:{count}"),
+                    StackItem::Header(file) => format!("H{file}"),
+                    StackItem::Row(file, row) => format!("{file}:{row}"),
+                    StackItem::Hunk(..) => "@".to_string(),
+                    StackItem::Gap => "…".to_string(),
+                    StackItem::Note(text) => text.clone(),
+                    StackItem::HeaderPad => " ".to_string(),
+                })
+                .collect()
+        };
+        assert_eq!(
+            kinds(&[true, true, false]),
+            [" ", "H0", " ", "H1", " ", "H2", "binary"]
+        );
+        assert_eq!(
+            kinds(&[]),
+            [
+                " ",
+                "H0",
+                "…",
+                "0:5",
+                "0:6",
+                "0:7",
+                "0:8",
+                "0:9",
+                " ",
+                "H1",
+                "No visible changes",
+                " ",
+                "H2",
+                "binary"
+            ]
+        );
+    }
+
+    #[test]
+    fn edits_text_at_its_cursor() {
+        let key = |keys: &str| {
+            let mut keystroke = gpui::Keystroke::parse(keys).unwrap();
+            if keystroke.key.chars().count() == 1 && !keystroke.modifiers.platform {
+                keystroke.key_char = Some(keystroke.key.clone());
+            }
+            keystroke
+        };
+        let edit = |text: &str, cursor: usize, keys: &str| {
+            let (mut text, mut cursor) = (text.to_string(), cursor);
+            edit_key(&mut text, &mut cursor, &key(keys), || Some("XY".into()));
+            (text, cursor)
+        };
+        assert_eq!(edit("ac", 1, "b"), ("abc".into(), 2));
+        assert_eq!(edit("abc", 1, "backspace"), ("bc".into(), 0));
+        assert_eq!(edit("abc", 1, "delete"), ("ac".into(), 1));
+        assert_eq!(edit("ab", 1, "cmd-v"), ("aXYb".into(), 3));
+        assert_eq!(edit("ab", 1, "enter"), ("a\nb".into(), 2));
+        assert_eq!(edit("привет", 2, "right"), ("привет".into(), 4));
+        assert_eq!(edit("one two", 7, "alt-left"), ("one two".into(), 4));
+        assert_eq!(edit("one two", 0, "alt-right"), ("one two".into(), 3));
+        assert_eq!(edit("one two", 7, "alt-backspace"), ("one ".into(), 4));
+        assert_eq!(edit("a\nbc", 4, "cmd-left"), ("a\nbc".into(), 2));
+        assert_eq!(edit("a\nbc", 2, "cmd-right"), ("a\nbc".into(), 4));
+        assert_eq!(edit("a\nbc", 4, "cmd-backspace"), ("a\n".into(), 2));
+        // The caret drawn at 1 takes room that is no place in the text.
+        assert_eq!(from_shown(1, 1), 1);
+        assert_eq!(from_shown(2, 1), 1);
+        assert_eq!(from_shown(1 + CARET.len() + 1, 1), 2);
+    }
+}

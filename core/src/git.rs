@@ -23,26 +23,7 @@ fn open(repo_path: &str) -> Result<gix::Repository, CoreError> {
 
 /// Runs git in `dir` and records it in the console log.
 pub fn run<S: AsRef<OsStr>>(dir: &str, args: &[S]) -> Result<String, CoreError> {
-    let started = Instant::now();
-    let line = console::shell_line("git", args);
-    let output = Command::new("git").args(args).current_dir(dir).output();
-    let output = match output {
-        Ok(output) => output,
-        Err(error) => {
-            console::record(dir, line, false, started, error.to_string());
-            return Err(CoreError::new(error));
-        }
-    };
-    if !output.status.success() {
-        let mut error = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        if error.is_empty() {
-            error = format!("{line} failed with {}", output.status);
-        }
-        console::record(dir, line, false, started, error.clone());
-        return Err(CoreError::new(error));
-    }
-    console::record(dir, line, true, started, String::new());
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    run_with_env(dir, args, None, &[])
 }
 
 /// Fetches every remote, dropping remote branches deleted there when
@@ -53,13 +34,13 @@ pub fn fetch(repo: &str, prune: bool) -> Result<(), CoreError> {
     if prune {
         args.push("--prune");
     }
-    run_with_env(repo, &args, "", &[("GIT_TERMINAL_PROMPT", "0")]).map(|_| ())
+    run_with_env(repo, &args, None, &[("GIT_TERMINAL_PROMPT", "0")]).map(|_| ())
 }
 
 /// Runs a git command that talks to a remote, such as `pull --rebase`, in
 /// `path`. As with [`fetch`], git asks no password.
 pub fn remote(path: &str, args: &[&str]) -> Result<(), CoreError> {
-    run_with_env(path, args, "", &[("GIT_TERMINAL_PROMPT", "0")]).map(|_| ())
+    run_with_env(path, args, None, &[("GIT_TERMINAL_PROMPT", "0")]).map(|_| ())
 }
 
 /// Pushes the branch checked out in `path` with `options`, to `to` or else
@@ -102,14 +83,14 @@ pub fn push(path: &str, to: Option<&str>, options: &[&str]) -> Result<(), CoreEr
 
 /// Runs git with `input` on its standard input, recorded like [`run`].
 fn run_with_input(dir: &str, args: &[&str], input: &str) -> Result<String, CoreError> {
-    run_with_env(dir, args, input, &[])
+    run_with_env(dir, args, Some(input), &[])
 }
 
-/// Runs git with `input` on stdin and extra environment variables.
-fn run_with_env(
+/// Runs git with `input`, if any, on stdin and extra environment variables.
+fn run_with_env<S: AsRef<OsStr>>(
     dir: &str,
-    args: &[&str],
-    input: &str,
+    args: &[S],
+    input: Option<&str>,
     env: &[(&str, &str)],
 ) -> Result<String, CoreError> {
     use std::io::Write;
@@ -117,16 +98,21 @@ fn run_with_env(
 
     let started = Instant::now();
     let line = console::shell_line("git", args);
+    // File names are paths, never patterns: `a*` names that one file.
     let spawned = Command::new("git")
         .args(args)
+        .env("GIT_LITERAL_PATHSPECS", "1")
         .envs(env.iter().copied())
         .current_dir(dir)
-        .stdin(Stdio::piped())
+        .stdin(match input {
+            Some(_) => Stdio::piped(),
+            None => Stdio::null(),
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn();
     let output = spawned.and_then(|mut child| {
-        if let Some(mut stdin) = child.stdin.take() {
+        if let (Some(mut stdin), Some(input)) = (child.stdin.take(), input) {
             stdin.write_all(input.as_bytes())?;
         }
         child.wait_with_output()
@@ -162,16 +148,7 @@ pub fn worktree_status(path: &str) -> Result<WorktreeStatus, CoreError> {
         staged: parse_raw(&staged, None),
         unstaged: parse_raw(&unstaged, Some(path)),
     };
-    status
-        .unstaged
-        .extend(untracked(path)?.into_iter().map(|file| ChangedFile {
-            status: "A".to_string(),
-            old_path: None,
-            new_path: Some(file),
-            old_id: NULL_ID.to_string(),
-            new_id: NULL_ID.to_string(),
-            worktree: Some(path.to_string()),
-        }));
+    status.unstaged.extend(untracked_files(path)?);
     Ok(status)
 }
 
@@ -201,11 +178,7 @@ pub fn stage_lines(
 ) -> Result<(), CoreError> {
     let (old, new) = read_blobs(repo_path, file)?;
     let (old, new) = (String::from_utf8_lossy(&old), String::from_utf8_lossy(&new));
-    let path = file
-        .new_path
-        .as_deref()
-        .or(file.old_path.as_deref())
-        .unwrap_or_default();
+    let path = file.path();
     // A new file needs an entry in the index before lines can go into it.
     let untracked = file.worktree.is_some() && file.status == "A" && file.old_id == NULL_ID;
     if untracked && !unstage {
@@ -223,19 +196,22 @@ pub fn stage_lines(
 }
 
 /// Throws away a worktree's unstaged changes to files: tracked ones go back
-/// to what is staged, untracked ones are deleted.
+/// to what is staged, new ones are deleted, as `git add -N` left them too.
 pub fn discard(path: &str, files: &[ChangedFile]) -> Result<(), CoreError> {
     for file in files {
-        let name = file
-            .new_path
-            .as_deref()
-            .or(file.old_path.as_deref())
-            .unwrap_or_default();
+        let name = file.path();
         let untracked = file.status == "A" && file.old_id == NULL_ID;
-        match untracked {
-            true => run(path, &["clean", "-f", "-q", "--", name])?,
-            false => run(path, &["restore", "--worktree", "--", name])?,
-        };
+        if untracked {
+            // An intent-to-add entry in the index would keep the file from
+            // `git clean`, and so would an ignore rule once it is out: `-x`.
+            run(
+                path,
+                &["rm", "--cached", "-q", "--ignore-unmatch", "--", name],
+            )?;
+            run(path, &["clean", "-f", "-x", "-q", "--", name])?;
+        } else {
+            run(path, &["restore", "--worktree", "--", name])?;
+        }
     }
     Ok(())
 }
@@ -251,11 +227,7 @@ pub fn discard_lines(
 ) -> Result<(), CoreError> {
     let (old, new) = read_blobs(repo_path, file)?;
     let (old, new) = (String::from_utf8_lossy(&old), String::from_utf8_lossy(&new));
-    let path = file
-        .new_path
-        .as_deref()
-        .or(file.old_path.as_deref())
-        .unwrap_or_default();
+    let path = file.path();
     match patch::partial(path, &old, &new, removed, added) {
         Some(patch) => run_with_input(worktree, &["apply", "-R", "-"], &patch).map(drop),
         None => Ok(()),
@@ -341,8 +313,8 @@ pub fn head_message(path: &str) -> Result<String, CoreError> {
         .to_string())
 }
 
-/// Rewrites the message of a worktree's latest commit, leaving staged
-/// changes out of it.
+/// Rewrites the message of a commit in a worktree's history, copying the
+/// commits after it; staged changes stay out of them.
 pub fn reword(path: &str, commit: &str, message: &str) -> Result<(), CoreError> {
     let head = run(path, &["rev-parse", "HEAD"])?.trim().to_string();
     let base = run(path, &["merge-base", commit, &head])?;
@@ -413,7 +385,9 @@ fn copy_commit(
         ("GIT_AUTHOR_EMAIL", email),
         ("GIT_AUTHOR_DATE", date),
     ];
-    Ok(run_with_env(path, &args, message, &env)?.trim().to_string())
+    Ok(run_with_env(path, &args, Some(message), &env)?
+        .trim()
+        .to_string())
 }
 
 pub fn empty_tree(repo_path: &str) -> Result<String, CoreError> {
@@ -451,6 +425,7 @@ pub fn parse_log(raw: &str) -> Vec<(Commit, Vec<String>)> {
         .collect()
 }
 
+/// Commits in `base..tip`, newest first; `None` reaches back to the root.
 pub fn range_commits(
     repo_path: &str,
     base: Option<&str>,
@@ -471,8 +446,6 @@ pub fn range_commits(
         .collect())
 }
 
-/// Files changed from `base` (`None` is the empty tree) to `tip`. A worktree tip
-/// includes its uncommitted and untracked files.
 /// The files a range changes, with how much, as `git diff --stat` puts it.
 pub fn diff_stat(repo_path: &str, base: Option<&str>, tip: &Revision) -> Result<String, CoreError> {
     let base = match base {
@@ -483,6 +456,8 @@ pub fn diff_stat(repo_path: &str, base: Option<&str>, tip: &Revision) -> Result<
     run(dir, &["diff", "--stat=100", &base, rev])
 }
 
+/// Files changed from `base` (`None` is the empty tree) to `tip`. A worktree tip
+/// includes its uncommitted and untracked files.
 pub fn changed_files(
     repo_path: &str,
     base: Option<&str>,
@@ -503,16 +478,24 @@ pub fn changed_files(
     };
     let mut files = parse_raw(&run(dir, &args)?, worktree);
     if let Some(root) = worktree {
-        files.extend(untracked(root)?.into_iter().map(|path| ChangedFile {
+        files.extend(untracked_files(root)?);
+    }
+    Ok(files)
+}
+
+/// A worktree's untracked files as added ones, read from disk.
+fn untracked_files(worktree: &str) -> Result<Vec<ChangedFile>, CoreError> {
+    Ok(untracked(worktree)?
+        .into_iter()
+        .map(|path| ChangedFile {
             status: "A".to_string(),
             old_path: None,
             new_path: Some(path),
             old_id: NULL_ID.to_string(),
             new_id: NULL_ID.to_string(),
-            worktree: Some(root.to_string()),
-        }));
-    }
-    Ok(files)
+            worktree: Some(worktree.to_string()),
+        })
+        .collect())
 }
 
 pub fn untracked(worktree: &str) -> Result<Vec<String>, CoreError> {

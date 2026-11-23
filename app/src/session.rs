@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex};
@@ -14,8 +13,7 @@ type Tabs = (usize, Vec<String>);
 static OPEN: LazyLock<Mutex<(HashMap<WindowId, Tabs>, String)>> = LazyLock::new(Mutex::default);
 
 fn file() -> PathBuf {
-    let home = env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join("Library/Application Support/wtf/session")
+    crate::recent::support_file("session")
 }
 
 /// The windows open when wtf last quit: each with its active tab and its

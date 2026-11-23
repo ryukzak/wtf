@@ -1,4 +1,3 @@
-use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{LazyLock, RwLock};
@@ -8,6 +7,8 @@ use gpui::{
     TitlebarOptions, Window, WindowBounds, WindowHandle, WindowOptions, div, prelude::*, px, size,
 };
 
+use crate::repo_view::type_key;
+use crate::sync;
 use crate::theme::{Appearance, Theme};
 use crate::workspace::{CloseTab, CloseWindow};
 
@@ -45,6 +46,7 @@ impl Default for GraphStyle {
 
 #[derive(Clone, PartialEq, Debug)]
 struct Settings {
+    appearance: Appearance,
     /// The interface font; `.SystemUIFont` is macOS's own.
     ui_font: SharedString,
     code_font: SharedString,
@@ -72,9 +74,30 @@ struct Settings {
     push_option: usize,
 }
 
+impl Settings {
+    /// Keeps numbers in the ranges Settings offers.
+    fn clamp(&mut self) {
+        self.ui_size = self.ui_size.clamp(12., 22.);
+        self.code_size = self.code_size.clamp(9., 24.);
+        self.idle_days = self.idle_days.clamp(1, 365);
+        self.pull_option = self.pull_option.min(sync::PULL.len() - 1);
+        self.push_option = self.push_option.min(sync::PUSH.len() - 1);
+        let graph = &mut self.graph;
+        graph.row_height = graph.row_height.clamp(16., 48.);
+        graph.column = graph.column.clamp(32., 160.);
+        graph.bead_spacing = graph.bead_spacing.clamp(4., 16.);
+        graph.beads = graph.beads.clamp(5, 200);
+        graph.dot = graph.dot.clamp(6., 18.);
+        graph.line = graph.line.clamp(1., 4.);
+        graph.hover_line = graph.hover_line.clamp(2., 8.);
+        graph.curve = graph.curve.clamp(8., 64.);
+    }
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            appearance: Appearance::System,
             ui_font: SYSTEM_FONT.into(),
             code_font: "Menlo".into(),
             code_size: 12.,
@@ -135,12 +158,13 @@ pub fn sync_badges() -> bool {
     read().sync_badges
 }
 
-pub fn pull_option() -> usize {
-    read().pull_option
-}
-
-pub fn push_option() -> usize {
-    read().push_option
+/// The option the Pull (`false`) or Push (`true`) button runs.
+pub fn sync_option(push: bool) -> usize {
+    let settings = read();
+    match push {
+        true => settings.push_option,
+        false => settings.pull_option,
+    }
 }
 
 /// Makes an option what the Pull or Push button runs.
@@ -169,6 +193,10 @@ pub fn decide_summaries(available: bool, cx: &mut App) {
     }
 }
 
+pub fn appearance() -> Appearance {
+    read().appearance
+}
+
 pub fn summary_prompt() -> String {
     read()
         .summary_prompt
@@ -190,36 +218,37 @@ pub fn summaries_decided() -> bool {
 /// macOS's interface font, offered as "System".
 const SYSTEM_FONT: &str = ".SystemUIFont";
 
+const ON_OFF: &[(&str, bool)] = &[("On", true), ("Off", false)];
+
 fn on_off(on: bool) -> &'static str {
     if on { "on" } else { "off" }
 }
 
 fn file() -> PathBuf {
-    let home = env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join("Library/Application Support/wtf/settings")
+    crate::recent::support_file("settings")
 }
 
 /// Applies the saved preferences; missing or unreadable ones keep defaults.
 pub fn load() {
-    let (settings, appearance) = parse(&fs::read_to_string(file()).unwrap_or_default());
-    appearance.set();
+    let settings = parse(&fs::read_to_string(file()).unwrap_or_default());
     *SETTINGS.write().unwrap_or_else(|error| error.into_inner()) = settings;
 }
 
 /// Reads `key=value` lines; unknown keys and bad values keep defaults.
-fn parse(text: &str) -> (Settings, Appearance) {
+fn parse(text: &str) -> Settings {
     let mut settings = Settings::default();
-    let mut appearance = Appearance::System;
     for line in text.lines() {
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
+        // Prompts keep their spaces; other values are trimmed.
+        let raw = value;
         let value = value.trim();
-        let number = value.parse::<f32>().ok();
+        let number = value.parse::<f32>().ok().filter(|n| n.is_finite());
         let graph = &mut settings.graph;
         match (key.trim(), number) {
             ("appearance", _) => {
-                appearance = match value {
+                settings.appearance = match value {
                     "light" => Appearance::Light,
                     "dark" => Appearance::Dark,
                     _ => Appearance::System,
@@ -236,9 +265,8 @@ fn parse(text: &str) -> (Settings, Appearance) {
             ("sync_badges", _) => settings.sync_badges = value == "on",
             ("pull_option", Some(n)) => settings.pull_option = n as usize,
             ("push_option", Some(n)) => settings.push_option = n as usize,
-            // Prompts keep their lines as `\n`.
-            ("summary_prompt", _) => settings.summary_prompt = Some(value.replace("\\n", "\n")),
-            ("message_prompt", _) => settings.message_prompt = Some(value.replace("\\n", "\n")),
+            ("summary_prompt", _) => settings.summary_prompt = Some(unescape(raw)),
+            ("message_prompt", _) => settings.message_prompt = Some(unescape(raw)),
             ("graph.row_height", Some(n)) => graph.row_height = n,
             ("graph.column", Some(n)) => graph.column = n,
             ("graph.bead_spacing", Some(n)) => graph.bead_spacing = n,
@@ -250,11 +278,38 @@ fn parse(text: &str) -> (Settings, Appearance) {
             _ => {}
         }
     }
-    (settings, appearance)
+    // A hand-edited file may hold numbers Settings never offers.
+    settings.clamp();
+    settings
 }
 
-fn format(settings: &Settings, appearance: Appearance) -> String {
-    let appearance = match appearance {
+/// A prompt on one line: line breaks as `\n`, backslashes as `\\`.
+fn escape(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('\n', "\\n")
+}
+
+/// Reads [`escape`]d text back; a backslash before anything else stays.
+fn unescape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (c, chars.peek()) {
+            ('\\', Some('n')) => {
+                chars.next();
+                out.push('\n');
+            }
+            ('\\', Some('\\')) => {
+                chars.next();
+                out.push('\\');
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn format(settings: &Settings) -> String {
+    let appearance = match settings.appearance {
         Appearance::System => "system",
         Appearance::Light => "light",
         Appearance::Dark => "dark",
@@ -277,12 +332,14 @@ fn format(settings: &Settings, appearance: Appearance) -> String {
             Some(false) => "summaries=off".to_string(),
             None => String::new(),
         },
-        settings.summary_prompt.as_ref().map_or(String::new(), |p| {
-            format!("summary_prompt={}", p.replace('\n', "\\n"))
-        }),
-        settings.message_prompt.as_ref().map_or(String::new(), |p| {
-            format!("message_prompt={}", p.replace('\n', "\\n"))
-        }),
+        settings
+            .summary_prompt
+            .as_ref()
+            .map_or(String::new(), |p| format!("summary_prompt={}", escape(p))),
+        settings
+            .message_prompt
+            .as_ref()
+            .map_or(String::new(), |p| format!("message_prompt={}", escape(p))),
         format!("graph.row_height={}", g.row_height),
         format!("graph.column={}", g.column),
         format!("graph.bead_spacing={}", g.bead_spacing),
@@ -302,7 +359,7 @@ fn format(settings: &Settings, appearance: Appearance) -> String {
 /// Saves the preferences. Failing to save only loses them on restart, so
 /// errors are ignored.
 fn save() {
-    let text = format(&read(), Appearance::current());
+    let text = format(&read());
     let file = file();
     if let Some(dir) = file.parent() {
         fs::create_dir_all(dir).ok();
@@ -312,7 +369,10 @@ fn save() {
 
 /// Changes the settings, saves them and redraws every window.
 fn change(update: impl FnOnce(&mut Settings), cx: &mut App) {
-    update(&mut SETTINGS.write().unwrap_or_else(|error| error.into_inner()));
+    let mut settings = SETTINGS.write().unwrap_or_else(|error| error.into_inner());
+    update(&mut settings);
+    settings.clamp();
+    drop(settings);
     save();
     cx.refresh_windows();
 }
@@ -322,30 +382,41 @@ struct PreferencesWindow(Option<WindowHandle<Preferences>>);
 
 impl Global for PreferencesWindow {}
 
-pub fn open(cx: &mut App) {
-    let existing = cx
-        .try_global::<PreferencesWindow>()
-        .and_then(|window| window.0);
-    if let Some(handle) = existing
-        && handle
+/// Brings a window of the app's own, such as Settings, to the front; false
+/// when it is not open.
+pub fn bring_forward<V: 'static>(handle: Option<WindowHandle<V>>, cx: &mut App) -> bool {
+    handle.is_some_and(|handle| {
+        handle
             .update(cx, |_, window, _| window.activate_window())
             .is_ok()
-    {
-        return;
-    }
-    let options = WindowOptions {
+    })
+}
+
+/// A small fixed-size window of the app's own, centred.
+pub fn panel_options(title: &'static str, width: f32, height: f32, cx: &App) -> WindowOptions {
+    WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
             None,
-            size(px(600.), px(480.)),
+            size(px(width), px(height)),
             cx,
         ))),
         titlebar: Some(TitlebarOptions {
-            title: Some("Settings".into()),
+            title: Some(title.into()),
             ..Default::default()
         }),
         is_resizable: false,
         ..Default::default()
-    };
+    }
+}
+
+pub fn open(cx: &mut App) {
+    let existing = cx
+        .try_global::<PreferencesWindow>()
+        .and_then(|window| window.0);
+    if bring_forward(existing, cx) {
+        return;
+    }
+    let options = panel_options("Settings", 600., 480., cx);
     let opened = cx.open_window(options, |window, cx| {
         cx.new(|cx| {
             let focus = cx.focus_handle();
@@ -383,6 +454,30 @@ pub struct Preferences {
 enum PromptSetting {
     Summary,
     Message,
+}
+
+impl PromptSetting {
+    /// The prompt as the model is told it.
+    fn text(self) -> String {
+        match self {
+            PromptSetting::Summary => summary_prompt(),
+            PromptSetting::Message => message_prompt(),
+        }
+    }
+
+    /// Sets a custom prompt, or with `None` goes back to the built-in one,
+    /// as typing the built-in text back does.
+    fn set(self, settings: &mut Settings, text: Option<String>) {
+        let built_in = match self {
+            PromptSetting::Summary => wtf_core::SUMMARY_PROMPT,
+            PromptSetting::Message => wtf_core::MESSAGE_PROMPT,
+        };
+        let text = text.filter(|text| text != built_in);
+        match self {
+            PromptSetting::Summary => settings.summary_prompt = text,
+            PromptSetting::Message => settings.message_prompt = text,
+        }
+    }
 }
 
 /// The settings window's sections, in sidebar order.
@@ -441,14 +536,62 @@ fn installed_fonts(window: &Window, cx: &App) -> Vec<(String, bool)> {
         .collect()
 }
 
+/// A row's label width and the gap after it; notes under a row start there.
+const LABEL_WIDTH: f32 = 150.;
+const LABEL_GAP: f32 = 12.;
+
 /// A labeled row of the settings window.
 fn row(label: &'static str, theme: &Theme) -> gpui::Div {
     div()
         .flex()
         .items_center()
-        .gap(px(12.))
+        .gap(px(LABEL_GAP))
         .h(px(26.))
-        .child(div().w(px(150.)).text_color(theme.secondary).child(label))
+        .child(
+            div()
+                .w(px(LABEL_WIDTH))
+                .text_color(theme.secondary)
+                .child(label),
+        )
+}
+
+/// A note under a row, lined up with its control.
+fn note(text: &'static str, theme: &Theme) -> gpui::Div {
+    div()
+        .pl(px(LABEL_WIDTH + LABEL_GAP))
+        .text_xs()
+        .text_color(theme.secondary)
+        .child(text)
+}
+
+/// A segmented control: a button per option, the `selected` one lit;
+/// clicking one runs `pick` with its value.
+fn segmented<T: Copy + PartialEq + 'static>(
+    id: &'static str,
+    options: &[(&'static str, T)],
+    selected: T,
+    pick: impl Fn(T, &mut App) + Clone + 'static,
+    theme: &Theme,
+) -> gpui::Div {
+    let buttons = options.iter().map(|&(label, value)| {
+        let pick = pick.clone();
+        div()
+            .id(SharedString::from(format!("{id}-{label}")))
+            .px(px(14.))
+            .py(px(3.))
+            .rounded(px(4.))
+            .when(selected == value, |button| button.bg(theme.selection))
+            .cursor_pointer()
+            .on_click(move |_, _, cx| pick(value, cx))
+            .child(label)
+    });
+    div()
+        .flex()
+        .p(px(2.))
+        .rounded(px(6.))
+        .border_1()
+        .border_color(theme.separator)
+        .children(buttons)
 }
 
 fn small_button(id: SharedString, label: &'static str, theme: &Theme) -> Stateful<gpui::Div> {
@@ -515,17 +658,7 @@ impl Preferences {
                 self.font_menu = None;
                 self.font_query.clear();
             }
-            "backspace" => {
-                self.font_query.pop();
-            }
-            _ if !keystroke.modifiers.platform && !keystroke.modifiers.control => {
-                match &keystroke.key_char {
-                    Some(text) if !text.chars().any(char::is_control) => {
-                        self.font_query.push_str(text)
-                    }
-                    _ => return,
-                }
-            }
+            _ if type_key(&mut self.font_query, keystroke, true, cx) => {}
             _ => return,
         }
         cx.stop_propagation();
@@ -578,17 +711,7 @@ impl Preferences {
                                 .text_color(theme.accent)
                                 .cursor_pointer()
                                 .on_click(cx.listener(move |_, _, _, cx| {
-                                    change(
-                                        |settings| match setting {
-                                            PromptSetting::Summary => {
-                                                settings.summary_prompt = None
-                                            }
-                                            PromptSetting::Message => {
-                                                settings.message_prompt = None
-                                            }
-                                        },
-                                        cx,
-                                    )
+                                    change(|settings| setting.set(settings, None), cx)
                                 }))
                                 .child("Reset to built-in"),
                         )
@@ -599,42 +722,12 @@ impl Preferences {
                     .id(SharedString::from(format!("{label}-field")))
                     .track_focus(focus)
                     .on_key_down(cx.listener(move |_, event: &KeyDownEvent, _, cx| {
-                        let keystroke = &event.keystroke;
-                        let mut text = match setting {
-                            PromptSetting::Summary => summary_prompt(),
-                            PromptSetting::Message => message_prompt(),
-                        };
-                        let modifiers = keystroke.modifiers;
-                        match keystroke.key.as_str() {
-                            "enter" if !modifiers.platform => text.push('\n'),
-                            "backspace" => {
-                                text.pop();
-                            }
-                            "v" if modifiers.platform => {
-                                if let Some(pasted) =
-                                    cx.read_from_clipboard().and_then(|item| item.text())
-                                {
-                                    text.push_str(&pasted);
-                                }
-                            }
-                            _ if !modifiers.platform && !modifiers.control => {
-                                match &keystroke.key_char {
-                                    Some(typed) if !typed.chars().any(char::is_control) => {
-                                        text.push_str(typed)
-                                    }
-                                    _ => return,
-                                }
-                            }
-                            _ => return,
+                        let mut text = setting.text();
+                        if !type_key(&mut text, &event.keystroke, false, cx) {
+                            return;
                         }
                         cx.stop_propagation();
-                        change(
-                            |settings| match setting {
-                                PromptSetting::Summary => settings.summary_prompt = Some(text),
-                                PromptSetting::Message => settings.message_prompt = Some(text),
-                            },
-                            cx,
-                        );
+                        change(|settings| setting.set(settings, Some(text)), cx);
                     }))
                     .w_full()
                     .min_h(px(64.))
@@ -807,40 +900,30 @@ impl Render for Preferences {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         window.set_rem_size(px(ui_size()));
         let theme = Theme::for_appearance(window.appearance());
-        let current = Appearance::current();
         let settings = read().clone();
+        let current = settings.appearance;
         let graph = settings.graph;
-        let choice = |label: &'static str, appearance: Appearance| {
-            div()
-                .id(label)
-                .px(px(14.))
-                .py(px(3.))
-                .rounded(px(4.))
-                .when(current == appearance, |button| button.bg(theme.selection))
-                .cursor_pointer()
-                .on_click(cx.listener(move |_, _, _, cx| {
-                    appearance.set();
-                    save();
-                    cx.refresh_windows();
-                }))
-                .child(label)
-        };
-        let clamp = |value: f32, low: f32, high: f32| value.clamp(low, high);
 
         let content = match self.section {
-            Section::Appearance => div().flex().flex_col().gap(px(4.)).child(
-                row("Theme", &theme).child(
-                    div()
-                        .flex()
-                        .p(px(2.))
-                        .rounded(px(6.))
-                        .border_1()
-                        .border_color(theme.separator)
-                        .child(choice("System", Appearance::System))
-                        .child(choice("Light", Appearance::Light))
-                        .child(choice("Dark", Appearance::Dark)),
-                ),
-            ),
+            Section::Appearance => {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.))
+                    .child(row("Theme", &theme).child(segmented(
+                        "theme",
+                        &[
+                            ("System", Appearance::System),
+                            ("Light", Appearance::Light),
+                            ("Dark", Appearance::Dark),
+                        ],
+                        current,
+                        |appearance: Appearance, cx| {
+                            change(|settings| settings.appearance = appearance, cx)
+                        },
+                        &theme,
+                    )))
+            }
             Section::Fonts => div()
                 .flex()
                 .flex_col()
@@ -854,7 +937,7 @@ impl Render for Preferences {
                 .child(row("Interface size", &theme).child(self.stepper(
                     "ui",
                     format!("{}", settings.ui_size),
-                    move |s, d| s.ui_size = clamp(s.ui_size + d, 12., 22.),
+                    move |s, d| s.ui_size += d,
                     &theme,
                     cx,
                 )))
@@ -867,51 +950,28 @@ impl Render for Preferences {
                 .child(row("Code size", &theme).child(self.stepper(
                     "code",
                     format!("{}", settings.code_size),
-                    move |s, d| s.code_size = clamp(s.code_size + d, 9., 24.),
+                    move |s, d| s.code_size += d,
                     &theme,
                     cx,
                 ))),
             Section::Review => {
                 let on = settings.summaries == Some(true);
-                let switch = |label: &'static str, value: bool| {
-                    div()
-                        .id(label)
-                        .px(px(14.))
-                        .py(px(3.))
-                        .rounded(px(4.))
-                        .when(on == value, |button| button.bg(theme.selection))
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            change(|settings| settings.summaries = Some(value), cx)
-                        }))
-                        .child(label)
-                };
                 div()
                     .flex()
                     .flex_col()
                     .gap(px(4.))
-                    .child(
-                        row("Commit summaries", &theme).child(
-                            div()
-                                .flex()
-                                .p(px(2.))
-                                .rounded(px(6.))
-                                .border_1()
-                                .border_color(theme.separator)
-                                .child(switch("On", true))
-                                .child(switch("Off", false)),
-                        ),
-                    )
-                    .child(
-                        div()
-                            .pl(px(162.))
-                            .text_xs()
-                            .text_color(theme.secondary)
-                            .child(
-                                "Several selected commits are summarized by Apple's on-device \
-                             model, through the fm command. Nothing leaves this Mac.",
-                            ),
-                    )
+                    .child(row("Commit summaries", &theme).child(segmented(
+                        "summaries",
+                        ON_OFF,
+                        on,
+                        |on, cx| change(|settings| settings.summaries = Some(on), cx),
+                        &theme,
+                    )))
+                    .child(note(
+                        "Several selected commits are summarized by Apple's on-device \
+                         model, through the fm command. Nothing leaves this Mac.",
+                        &theme,
+                    ))
                     .child(self.prompt_field(PromptSetting::Summary, &theme, window, cx))
                     .child(self.prompt_field(PromptSetting::Message, &theme, window, cx))
             }
@@ -935,27 +995,8 @@ impl Render for Preferences {
                     cx,
                 ));
                 let switch = |id: &'static str, on: bool, set: fn(&mut Settings, bool)| {
-                    let option = |label: &'static str, value: bool| {
-                        div()
-                            .id(SharedString::from(format!("{id}-{label}")))
-                            .px(px(14.))
-                            .py(px(3.))
-                            .rounded(px(4.))
-                            .when(on == value, |button| button.bg(theme.selection))
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |_, _, _, cx| {
-                                change(|settings| set(settings, value), cx)
-                            }))
-                            .child(label)
-                    };
-                    div()
-                        .flex()
-                        .p(px(2.))
-                        .rounded(px(6.))
-                        .border_1()
-                        .border_color(theme.separator)
-                        .child(option("On", true))
-                        .child(option("Off", false))
+                    let pick = move |on, cx: &mut App| change(|settings| set(settings, on), cx);
+                    segmented(id, ON_OFF, on, pick, &theme)
                 };
                 div()
                     .flex()
@@ -972,16 +1013,11 @@ impl Render for Preferences {
                         settings.sync_badges,
                         |s, on| s.sync_badges = on,
                     )))
-                    .child(
-                        div()
-                            .pl(px(162.))
-                            .text_xs()
-                            .text_color(theme.secondary)
-                            .child(
-                                "Fetches every remote. Pruning drops remote branches deleted \
-                                 there, so local ones tracking them read as remote gone.",
-                            ),
-                    )
+                    .child(note(
+                        "Fetches every remote. Pruning drops remote branches deleted there, \
+                         so local ones tracking them read as remote gone.",
+                        &theme,
+                    ))
             }
             Section::Graph => div()
                 .flex()
@@ -990,65 +1026,63 @@ impl Render for Preferences {
                 .child(row("Row height", &theme).child(self.stepper(
                     "row",
                     format!("{}", graph.row_height),
-                    move |s, d| s.graph.row_height = clamp(s.graph.row_height + 2. * d, 16., 48.),
+                    move |s, d| s.graph.row_height += 2. * d,
                     &theme,
                     cx,
                 )))
                 .child(row("Node spacing", &theme).child(self.stepper(
                     "column",
                     format!("{}", graph.column),
-                    move |s, d| s.graph.column = clamp(s.graph.column + 8. * d, 32., 160.),
+                    move |s, d| s.graph.column += 8. * d,
                     &theme,
                     cx,
                 )))
                 .child(row("Bead spacing", &theme).child(self.stepper(
                     "bead",
                     format!("{}", graph.bead_spacing),
-                    move |s, d| s.graph.bead_spacing = clamp(s.graph.bead_spacing + d, 4., 16.),
+                    move |s, d| s.graph.bead_spacing += d,
                     &theme,
                     cx,
                 )))
                 .child(row("Beads per node", &theme).child(self.stepper(
                     "beads",
                     format!("{}", graph.beads),
-                    move |s, d| {
-                        s.graph.beads = clamp(s.graph.beads as f32 + 5. * d, 5., 200.) as usize
-                    },
+                    move |s, d| s.graph.beads = (s.graph.beads as f32 + 5. * d) as usize,
                     &theme,
                     cx,
                 )))
                 .child(row("Dot size", &theme).child(self.stepper(
                     "dot",
                     format!("{}", graph.dot),
-                    move |s, d| s.graph.dot = clamp(s.graph.dot + 2. * d, 6., 18.),
+                    move |s, d| s.graph.dot += 2. * d,
                     &theme,
                     cx,
                 )))
                 .child(row("Line width", &theme).child(self.stepper(
                     "line",
                     format!("{}", graph.line),
-                    move |s, d| s.graph.line = clamp(s.graph.line + 0.5 * d, 1., 4.),
+                    move |s, d| s.graph.line += 0.5 * d,
                     &theme,
                     cx,
                 )))
                 .child(row("Hover line width", &theme).child(self.stepper(
                     "hover",
                     format!("{}", graph.hover_line),
-                    move |s, d| s.graph.hover_line = clamp(s.graph.hover_line + d, 2., 8.),
+                    move |s, d| s.graph.hover_line += d,
                     &theme,
                     cx,
                 )))
                 .child(row("Curve length", &theme).child(self.stepper(
                     "curve",
                     format!("{}", graph.curve),
-                    move |s, d| s.graph.curve = clamp(s.graph.curve + 4. * d, 8., 64.),
+                    move |s, d| s.graph.curve += 4. * d,
                     &theme,
                     cx,
                 )))
                 .child(row("Branch idle after", &theme).child(self.stepper(
                     "idle-days",
                     format!("{} days", settings.idle_days),
-                    move |s, d| s.idle_days = clamp(s.idle_days as f32 + d, 1., 365.) as u32,
+                    move |s, d| s.idle_days = (s.idle_days as f32 + d) as u32,
                     &theme,
                     cx,
                 )))
@@ -1059,7 +1093,14 @@ impl Render for Preferences {
                             .text_color(theme.accent)
                             .cursor_pointer()
                             .on_click(cx.listener(|_, _, _, cx| {
-                                change(|settings| settings.graph = GraphStyle::default(), cx)
+                                // Everything in this section, idle days too.
+                                change(
+                                    |settings| {
+                                        settings.graph = GraphStyle::default();
+                                        settings.idle_days = Settings::default().idle_days;
+                                    },
+                                    cx,
+                                )
                             }))
                             .child("Reset graph to defaults"),
                     ),
@@ -1144,6 +1185,7 @@ mod tests {
     fn settings_survive_saving_and_loading() {
         let settings = Settings {
             summary_prompt: Some("Two\nlines".to_string()),
+            message_prompt: Some(" Write \\n, not C:\\dir ".to_string()),
             summaries: Some(true),
             ui_font: "Helvetica".into(),
             code_font: "SF Mono".into(),
@@ -1154,15 +1196,23 @@ mod tests {
             },
             ..Settings::default()
         };
-        let text = format(&settings, Appearance::Dark);
-        assert_eq!(parse(&text), (settings, Appearance::Dark));
+        let text = format(&settings);
+        assert_eq!(parse(&text), settings);
     }
 
     #[test]
     fn unknown_and_bad_lines_keep_defaults() {
-        let (settings, appearance) = parse("graph.dot=big\nnope=1\ncode_size=13\n");
+        let settings = parse("graph.dot=big\nnope=1\ncode_size=13\n");
         assert_eq!(settings.graph.dot, GraphStyle::default().dot);
         assert_eq!(settings.code_size, 13.);
-        assert_eq!(appearance, Appearance::System);
+        assert_eq!(settings.appearance, Appearance::System);
+    }
+
+    #[test]
+    fn numbers_out_of_range_are_clamped() {
+        let settings = parse("ui_size=0\ncode_size=NaN\npush_option=99\n");
+        assert_eq!(settings.ui_size, 12.);
+        assert_eq!(settings.code_size, Settings::default().code_size);
+        assert_eq!(settings.push_option, sync::PUSH.len() - 1);
     }
 }

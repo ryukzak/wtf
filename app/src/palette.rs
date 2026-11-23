@@ -91,8 +91,12 @@ pub fn entries(window: &Window) -> Vec<Entry> {
 
 /// A shortcut as macOS menus write it: `cmd-shift-p` as ⇧⌘P.
 fn symbols(keys: &str) -> String {
-    let mut parts: Vec<&str> = keys.split('-').collect();
-    let key = parts.pop().unwrap_or_default();
+    // `cmd--` binds the minus key itself.
+    let (modifiers, key) = match keys.strip_suffix("--") {
+        Some(modifiers) => (modifiers, "-"),
+        None => keys.rsplit_once('-').unwrap_or(("", keys)),
+    };
+    let parts: Vec<&str> = modifiers.split('-').collect();
     let mut text = String::new();
     for (name, symbol) in [("ctrl", "⌃"), ("alt", "⌥"), ("shift", "⇧"), ("cmd", "⌘")] {
         if parts.contains(&name) {
@@ -103,6 +107,12 @@ fn symbols(keys: &str) -> String {
         "tab" => "⇥".to_string(),
         "enter" => "↩".to_string(),
         "escape" => "⎋".to_string(),
+        "backspace" => "⌫".to_string(),
+        "space" => "Space".to_string(),
+        "up" => "↑".to_string(),
+        "down" => "↓".to_string(),
+        "left" => "←".to_string(),
+        "right" => "→".to_string(),
         key => key.to_uppercase(),
     };
     text + &key
@@ -117,5 +127,8 @@ mod tests {
         assert_eq!(symbols("cmd-shift-p"), "⇧⌘P");
         assert_eq!(symbols("ctrl-tab"), "⌃⇥");
         assert_eq!(symbols("alt-cmd-1"), "⌥⌘1");
+        assert_eq!(symbols("cmd--"), "⌘-");
+        assert_eq!(symbols("shift-up"), "⇧↑");
+        assert_eq!(symbols("f"), "F");
     }
 }

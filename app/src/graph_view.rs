@@ -1,5 +1,3 @@
-use std::path::Path;
-
 use gpui::{
     AnyElement, ClickEvent, Context, Hsla, MouseButton, MouseDownEvent, PathBuilder, Pixels, Point,
     ScrollHandle, SharedString, canvas, div, point, prelude::*, px,
@@ -22,9 +20,7 @@ pub enum WorktreeNames {
 /// differ; detached worktrees only have a folder.
 pub fn worktree_label(node: &GraphNode, names: WorktreeNames) -> String {
     let folder = match &node.tip {
-        Revision::Worktree(path) => Path::new(path)
-            .file_name()
-            .map_or(path.clone(), |name| name.to_string_lossy().into_owned()),
+        Revision::Worktree(path) => crate::workspace::folder_name(path),
         Revision::Commit(_) => String::new(),
     };
     match (names, &node.branch) {
@@ -44,7 +40,7 @@ pub enum WorktreeOrder {
 }
 
 /// What a right-click on a worktree acts on.
-pub fn worktree_target(graph: &WorkflowGraph, index: usize) -> Target {
+fn worktree_target(graph: &WorkflowGraph, index: usize) -> Target {
     let node = &graph.nodes[index];
     let path = match &node.tip {
         Revision::Worktree(path) => path.clone(),
@@ -61,7 +57,7 @@ pub fn worktree_target(graph: &WorkflowGraph, index: usize) -> Target {
 /// Whether a worktree's branch can go with it, and whether the main branch
 /// has merged it: only the main branch's history, if anything, follows its
 /// HEAD; no other branch or worktree grows from it.
-pub fn leaf(graph: &WorkflowGraph, worktree: usize) -> Option<bool> {
+fn leaf(graph: &WorkflowGraph, worktree: usize) -> Option<bool> {
     let head = *graph.nodes[worktree].parents.first()?;
     // A detached worktree has no branch to delete.
     graph.nodes[worktree].branch.as_ref()?;
@@ -94,7 +90,7 @@ pub fn label_target(graph: &WorkflowGraph, name: &str, commit: String) -> Target
 
 /// A branch label's target, with whether the branch can go: nothing but the
 /// main branch's history grows from its node, and whether that has merged it.
-pub fn branch_target(graph: &WorkflowGraph, name: &str, commit: String) -> Target {
+fn branch_target(graph: &WorkflowGraph, name: &str, commit: String) -> Target {
     let node = graph
         .nodes
         .iter()
@@ -113,20 +109,13 @@ fn grows_alone(graph: &WorkflowGraph, head: usize, except: usize) -> Option<bool
     if graph.main_node == Some(head) {
         return None;
     }
-    // The main branch's history, by walking back from its tip.
-    let mut main = std::collections::HashSet::new();
-    let mut stack: Vec<usize> = graph.main_node.into_iter().collect();
-    while let Some(node) = stack.pop() {
-        if main.insert(node) {
-            stack.extend(&graph.nodes[node].parents);
-        }
-    }
+    let on_main = |i: usize| graph.on_main.get(i).copied().unwrap_or(false);
     let others_grow = graph
         .nodes
         .iter()
         .enumerate()
-        .any(|(i, node)| i != except && node.parents.contains(&head) && !main.contains(&i));
-    (!others_grow).then(|| main.contains(&head))
+        .any(|(i, node)| i != except && node.parents.contains(&head) && !on_main(i));
+    (!others_grow).then(|| on_main(head))
 }
 
 /// The graph's look, from Settings.
@@ -223,9 +212,10 @@ pub struct StashPlace {
 pub fn layout(graph: &WorkflowGraph, order: WorktreeOrder) -> Layout {
     let mut xs = topological(graph);
 
-    // Worktrees sit as squares right after the node of their HEAD commit when
-    // nothing follows it; otherwise later commits or a merge rail are in the
-    // way, so they branch off to rows of their own.
+    // A clean worktree is a frame around its HEAD commit. A changed one is a
+    // square right after that commit when nothing follows it; otherwise later
+    // commits or a merge rail are in the way, so it branches off to a row of
+    // its own.
     let mut followed = vec![false; graph.nodes.len()];
     for node in graph
         .nodes
@@ -236,8 +226,8 @@ pub fn layout(graph: &WorkflowGraph, order: WorktreeOrder) -> Layout {
             followed[p] = true;
         }
     }
-    // A clean one there is the frame around its commit, and its lead runs on
-    // the commit's own row, from the commit's labels straight to the list.
+    // A frame's lead runs on the commit's own row, from the commit's labels
+    // straight to the list.
     let mut worktrees = vec![Vec::new(); graph.nodes.len()];
     let mut detached = Vec::new();
     let mut framed = Vec::new();
@@ -246,13 +236,14 @@ pub fn layout(graph: &WorkflowGraph, order: WorktreeOrder) -> Layout {
             continue;
         }
         let parent = node.parents[0];
-        // At a tip, the first worktree follows the commit on its row; any
-        // more get rows of their own, so no two sit in one row.
-        if !followed[parent] && worktrees[parent].is_empty() {
-            worktrees[parent].push(i);
-        } else if followed[parent] && (node.added, node.removed) == (0, 0) {
+        // A clean one is always the frame, as `render` draws it. Of changed
+        // ones at a tip, the first follows the commit on its row; any more
+        // get rows of their own, so no two sit in one row.
+        if (node.added, node.removed) == (0, 0) {
             xs[i] = xs[parent];
             framed.push(i);
+        } else if !followed[parent] && worktrees[parent].is_empty() {
+            worktrees[parent].push(i);
         } else {
             let x = xs[parent].1 + DETACHED_OFFSET;
             xs[i] = (x, x);
@@ -305,6 +296,16 @@ pub fn layout(graph: &WorkflowGraph, order: WorktreeOrder) -> Layout {
         graph.lane_count + detached.iter().position(|&w| w == worktree).unwrap_or(0)
     };
     let stash_lane = |k: usize| graph.lane_count + detached.len() + k;
+    // The layout lane whose row a node sits in: a worktree's commit's, or
+    // one of its own when detached.
+    let lane_row = |i: usize| {
+        let node = &graph.nodes[i];
+        match node.kind {
+            NodeKind::Uncommitted if detached.contains(&i) => own_lane(i),
+            NodeKind::Uncommitted => graph.nodes[node.parents[0]].lane,
+            _ => node.lane,
+        }
+    };
     let mut spans: Vec<Option<(f32, f32)>> = vec![None; lane_count];
     let widen = |spans: &mut Vec<Option<(f32, f32)>>, lane: usize, start: f32, end: f32| {
         let span = spans[lane].get_or_insert((start, end));
@@ -389,10 +390,7 @@ pub fn layout(graph: &WorkflowGraph, order: WorktreeOrder) -> Layout {
             continue;
         }
         let parent = &graph.nodes[node.parents[0]];
-        let lane = match detached.contains(&i) {
-            true => own_lane(i),
-            false => parent.lane,
-        };
+        let lane = lane_row(i);
         worktree_lane[lane] = true;
         times[lane].get_or_insert((parent.last_time, parent.last_time));
     }
@@ -469,14 +467,7 @@ pub fn layout(graph: &WorkflowGraph, order: WorktreeOrder) -> Layout {
         .nodes
         .iter()
         .enumerate()
-        .map(|(i, node)| {
-            let lane = match node.kind {
-                NodeKind::Uncommitted if detached.contains(&i) => own_lane(i),
-                NodeKind::Uncommitted => graph.nodes[node.parents[0]].lane,
-                _ => node.lane,
-            };
-            (xs[i].0, xs[i].1, row_y(lane))
-        })
+        .map(|(i, _)| (xs[i].0, xs[i].1, row_y(lane_row(i))))
         .collect();
     let stashes: Vec<StashPlace> = stash_rows
         .into_iter()
@@ -635,10 +626,7 @@ fn labels_width(graph: &WorkflowGraph, node: &GraphNode) -> f32 {
 pub fn stale_note(graph: &WorkflowGraph, name: &str) -> Option<String> {
     let branch = graph.branches.iter().find(|branch| branch.name == name)?;
     let mut reasons = branch.stale.clone();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |time| time.as_secs() as i64);
-    let days = (now - branch.time) / 86_400;
+    let days = (crate::repo_view::now_seconds() - branch.time) / 86_400;
     let live = branch.busy || branch.remote || branch.name == graph.main;
     if !live && branch.time > 0 && days >= i64::from(crate::preferences::idle_days()) {
         reasons.push(format!("idle {days}d"));
@@ -930,24 +918,15 @@ pub fn render(
                         .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                             this.hover_node(i, *hovered, cx)
                         }))
-                        .on_mouse_down(
-                            MouseButton::Right,
-                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                cx.stop_propagation();
-                                this.open_context_menu(target.clone(), event.position, cx);
-                            }),
-                        ),
+                        .on_mouse_down(MouseButton::Right, open_menu(target.clone(), cx)),
                 );
             }
             continue;
         }
         // Commits are dots, or with bars a run of beads. Selected nodes get a ring.
-        let (size, hit) = match (worktree, is_selected) {
-            (true, false) => (symbol(), symbol_step()),
-            (true, true) => (symbol() + 4., symbol_step()),
-            (false, false) => (style().dot, HIT),
-            (false, true) => (style().dot + 4., HIT),
-        };
+        // Only a changed worktree is left here; a clean one was its frame.
+        let hit = if worktree { symbol_step() } else { HIT };
+        let size = style().dot + if is_selected { 4. } else { 0. };
         let shape = if worktree {
             div()
                 .flex()
@@ -966,28 +945,14 @@ pub fn render(
             beads(i, &node.commits, end - start, color, selection, theme, cx)
         } else {
             // A commit is an upright ellipse, as each bead of a bar is.
-            let width = match worktree {
-                true => end - start + size,
-                false => (end - start + size).min(bead_width() * size / style().dot),
-            };
+            let width = (end - start + size).min(bead_width() * size / style().dot);
             div()
                 .w(px(width))
                 .h(px(size))
-                .rounded(px(if worktree { 2. } else { size / 2. }))
-                .map(|shape| match (is_selected, worktree && !dirty) {
-                    (true, hollow) => shape
-                        .bg(if hollow {
-                            theme.graph_background
-                        } else {
-                            color
-                        })
-                        .border_2()
-                        .border_color(theme.accent),
-                    (false, true) => shape
-                        .bg(theme.graph_background)
-                        .border_2()
-                        .border_color(color),
-                    (false, false) => shape.bg(color),
+                .rounded(px(size / 2.))
+                .bg(color)
+                .when(is_selected, |shape| {
+                    shape.border_2().border_color(theme.accent)
                 })
                 // A selected commit the commit list leaves out fades.
                 .when(
@@ -1043,23 +1008,11 @@ pub fn render(
                                 false => format!("{}\n\n{}", commit.summary, commit.body),
                             },
                         };
-                        dot.on_mouse_down(
-                            MouseButton::Right,
-                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                cx.stop_propagation();
-                                this.open_context_menu(target.clone(), event.position, cx);
-                            }),
-                        )
+                        dot.on_mouse_down(MouseButton::Right, open_menu(target.clone(), cx))
                     })
                     .when(worktree, |square| {
                         let target = worktree_target(graph, i);
-                        square.on_mouse_down(
-                            MouseButton::Right,
-                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                cx.stop_propagation();
-                                this.open_context_menu(target.clone(), event.position, cx);
-                            }),
-                        )
+                        square.on_mouse_down(MouseButton::Right, open_menu(target.clone(), cx))
                     })
                     .child(shape),
             );
@@ -1123,13 +1076,7 @@ pub fn render(
                 name: name.clone(),
                 commit: commit.clone(),
             };
-            let label = div()
-                .flex_none()
-                .h(px(TAG_HEIGHT))
-                .flex()
-                .items_center()
-                .px(px(5.))
-                .rounded(px(3.))
+            let label = pill()
                 .bg(theme.git_tag_background)
                 .text_color(theme.git_tag_text)
                 .child(name.clone());
@@ -1235,15 +1182,8 @@ pub fn render(
         let target = Target::Stash {
             name: place.name.clone(),
             id: stash.id.clone(),
-            message: stash.message.clone(),
         };
-        let label = div()
-            .flex_none()
-            .h(px(TAG_HEIGHT))
-            .flex()
-            .items_center()
-            .px(px(5.))
-            .rounded(px(3.))
+        let label = pill()
             .border_1()
             .border_color(if shown { theme.accent } else { theme.secondary })
             .bg(if shown {
@@ -1574,6 +1514,17 @@ fn bead_count(commits: usize, length: f32) -> usize {
     commits.min(fits).max(2)
 }
 
+/// A right-click listener opening `target`'s menu at the mouse.
+fn open_menu(
+    target: Target,
+    cx: &mut Context<RepoView>,
+) -> impl Fn(&MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static {
+    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+        cx.stop_propagation();
+        this.open_context_menu(target.clone(), event.position, cx);
+    })
+}
+
 /// A label that opens its right-click menu.
 fn with_menu(
     label: gpui::Div,
@@ -1583,13 +1534,7 @@ fn with_menu(
 ) -> AnyElement {
     label
         .id(id)
-        .on_mouse_down(
-            MouseButton::Right,
-            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                cx.stop_propagation();
-                this.open_context_menu(target.clone(), event.position, cx);
-            }),
-        )
+        .on_mouse_down(MouseButton::Right, open_menu(target.clone(), cx))
         .into_any_element()
 }
 
@@ -1612,13 +1557,7 @@ fn menu_label(
         .on_hover(
             cx.listener(move |this, hovered: &bool, _, cx| this.hover_node(hover, *hovered, cx)),
         )
-        .on_mouse_down(
-            MouseButton::Right,
-            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                cx.stop_propagation();
-                this.open_context_menu(target.clone(), event.position, cx);
-            }),
-        )
+        .on_mouse_down(MouseButton::Right, open_menu(target.clone(), cx))
         .when(click_menu, |label| {
             label.cursor_pointer().on_mouse_down(
                 MouseButton::Left,
@@ -1632,15 +1571,20 @@ fn menu_label(
         .into_any_element()
 }
 
-fn tag(name: &str, color: Hsla, filled: bool, theme: &Theme) -> gpui::Div {
+/// A label's shape, as git tags, stashes and branches share it.
+fn pill() -> gpui::Div {
     div()
         .flex_none()
         .h(px(TAG_HEIGHT))
         .flex()
         .items_center()
-        .pl(px(6.))
-        .pr(px(5.))
+        .px(px(5.))
         .rounded(px(3.))
+}
+
+fn tag(name: &str, color: Hsla, filled: bool, theme: &Theme) -> gpui::Div {
+    pill()
+        .pl(px(6.))
         .border_l_4()
         .border_color(color)
         .map(|tag| match filled {
@@ -1711,7 +1655,7 @@ mod tests {
 
     fn graph(nodes: Vec<GraphNode>) -> WorkflowGraph {
         let lane_count = nodes.iter().map(|node| node.lane + 1).max().unwrap_or(0);
-        WorkflowGraph {
+        let graph = WorkflowGraph {
             nodes,
             lane_count,
             main_node: Some(0),
@@ -1721,6 +1665,12 @@ mod tests {
             tags: Vec::new(),
             stashes: Vec::new(),
             remotes: Vec::new(),
+            main_worktree: None,
+            on_main: Vec::new(),
+        };
+        WorkflowGraph {
+            on_main: graph.main_history(),
+            ..graph
         }
     }
 
@@ -1876,12 +1826,12 @@ mod tests {
             node.refs
                 .first()
                 .cloned()
-                .unwrap_or_else(|| node.key.chars().take(7).collect())
+                .unwrap_or_else(|| crate::popups::short_hash(&node.key))
         };
         for (i, node) in graph.nodes.iter().enumerate() {
             let (start, end, y) = layout.nodes[i];
             if node.kind == NodeKind::Uncommitted {
-                // A framed worktree is drawn around its commit's own box.
+                // Only worktrees in the list have a tag there.
                 let Some(x) = layout.list_x[i] else {
                     continue;
                 };
@@ -1957,6 +1907,8 @@ mod tests {
         for name in ["first", "second"] {
             let mut worktree = node(0, &[0], 1, 0);
             worktree.kind = NodeKind::Uncommitted;
+            // Changed, so each is a square; clean ones are frames.
+            worktree.added = 1;
             worktree.refs = vec![name.to_string()];
             worktree.branch = Some(name.to_string());
             worktree.tip = Revision::Worktree(format!("/repo/{name}"));
@@ -2025,6 +1977,7 @@ mod tests {
             worktree(3),
         ]);
         graph.main_node = Some(3);
+        graph.on_main = graph.main_history();
         assert_eq!(leaf(&graph, 5), Some(true), "merged into main");
         assert_eq!(leaf(&graph, 6), Some(false), "unmerged, nothing after");
         assert_eq!(leaf(&graph, 7), None, "on the main branch's tip");
@@ -2063,8 +2016,10 @@ mod tests {
     fn the_first_worktree_sits_after_its_commit_and_the_next_one_below() {
         let mut first = node(1, &[0], 1, 0);
         first.kind = NodeKind::Uncommitted;
+        first.added = 1;
         let mut second = node(2, &[0], 1, 0);
         second.kind = NodeKind::Uncommitted;
+        second.added = 1;
         let graph = graph(vec![node(0, &[], 3, 0), first, second]);
         let layout = layout(&graph, WorktreeOrder::LastCommit);
 
@@ -2074,6 +2029,19 @@ mod tests {
         assert!(layout.nodes[1].0 > bar_end);
         assert_eq!(layout.detached, [2]);
         assert!(layout.nodes[2].2 > y, "the next on a row of its own");
+    }
+
+    #[test]
+    fn clean_worktrees_at_a_tip_are_frames_as_drawn() {
+        let clean = |lane: usize| {
+            let mut worktree = node(lane, &[0], 1, 0);
+            worktree.kind = NodeKind::Uncommitted;
+            worktree
+        };
+        let graph = graph(vec![node(0, &[], 3, 0), clean(1), clean(2)]);
+        let layout = layout(&graph, WorktreeOrder::LastCommit);
+        assert!(layout.worktrees[0].is_empty() && layout.detached.is_empty());
+        assert_eq!(layout.framed, [1, 2]);
     }
 
     #[test]

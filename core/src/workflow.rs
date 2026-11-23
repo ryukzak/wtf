@@ -66,9 +66,14 @@ pub struct WorkflowGraph {
     pub stashes: Vec<crate::Stash>,
     /// The repository's remotes, such as `origin`.
     pub remotes: Vec<String>,
+    /// The folder of the main worktree, which git never removes; `None` in
+    /// a bare repository.
+    pub main_worktree: Option<String>,
+    /// Which nodes the main branch's history holds, by node.
+    pub on_main: Vec<bool>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Branch {
     pub name: String,
     /// The commit at its tip.
@@ -120,6 +125,19 @@ impl WorkflowGraph {
         ))
     }
 
+    /// Which nodes the main branch's history holds: its tip's node and every
+    /// node back from it.
+    pub fn main_history(&self) -> Vec<bool> {
+        let mut on_main = vec![false; self.nodes.len()];
+        let mut stack: Vec<usize> = self.main_node.into_iter().collect();
+        while let Some(node) = stack.pop() {
+            if !std::mem::replace(&mut on_main[node], true) {
+                stack.extend(&self.nodes[node].parents);
+            }
+        }
+        on_main
+    }
+
     /// Whether `a` is `b` or one of its ancestors.
     fn is_ancestor(&self, a: usize, b: usize) -> bool {
         let mut stack = vec![b];
@@ -155,7 +173,8 @@ pub fn build(
     history: usize,
     now: i64,
 ) -> Result<WorkflowGraph, CoreError> {
-    let (mut tips, mut branches) = tips(repo_path, attention, now)?;
+    let remotes = remote_names(repo_path)?;
+    let (mut tips, mut branches, main_worktree) = tips(repo_path, attention, now, &remotes)?;
     let base = match octopus_base(repo_path, &tips) {
         Ok(base) => base,
         Err(_) => {
@@ -194,9 +213,7 @@ pub fn build(
         .parse::<usize>()
         .unwrap_or(1)
         .saturating_sub(1);
-    let mut ids: Vec<&str> = tips.iter().map(|tip| tip.id.as_str()).collect();
-    ids.sort_unstable();
-    ids.dedup();
+    let ids = tip_ids(&tips);
 
     // Newest first, with the base last. Before the attention window only the
     // tips' first-parent lines count, so old merges read as plain commits and
@@ -206,10 +223,9 @@ pub fn build(
         .map(|id| id.to_string())
         .chain([format!("^{base}")])
         .collect();
-    let mut log = match attention.window_days {
+    let mut log = match attention.since(now) {
         None => commits(repo_path, &[], &range)?,
-        Some(days) => {
-            let since = now - i64::from(days) * 86_400;
+        Some(since) => {
             let mut log = commits(repo_path, &["--first-parent".to_string()], &range)?;
             let seen: HashSet<String> = log.iter().map(|(commit, _)| commit.id.clone()).collect();
             let recent = commits(repo_path, &[format!("--since=@{since}")], &range)?;
@@ -368,18 +384,29 @@ pub fn build(
         }
     }
 
-    if attention.tags {
-        let format = "--format=%(refname:short)%09%(objectname)%09%(*objectname)";
-        for line in git::run(repo_path, &["for-each-ref", format, "refs/tags"])?.lines() {
-            // Annotated tags point at a tag object; the commit is the peeled one.
-            let fields: Vec<&str> = line.split('\t').collect();
-            let [name, id, peeled] = fields[..] else {
-                continue;
-            };
-            let commit = if peeled.is_empty() { id } else { peeled };
-            if let Some(&i) = index.get(commit) {
-                nodes[node_of[i]].tags.push(name.to_string());
-            }
+    // Every tag, newest first, and the commit each labels.
+    let tag_list = git::run(
+        repo_path,
+        &[
+            "for-each-ref",
+            "--sort=-creatordate",
+            "--format=%(refname:short)%09%(objectname)%09%(*objectname)",
+            "refs/tags",
+        ],
+    )?;
+    let mut tags = Vec::new();
+    for line in tag_list.lines() {
+        // Annotated tags point at a tag object; the commit is the peeled one.
+        let fields: Vec<&str> = line.split('\t').collect();
+        let [name, id, peeled] = fields[..] else {
+            continue;
+        };
+        tags.push(name.to_string());
+        let commit = if peeled.is_empty() { id } else { peeled };
+        if attention.tags
+            && let Some(&i) = index.get(commit)
+        {
+            nodes[node_of[i]].tags.push(name.to_string());
         }
     }
 
@@ -407,28 +434,21 @@ pub fn build(
     }
 
     let main_node = index.get(tips[0].id.as_str()).map(|&i| node_of[i]);
-    Ok(WorkflowGraph {
+    let mut graph = WorkflowGraph {
         nodes,
         lane_count,
         main_node,
         main: tips[0].name.clone(),
         branches,
         older,
-        remotes: remote_names(repo_path)?,
-        tags: git::run(
-            repo_path,
-            &[
-                "for-each-ref",
-                "--sort=-creatordate",
-                "--format=%(refname:short)",
-                "refs/tags",
-            ],
-        )?
-        .lines()
-        .map(str::to_string)
-        .collect(),
+        remotes,
+        main_worktree,
+        on_main: Vec::new(),
+        tags,
         stashes,
-    })
+    };
+    graph.on_main = graph.main_history();
+    Ok(graph)
 }
 
 /// Commits on `tip`'s first-parent line to show before it: those in the
@@ -445,8 +465,8 @@ fn recent_base(
         "--first-parent".to_string(),
         format!("--max-count={RECENT_COMMITS}"),
     ];
-    if let Some(days) = attention.window_days {
-        args.push(format!("--since=@{}", now - i64::from(days) * 86_400));
+    if let Some(since) = attention.since(now) {
+        args.push(format!("--since=@{since}"));
     }
     args.push(tip.to_string());
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -457,11 +477,17 @@ fn recent_base(
     Ok(parents.lines().next().unwrap_or(oldest).to_string())
 }
 
-/// The newest commit every tip descends from.
-fn octopus_base(repo_path: &str, tips: &[Tip]) -> Result<String, CoreError> {
+/// The tips' commits, each once.
+fn tip_ids(tips: &[Tip]) -> Vec<&str> {
     let mut ids: Vec<&str> = tips.iter().map(|tip| tip.id.as_str()).collect();
     ids.sort_unstable();
     ids.dedup();
+    ids
+}
+
+/// The newest commit every tip descends from.
+fn octopus_base(repo_path: &str, tips: &[Tip]) -> Result<String, CoreError> {
+    let ids = tip_ids(tips);
     if ids.len() == 1 {
         return Ok(ids[0].to_string());
     }
@@ -541,13 +567,17 @@ fn claim(
     claimed
 }
 
-/// The main branch first, then worktrees, then the branches attention shows; and
-/// all branches outside worktrees with whether they are shown.
+type Tips = (Vec<Tip>, Vec<Branch>, Option<String>);
+
+/// The main branch first, then worktrees, then the branches attention shows;
+/// all branches outside worktrees with whether they are shown; and the main
+/// worktree's folder.
 fn tips(
     repo_path: &str,
     attention: &Attention,
     now: i64,
-) -> Result<(Vec<Tip>, Vec<Branch>), CoreError> {
+    remotes: &[String],
+) -> Result<Tips, CoreError> {
     let main = main_branch(repo_path);
     let main_id = git::run(
         repo_path,
@@ -561,7 +591,8 @@ fn tips(
     }];
 
     let mut branches = Vec::new();
-    for (path, head, branch) in worktrees(repo_path)? {
+    let (worktrees, main_worktree) = worktrees(repo_path)?;
+    for (path, head, branch) in worktrees {
         if branch.as_deref() == Some(main.as_str()) {
             tips[0].worktree = Some(path);
             continue;
@@ -575,17 +606,9 @@ fn tips(
         branches.push(Branch {
             name: name.clone(),
             commit: head.clone(),
-            author: String::new(),
-            time: 0,
             shown,
             worktree: true,
-            remote: false,
-            stale: Vec::new(),
-            busy: false,
-            unrelated: false,
-            upstream: None,
-            ahead: 0,
-            behind: 0,
+            ..Branch::default()
         });
         if shown {
             tips.push(Tip {
@@ -602,17 +625,9 @@ fn tips(
     branches.push(Branch {
         name: main.clone(),
         commit: tips[0].id.clone(),
-        author: String::new(),
-        time: 0,
         shown: true,
         worktree: tips[0].worktree.is_some(),
-        remote: false,
-        stale: Vec::new(),
-        busy: false,
-        unrelated: false,
-        upstream: None,
-        ahead: 0,
-        behind: 0,
+        ..Branch::default()
     });
 
     let format =
@@ -627,7 +642,6 @@ fn tips(
         "refs/remotes",
     ];
     let refs = git::run(repo_path, &args)?;
-    let remote_names = remote_names(repo_path)?;
     for line in refs.lines() {
         let fields: Vec<&str> = line.split('\t').collect();
         let [name, id, time, author] = fields[..] else {
@@ -635,10 +649,10 @@ fn tips(
         };
         let time = time.parse().unwrap_or_default();
         // `origin/HEAD` names another branch, and a bare `origin` is its short form.
-        let remote = remote_names
+        let remote = remotes
             .iter()
             .any(|remote| name.starts_with(&format!("{remote}/")));
-        if name.ends_with("/HEAD") || remote_names.iter().any(|r| r == name) {
+        if name.ends_with("/HEAD") || remotes.iter().any(|r| r == name) {
             continue;
         }
         if let Some(branch) = branches.iter_mut().find(|branch| branch.name == name) {
@@ -650,15 +664,8 @@ fn tips(
             commit: id.to_string(),
             author: author.to_string(),
             time,
-            shown: false,
-            worktree: false,
             remote,
-            stale: Vec::new(),
-            busy: false,
-            unrelated: false,
-            upstream: None,
-            ahead: 0,
-            behind: 0,
+            ..Branch::default()
         };
         branch.shown = attention.shows_branch(&branch, now);
         if branch.shown {
@@ -674,7 +681,7 @@ fn tips(
     // The main branch first, then the newest.
     branches.sort_by_key(|branch| (branch.name != main, std::cmp::Reverse(branch.time)));
     mark_stale(repo_path, &main, &mut branches)?;
-    Ok((tips, branches))
+    Ok((tips, branches, main_worktree))
 }
 
 /// Notes why local branches look left behind: the main branch has merged
@@ -760,10 +767,20 @@ fn main_branch(repo_path: &str) -> String {
         .unwrap_or_else(|| "HEAD".to_string())
 }
 
-/// Path, HEAD and branch of each usable worktree, the main one first.
-fn worktrees(repo_path: &str) -> Result<Vec<(String, String, Option<String>)>, CoreError> {
+type Worktrees = (Vec<(String, String, Option<String>)>, Option<String>);
+
+/// Path, HEAD and branch of each usable worktree, the main one first; and
+/// the main worktree's path, unless the repository is bare.
+fn worktrees(repo_path: &str) -> Result<Worktrees, CoreError> {
     let raw = git::run(repo_path, &["worktree", "list", "--porcelain"])?;
     let mut list = Vec::new();
+    // Git lists the main worktree first.
+    let main = raw
+        .split("\n\n")
+        .next()
+        .filter(|block| !block.lines().any(|line| line == "bare"))
+        .and_then(|block| block.lines().next()?.strip_prefix("worktree "))
+        .map(str::to_string);
     for block in raw.split("\n\n") {
         let (mut path, mut head, mut branch, mut usable) = (None, None, None, true);
         for line in block.lines() {
@@ -782,7 +799,7 @@ fn worktrees(repo_path: &str) -> Result<Vec<(String, String, Option<String>)>, C
             list.push((path, head, branch));
         }
     }
-    Ok(list)
+    Ok((list, main))
 }
 
 /// Lines added and removed in the worktree, untracked files included.
@@ -968,6 +985,9 @@ mod tests {
         fixture.write("wt", "a.txt", "1\n2\n3\n4\n");
         fixture.write("wt", "new.txt", "n\n");
         let graph = fixture.graph();
+
+        let top = fixture.git(".", &["rev-parse", "--show-toplevel"]);
+        assert_eq!(graph.main_worktree, Some(top));
 
         let (agent_ix, agent) = node(&graph, "agent");
         assert_eq!(agent.kind, NodeKind::Uncommitted);
@@ -1479,6 +1499,32 @@ mod tests {
         crate::discard(&path, &[file("b.txt"), file("new.txt")]).unwrap();
         assert_eq!(read("b.txt"), "b\n");
         assert!(!std::path::Path::new(&format!("{path}/new.txt")).exists());
+
+        // A file marked with `git add -N` goes too.
+        fixture.write(".", "noted.txt", "x\n");
+        fixture.git(".", &["add", "-N", "noted.txt"]);
+        crate::discard(&path, &[file("noted.txt")]).unwrap();
+        assert!(!std::path::Path::new(&format!("{path}/noted.txt")).exists());
+        assert!(
+            !fixture
+                .git(".", &["status", "--porcelain"])
+                .contains("noted.txt")
+        );
+
+        // A name is a path, not a pattern: discarding `n*` leaves `noted.txt`.
+        fixture.commit(".", "noted.txt", "kept\n", "c3");
+        fixture.write(".", "noted.txt", "edited\n");
+        fixture.write(".", "n*", "x\n");
+        crate::discard(&path, &[file("n*")]).unwrap();
+        assert_eq!(read("noted.txt"), "edited\n");
+        assert!(!std::path::Path::new(&format!("{path}/n*")).exists());
+
+        // An ignored file marked with `git add -N` goes too.
+        fixture.write(".", ".gitignore", "*.log\n");
+        fixture.write(".", "debug.log", "x\n");
+        fixture.git(".", &["add", "-N", "-f", "debug.log"]);
+        crate::discard(&path, &[file("debug.log")]).unwrap();
+        assert!(!std::path::Path::new(&format!("{path}/debug.log")).exists());
     }
 
     #[test]

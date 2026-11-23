@@ -1,5 +1,3 @@
-use std::sync::atomic::{AtomicU8, Ordering};
-
 use gpui::{Hsla, WindowAppearance, hsla};
 
 /// The appearance the user chose in Preferences: follow the system, or
@@ -11,30 +9,11 @@ pub enum Appearance {
     Dark,
 }
 
-static APPEARANCE: AtomicU8 = AtomicU8::new(0);
-
-impl Appearance {
-    pub fn current() -> Self {
-        match APPEARANCE.load(Ordering::Relaxed) {
-            1 => Self::Light,
-            2 => Self::Dark,
-            _ => Self::System,
-        }
-    }
-
-    pub fn set(self) {
-        let value = match self {
-            Self::System => 0,
-            Self::Light => 1,
-            Self::Dark => 2,
-        };
-        APPEARANCE.store(value, Ordering::Relaxed);
-    }
-}
-
 /// Sublime Merge's colors: diffs from Breakers (light) and Mariana (dark), the
 /// graph from the Merge and Merge Dark themes.
 pub struct Theme {
+    /// Light text on a dark background.
+    pub dark: bool,
     pub background: Hsla,
     pub foreground: Hsla,
     pub secondary: Hsla,
@@ -67,7 +46,7 @@ pub struct Theme {
 impl Theme {
     /// The theme for a window, unless Preferences fix the appearance.
     pub fn for_appearance(appearance: WindowAppearance) -> Self {
-        match (Appearance::current(), appearance) {
+        match (crate::preferences::appearance(), appearance) {
             (Appearance::Light, _) => Self::light(),
             (Appearance::Dark, _) => Self::dark(),
             (_, WindowAppearance::Light | WindowAppearance::VibrantLight) => Self::light(),
@@ -77,6 +56,7 @@ impl Theme {
 
     fn light() -> Self {
         Self {
+            dark: false,
             background: hsl(180., 9., 99., 1.),
             foreground: hsl(0., 0., 20., 1.),
             secondary: hsl(0., 0., 60., 1.),
@@ -109,6 +89,7 @@ impl Theme {
 
     fn dark() -> Self {
         Self {
+            dark: true,
             background: hsl(210., 15., 22., 1.),
             foreground: hsl(219., 28., 88., 1.),
             secondary: hsl(221., 12., 69., 1.),

@@ -11,6 +11,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use attention::{Attention, Scope};
 pub use console::{LogEntry, log_since};
+pub use git::{
+    changed_files, commit, discard, discard_lines, head_message, push, range_commits, reword,
+    stage, stage_lines, stash_files, unstage, worktree_status,
+};
 pub use workflow::{Branch, GraphNode, NodeKind, WorkflowGraph};
 
 #[derive(Debug, thiserror::Error)]
@@ -48,7 +52,7 @@ pub enum Revision {
     Worktree(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ChangedFile {
     pub status: String,
     pub old_path: Option<String>,
@@ -57,6 +61,16 @@ pub struct ChangedFile {
     pub new_id: String,
     /// Set when the new side is read from this worktree's files.
     pub worktree: Option<String>,
+}
+
+impl ChangedFile {
+    /// Its path: the new one, or the old one of a deleted file.
+    pub fn path(&self) -> &str {
+        self.new_path
+            .as_deref()
+            .or(self.old_path.as_deref())
+            .unwrap_or_default()
+    }
 }
 
 /// Half-open byte range on char boundaries, ready for GPUI text highlights.
@@ -106,15 +120,6 @@ pub fn workflow_graph(
     console::as_refresh(|| workflow::build(repo_path, attention, combine, history, now))
 }
 
-/// Commits in `base..tip`, newest first; `None` reaches back to the root.
-pub fn range_commits(
-    repo_path: &str,
-    base: Option<&str>,
-    tip: &Revision,
-) -> Result<Vec<Commit>, CoreError> {
-    git::range_commits(repo_path, base, tip)
-}
-
 pub use summary::{MESSAGE_PROMPT, SUMMARY_PROMPT, Summary};
 
 /// Whether Apple's on-device model can summarize commits on this Mac.
@@ -158,20 +163,6 @@ pub struct Stash {
     pub time: i64,
 }
 
-/// The files a stash changes: unstaged and untracked ones first, then the
-/// staged ones, which start at the returned index.
-pub fn stash_files(repo_path: &str, stash: &Stash) -> Result<(Vec<ChangedFile>, usize), CoreError> {
-    git::stash_files(repo_path, stash)
-}
-
-pub fn changed_files(
-    repo_path: &str,
-    base: Option<&str>,
-    tip: &Revision,
-) -> Result<Vec<ChangedFile>, CoreError> {
-    git::changed_files(repo_path, base, tip)
-}
-
 /// The top of the repository or worktree holding `path`: a folder or file
 /// anywhere inside it. `None` outside any repository.
 pub fn repository_root(path: &str) -> Option<String> {
@@ -188,49 +179,6 @@ pub struct WorktreeStatus {
     pub unstaged: Vec<ChangedFile>,
 }
 
-pub fn worktree_status(path: &str) -> Result<WorktreeStatus, CoreError> {
-    git::worktree_status(path)
-}
-
-/// Stages files in a worktree; all changes when `files` is empty.
-pub fn stage(path: &str, files: &[String]) -> Result<(), CoreError> {
-    git::stage(path, files)
-}
-
-/// Unstages files in a worktree; everything when `files` is empty.
-pub fn unstage(path: &str, files: &[String]) -> Result<(), CoreError> {
-    git::unstage(path, files)
-}
-
-/// Stages, or with `unstage` unstages, some lines of a worktree's file:
-/// removed lines by their old numbers, added ones by their new numbers.
-pub fn stage_lines(
-    repo_path: &str,
-    worktree: &str,
-    file: &ChangedFile,
-    removed: &std::collections::HashSet<u32>,
-    added: &std::collections::HashSet<u32>,
-    unstage: bool,
-) -> Result<(), CoreError> {
-    git::stage_lines(repo_path, worktree, file, removed, added, unstage)
-}
-
-/// Throws away a worktree's unstaged changes to files.
-pub fn discard(path: &str, files: &[ChangedFile]) -> Result<(), CoreError> {
-    git::discard(path, files)
-}
-
-/// Throws away some unstaged lines of a worktree's file.
-pub fn discard_lines(
-    repo_path: &str,
-    worktree: &str,
-    file: &ChangedFile,
-    removed: &std::collections::HashSet<u32>,
-    added: &std::collections::HashSet<u32>,
-) -> Result<(), CoreError> {
-    git::discard_lines(repo_path, worktree, file, removed, added)
-}
-
 /// Fetches every remote of a repository. A background fetch is logged as
 /// a refresh command, hidden with them.
 pub fn fetch(repo: &str, prune: bool, background: bool) -> Result<(), CoreError> {
@@ -245,28 +193,6 @@ pub fn pull(path: &str, args: &[&str]) -> Result<(), CoreError> {
     git::remote(path, args)
 }
 
-/// Pushes a worktree's branch, to `to` or where it tracks, setting where
-/// it goes on its first push.
-pub fn push(path: &str, to: Option<&str>, options: &[&str]) -> Result<(), CoreError> {
-    git::push(path, to, options)
-}
-
-/// Commits a worktree's staged changes, or amends its latest commit with them.
-pub fn commit(path: &str, message: &str, amend: bool) -> Result<(), CoreError> {
-    git::commit(path, message, amend)
-}
-
-/// The full message of a worktree's latest commit.
-pub fn head_message(path: &str) -> Result<String, CoreError> {
-    git::head_message(path)
-}
-
-/// Rewrites the message of a commit in a worktree's history, copying the
-/// commits after it; files and the index stay as they are.
-pub fn reword(path: &str, commit: &str, message: &str) -> Result<(), CoreError> {
-    git::reword(path, commit, message)
-}
-
 pub fn file_diff(
     repo_path: String,
     file: ChangedFile,
@@ -274,10 +200,7 @@ pub fn file_diff(
 ) -> Result<FileDiff, CoreError> {
     let (old, new) = git::read_blobs(&repo_path, &file)?;
     match mode {
-        DiffMode::Structural => {
-            let name = file.new_path.as_ref().or(file.old_path.as_ref());
-            difft::diff(name.map_or("file", String::as_str), &old, &new)
-        }
+        DiffMode::Structural => difft::diff(file.path(), &old, &new),
         DiffMode::Text => Ok(text::diff(&old, &new)),
     }
 }

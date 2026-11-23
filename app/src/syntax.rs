@@ -7,7 +7,7 @@ use std::ops::Range;
 use std::path::Path;
 use std::sync::LazyLock;
 
-use gpui::{Hsla, Rgba};
+use gpui::Hsla;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
@@ -59,9 +59,20 @@ pub fn colors(path: &str, diff: &FileDiff, dark: bool) -> Colors {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or_default();
+    // By extension, then by whole name, such as `Makefile`, then by a first
+    // line such as a shebang.
+    let first_line = || {
+        let side = diff
+            .rows
+            .iter()
+            .find_map(|row| row.right.as_ref().or(row.left.as_ref()));
+        side.filter(|side| side.line_number == 1)
+            .map_or("", |side| side.text.as_str())
+    };
     let Some(syntax) = SYNTAXES
         .find_syntax_by_extension(extension)
         .or_else(|| SYNTAXES.find_syntax_by_extension(name))
+        .or_else(|| SYNTAXES.find_syntax_by_first_line(first_line()))
     else {
         return Colors::default();
     };
@@ -79,13 +90,8 @@ pub fn colors(path: &str, diff: &FileDiff, dark: bool) -> Colors {
                 let end = (at + text.len()).min(side.text.len());
                 if at < end {
                     let color = style.foreground;
-                    let rgba = Rgba {
-                        r: f32::from(color.r) / 255.,
-                        g: f32::from(color.g) / 255.,
-                        b: f32::from(color.b) / 255.,
-                        a: f32::from(color.a) / 255.,
-                    };
-                    let mut color: Hsla = rgba.into();
+                    let rgba = u32::from_be_bytes([color.r, color.g, color.b, color.a]);
+                    let mut color: Hsla = gpui::rgba(rgba).into();
                     // On a dark diff, over its red and green lines, dim colors
                     // such as comments' are lifted so they still read.
                     if dark {

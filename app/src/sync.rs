@@ -6,6 +6,14 @@ pub struct SyncOption {
     pub about: &'static str,
 }
 
+/// The Pull (`false`) or Push (`true`) options.
+pub fn options(push: bool) -> &'static [SyncOption] {
+    match push {
+        true => &PUSH,
+        false => &PULL,
+    }
+}
+
 pub const PULL: [SyncOption; 7] = [
     SyncOption {
         args: &["pull"],

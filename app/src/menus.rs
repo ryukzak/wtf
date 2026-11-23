@@ -299,7 +299,7 @@ pub fn menus(state: &MenuState) -> Vec<Menu> {
                 MenuItem::separator(),
                 MenuItem::action("Go To…", GoTo),
                 MenuItem::action("Command Palette…", CommandPalette),
-                MenuItem::action("Prune Stale Branches…", Prune),
+                MenuItem::action("Prune Stale Branches and Worktrees…", Prune),
                 MenuItem::action("Fetch All Remotes", Fetch),
                 MenuItem::action("Stash Changes", StashChanges),
                 MenuItem::action("Toggle Side Panel", ToggleSidePanel),

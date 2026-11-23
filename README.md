@@ -1,4 +1,4 @@
-# wtf — WorkTree Flow
+# WorkTree Flow
 
 A native macOS Git client for reviewing what your AI agents did: worktrees and branches as a flow of work, with a review area under it.
 

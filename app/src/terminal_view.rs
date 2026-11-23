@@ -23,6 +23,8 @@ use gpui::{
     Window, canvas, div, font, prelude::*, px, rgb,
 };
 
+use unicode_width::UnicodeWidthChar;
+
 use crate::console_view::{Line, Tone};
 use crate::theme::Theme;
 
@@ -125,17 +127,20 @@ impl TerminalView {
             }
             _ => None,
         };
+        // Lines held for a full-screen program show once it quits.
+        self.announce(Vec::new(), cx);
         cx.notify();
     }
 
     /// Prints lines above the prompt without the shell noticing. Lines wait
     /// while a full-screen program owns the screen.
     pub fn announce(&mut self, lines: Vec<Line>, cx: &mut Context<Self>) {
-        let Some(session) = &mut self.session else {
+        // A shell that exited shows nothing more.
+        let Some(session) = self.session.as_mut().filter(|session| !session.exited) else {
             return;
         };
         session.pending.extend(lines);
-        if session.exited || session.pending.is_empty() {
+        if session.pending.is_empty() {
             return;
         }
         let mut term = session.term.lock();
@@ -154,9 +159,27 @@ impl TerminalView {
         cx.notify();
     }
 
-    /// Types a command line into the shell and runs it.
-    pub fn run(&self, line: &str) {
-        self.write(format!("{line}\r").into_bytes());
+    /// Types a command line into the shell and runs it: in a new shell when
+    /// the last one exited, in place of anything half typed at the prompt.
+    /// A full-screen program does not get it as keys: it is not run, and a
+    /// note saying so shows once the program quits.
+    pub fn run(&mut self, line: &str, cx: &mut Context<Self>) {
+        if self.session.as_ref().is_none_or(|session| session.exited) {
+            self.start(cx);
+        }
+        // A shell that failed to start shows its error instead.
+        let Some(session) = self.session.as_mut().filter(|session| !session.exited) else {
+            return;
+        };
+        if session.term.lock().mode().contains(TermMode::ALT_SCREEN) {
+            session.pending.push(Line {
+                text: format!("not run while a full-screen program was open: {line}"),
+                tone: Tone::Error,
+            });
+            return;
+        }
+        // Ctrl-E and Ctrl-U clear what was typed at the prompt.
+        self.write(format!("\x05\x15{line}\r").into_bytes());
     }
 
     fn write(&self, bytes: impl Into<Cow<'static, [u8]>>) {
@@ -195,6 +218,11 @@ impl TerminalView {
                 && let Some(text) = cx.read_from_clipboard().and_then(|item| item.text())
             {
                 self.paste(&text);
+                cx.stop_propagation();
+            }
+            // ⌘A is the terminal's, though it has nothing to select all of;
+            // it does not reach the review behind.
+            if keystroke.key == "a" {
                 cx.stop_propagation();
             }
             // Other Cmd shortcuts belong to the app.
@@ -383,11 +411,17 @@ fn announcement(lines: &[Line], cursor: Point, screen_lines: usize, columns: usi
         // Inserting lines pushes the cursor's line down, colors and all.
         out.push_str(&format!("\x1b[{};1H\x1b[{count}L", row + 1));
         for (i, line) in chunk.iter().enumerate() {
+            // Cut to the screen's width in cells, so a wide character never
+            // wraps the line onto the next row.
+            let mut cells = 0;
             let text: String = line
                 .text
                 .chars()
                 .filter(|c| !c.is_control())
-                .take(width)
+                .take_while(|&c| {
+                    cells += UnicodeWidthChar::width(c).unwrap_or(0);
+                    cells <= width
+                })
                 .collect();
             out.push_str(&format!(
                 "\x1b[{};1H{}\x1b[0m",
@@ -535,6 +569,10 @@ fn rows(term: &Term<Listener>, palette: &Palette, focused: bool) -> Vec<Row> {
         }
         let start = row.text.len();
         row.text.push(cell.c);
+        // Combining marks ride on their cell's character.
+        if let Some(marks) = cell.zerowidth() {
+            row.text.extend(marks);
+        }
         let style = HighlightStyle {
             color: Some(fg),
             background_color: (bg != palette.background).then_some(bg),
@@ -591,15 +629,8 @@ impl Palette {
     }
 
     fn color(&self, color: Color, overrides: &alacritty_terminal::term::color::Colors) -> Hsla {
-        let spec = |rgb: Rgb| -> Hsla {
-            gpui::Rgba {
-                r: rgb.r as f32 / 255.,
-                g: rgb.g as f32 / 255.,
-                b: rgb.b as f32 / 255.,
-                a: 1.,
-            }
-            .into()
-        };
+        let spec =
+            |rgb: Rgb| -> Hsla { gpui::rgb(u32::from_be_bytes([0, rgb.r, rgb.g, rgb.b])).into() };
         match color {
             Color::Spec(rgb) => spec(rgb),
             Color::Named(name) => {
@@ -650,7 +681,7 @@ impl Palette {
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::for_appearance(window.appearance());
-        let dark = theme.background.l < 0.5;
+        let dark = theme.dark;
         let palette = Palette::new(&theme, dark);
         let focused = self.focus.is_focused(window);
 
@@ -727,7 +758,9 @@ impl Render for TerminalView {
         );
 
         let rows = rows(&session.term.lock(), &palette, focused);
-        root = root.children(rows.into_iter().map(|row| {
+        // Past an exited shell, its top row makes room for the note below.
+        let skip = usize::from(session.exited);
+        root = root.children(rows.into_iter().skip(skip).map(|row| {
             div()
                 .h(px(line_height()))
                 .whitespace_nowrap()
@@ -847,6 +880,14 @@ mod tests {
         let (screen, cursor) = announce_into(5, "old\r\n$ ls", &["$ git log", "$ git diff"]);
         assert_eq!(screen, ["old", "$ git log", "$ git diff", "$ ls", ""]);
         assert_eq!((cursor.line.0, cursor.column.0), (3, 4));
+    }
+
+    #[test]
+    fn wide_characters_are_cut_by_cells_not_wrapped() {
+        let wide = "日本語".repeat(4);
+        let (screen, cursor) = announce_into(3, "$ ", &[wide.as_str()]);
+        assert_eq!(screen[1], "$", "the prompt stays on its row");
+        assert_eq!((cursor.line.0, cursor.column.0), (1, 2));
     }
 
     #[test]

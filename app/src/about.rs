@@ -1,6 +1,6 @@
 use gpui::{
-    App, Bounds, Context, FocusHandle, Global, KeyDownEvent, TitlebarOptions, Window, WindowBounds,
-    WindowHandle, WindowOptions, div, prelude::*, px, size,
+    App, Context, FocusHandle, Global, KeyDownEvent, Window, WindowHandle, WindowOptions, div,
+    prelude::*, px,
 };
 
 use crate::preferences;
@@ -14,26 +14,12 @@ impl Global for AboutWindow {}
 
 pub fn open(cx: &mut App) {
     let existing = cx.try_global::<AboutWindow>().and_then(|window| window.0);
-    if let Some(handle) = existing
-        && handle
-            .update(cx, |_, window, _| window.activate_window())
-            .is_ok()
-    {
+    if preferences::bring_forward(existing, cx) {
         return;
     }
     let options = WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-            None,
-            size(px(360.), px(240.)),
-            cx,
-        ))),
-        titlebar: Some(TitlebarOptions {
-            title: Some("About wtf".into()),
-            ..Default::default()
-        }),
-        is_resizable: false,
         is_minimizable: false,
-        ..Default::default()
+        ..preferences::panel_options("About wtf", 360., 240., cx)
     };
     let opened = cx.open_window(options, |window, cx| {
         cx.new(|cx| {

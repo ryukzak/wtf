@@ -23,8 +23,6 @@ actions!(
     ]
 );
 
-/// Opens a repository: in the current tab when it is empty, in the tab that
-/// already shows it, or in a new tab.
 /// Brings the tab at a place in the tab bar to the front; ⌘9 always the
 /// last one, as in Safari.
 #[derive(Clone, PartialEq, Debug, Action)]
@@ -169,6 +167,8 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Opens a repository: in the current tab when it is empty, in the tab
+    /// that already shows it, or in a new tab.
     fn open_path(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
         let showing =
             |tab: &Entity<RepoView>, cx: &App| tab.read(cx).repo_path().map(str::to_string);
@@ -391,14 +391,8 @@ impl Workspace {
             true => ("↑", ahead),
             false => ("↓", behind),
         };
-        let option = match push {
-            true => crate::preferences::push_option(),
-            false => crate::preferences::pull_option(),
-        };
-        let options: &[crate::sync::SyncOption] = match push {
-            true => &crate::sync::PUSH,
-            false => &crate::sync::PULL,
-        };
+        let option = crate::preferences::sync_option(push);
+        let options = crate::sync::options(push);
         let label = options
             .get(option)
             .map(|option| crate::sync::label(push, option))
@@ -479,14 +473,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let push = self.sync_menu?;
-        let options: &[crate::sync::SyncOption] = match push {
-            true => &crate::sync::PUSH,
-            false => &crate::sync::PULL,
-        };
-        let chosen = match push {
-            true => crate::preferences::push_option(),
-            false => crate::preferences::pull_option(),
-        };
+        let options = crate::sync::options(push);
+        let chosen = crate::preferences::sync_option(push);
         let rows = options.iter().enumerate().map(|(k, option)| {
             div()
                 .id(("sync-option", k))
@@ -613,13 +601,26 @@ fn set_window_movable(window: &Window, movable: bool) {
     }
 }
 
+/// What a path to open is kept as: the top of its repository, else the
+/// path in full, so `.`, a file inside or a link name it the same, in recent
+/// tabs and the session, from any folder.
+pub fn repository_path(path: &str) -> String {
+    wtf_core::repository_root(path)
+        .or_else(|| {
+            Some(
+                std::fs::canonicalize(path)
+                    .ok()?
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        })
+        .unwrap_or_else(|| path.to_string())
+}
+
 /// Opens paths the system hands the app, such as folders dropped on its Dock
 /// icon: in the front window, or in a new one when there is none.
 pub fn open_paths(paths: Vec<String>, cx: &mut App) {
-    let roots: Vec<String> = paths
-        .iter()
-        .map(|path| wtf_core::repository_root(path).unwrap_or_else(|| path.clone()))
-        .collect();
+    let roots: Vec<String> = paths.iter().map(|path| repository_path(path)).collect();
     let front = cx.active_window().or_else(|| cx.windows().first().copied());
     let opened = front.is_some_and(|window| {
         window
@@ -663,7 +664,7 @@ pub fn path_from_url(url: &str) -> Option<String> {
     Some(path.trim_end_matches('/').to_string())
 }
 
-/// The folder name of a repository path, for tab titles.
+/// The last folder of a path, as tabs, worktrees and menus name it.
 pub fn folder_name(path: &str) -> String {
     Path::new(path)
         .file_name()
@@ -735,8 +736,7 @@ impl Render for Workspace {
             .on_drop(cx.listener(|this, dropped: &ExternalPaths, window, cx| {
                 for path in dropped.paths() {
                     let path = path.to_string_lossy();
-                    let root =
-                        wtf_core::repository_root(&path).unwrap_or_else(|| path.into_owned());
+                    let root = repository_path(&path);
                     this.open_path(root, window, cx);
                 }
             }))

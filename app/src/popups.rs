@@ -1,3 +1,5 @@
+use crate::workspace::folder_name;
+
 /// What a right-click menu acts on.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Target {
@@ -36,7 +38,6 @@ pub enum Target {
     Stash {
         name: String,
         id: String,
-        message: String,
     },
 }
 
@@ -89,9 +90,7 @@ pub fn attention_name(target: &Target) -> String {
             branch: Some(branch),
             ..
         } => branch.clone(),
-        Target::Worktree { path, .. } => std::path::Path::new(path)
-            .file_name()
-            .map_or(path.clone(), |name| name.to_string_lossy().into_owned()),
+        Target::Worktree { path, .. } => folder_name(path),
         Target::Commit { commit, .. } => commit.clone(),
         Target::Remote { remote, branch, .. } => format!("{remote}/{branch}"),
         Target::Tag { name, .. } | Target::Stash { name, .. } => name.clone(),
@@ -101,14 +100,23 @@ pub fn attention_name(target: &Target) -> String {
 /// How many Open With commands the menu remembers.
 pub const RECENT_COMMANDS: usize = 3;
 
+/// How much of a commit id names it short, as git's `%h` does.
 const SHORT_HASH: usize = 7;
+/// How much of a commit id a Copy SHA label shows of the whole.
+const LABEL_HASH: usize = 12;
+
+pub fn short_hash(id: &str) -> String {
+    id.chars().take(SHORT_HASH).collect()
+}
 
 /// The menu for a target, `None` marking separators. Copy items show what
 /// they copy; `recent` are the last Open With commands. The main branch and
-/// the main worktree cannot be renamed, deleted or removed.
+/// the main worktree, at `main_worktree`, cannot be renamed, deleted or
+/// removed.
 pub fn commands(
     target: &Target,
     main: &str,
+    main_worktree: Option<&str>,
     recent: &[String],
     shown: bool,
     overridden: bool,
@@ -116,7 +124,7 @@ pub fn commands(
 ) -> Vec<Option<(Command, String)>> {
     let item = |command, label: String| Some((command, label));
     // Labels other than local branches and worktrees have menus of their own.
-    let short = |commit: &str| commit.chars().take(SHORT_HASH).collect::<String>();
+    let long = |commit: &str| commit.chars().take(LABEL_HASH).collect::<String>();
     match target {
         Target::Remote {
             remote,
@@ -128,7 +136,7 @@ pub fn commands(
                     Command::CopyName,
                     format!("Copy Branch Name — {remote}/{branch}"),
                 ),
-                item(Command::CopyHash, format!("Copy SHA — {}…", short(commit))),
+                item(Command::CopyHash, format!("Copy SHA — {}…", long(commit))),
                 None,
                 attention_item(shown, overridden),
                 None,
@@ -145,12 +153,11 @@ pub fn commands(
                 item(Command::DeleteTag, "Delete Tag…".to_string()),
             ];
         }
-        // A deleted branch can come back where it ended.
         // A stash goes into a worktree, or one of its own, or away.
-        Target::Stash { name, id, .. } => {
+        Target::Stash { name, id } => {
             let mut items = vec![
                 item(Command::CopyName, format!("Copy Stash Name — {name}")),
-                item(Command::CopyHash, format!("Copy SHA — {}…", short(id))),
+                item(Command::CopyHash, format!("Copy SHA — {}…", long(id))),
                 None,
             ];
             items.extend(
@@ -191,12 +198,13 @@ pub fn commands(
         ));
     }
     if !commit.is_empty() {
-        let short: String = commit.chars().take(SHORT_HASH).collect();
-        let long: String = commit.chars().take(12).collect();
-        items.push(item(Command::CopyHash, format!("Copy SHA — {long}…")));
+        items.push(item(
+            Command::CopyHash,
+            format!("Copy SHA — {}…", long(commit)),
+        ));
         items.push(item(
             Command::CopyShortHash,
-            format!("Copy Short SHA — {short}"),
+            format!("Copy Short SHA — {}", short_hash(commit)),
         ));
     }
     if let Target::Commit { .. } = target {
@@ -273,20 +281,23 @@ pub fn commands(
             items.push(item(Command::OpenWith, "Open With…".to_string()));
             items.push(None);
             items.push(item(Command::StashChanges, "Stash Changes".to_string()));
-            if branch.as_deref() != Some(main) {
+            let rename = branch.is_some() && branch.as_deref() != Some(main);
+            let remove = main_worktree != Some(path.as_str());
+            if rename || remove {
                 items.push(None);
-                if branch.is_some() {
-                    items.push(item(Command::Rename, "Rename Branch…".to_string()));
-                }
+            }
+            if rename {
+                items.push(item(Command::Rename, "Rename Branch…".to_string()));
+            }
+            if remove {
                 // Removing names the worktree it removes.
-                let folder = std::path::Path::new(path)
-                    .file_name()
-                    .map_or(path.clone(), |name| name.to_string_lossy().into_owned());
+                let folder = folder_name(path);
                 items.push(item(
                     Command::RemoveWorktree,
                     format!("Remove Worktree — {folder}…"),
                 ));
-                if let (Some(_), Some(branch)) = (leaf, branch) {
+                // The main branch stays, wherever it is checked out.
+                if let (Some(_), Some(branch), true) = (leaf, branch, rename) {
                     items.push(item(
                         Command::RemoveWorktreeAndBranch,
                         format!("Remove Worktree {folder} and Branch {branch}…"),
@@ -309,45 +320,26 @@ fn attention_item(shown: bool, overridden: bool) -> Option<(Command, String)> {
     Some((command, label.to_string()))
 }
 
+/// The recent commands saved in the file `name`, as many as are kept.
+pub fn load_recent(name: &str) -> Vec<String> {
+    let mut recent = crate::recent::load_list(name);
+    recent.truncate(RECENT_COMMANDS);
+    recent
+}
+
 /// Remembers a command first among the recent ones, without repeats.
 pub fn remember(recent: &mut Vec<String>, command: &str) {
-    recent.retain(|known| known != command);
-    recent.insert(0, command.to_string());
-    recent.truncate(RECENT_COMMANDS);
-}
-
-fn recent_file(name: &str) -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    std::path::PathBuf::from(home)
-        .join("Library/Application Support/wtf")
-        .join(name)
-}
-
-/// Recent commands saved in the file `name`, one per line.
-pub fn load_recent(name: &str) -> Vec<String> {
-    let text = std::fs::read_to_string(recent_file(name)).unwrap_or_default();
-    text.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .take(RECENT_COMMANDS)
-        .map(str::to_string)
-        .collect()
-}
-
-/// Saves the recent commands; a failure only forgets them.
-pub fn save_recent(name: &str, recent: &[String]) {
-    let file = recent_file(name);
-    if let Some(dir) = file.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let _ = std::fs::write(file, recent.join("\n"));
+    crate::recent::put_first(recent, command, RECENT_COMMANDS);
 }
 
 /// A path with the home directory as `~`.
 pub fn tilde(path: &str) -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     match path.strip_prefix(&home) {
-        Some(rest) if !home.is_empty() => format!("~{rest}"),
+        // Only at a folder boundary: `/Users/ann2` is not under `/Users/ann`.
+        Some(rest) if !home.is_empty() && (rest.is_empty() || rest.starts_with('/')) => {
+            format!("~{rest}")
+        }
         _ => path.to_string(),
     }
 }
@@ -556,7 +548,7 @@ mod tests {
     }
 
     fn labels(target: &Target) -> Vec<String> {
-        commands(target, "master", &[], true, false, &[])
+        commands(target, "master", Some("/repo"), &[], true, false, &[])
             .into_iter()
             .map(|item| item.map_or("—".to_string(), |(_, label)| label))
             .collect()
@@ -593,7 +585,7 @@ mod tests {
             leaf: Some(false),
         };
         assert!(has(&labels(&unmerged), "Delete Branch and Its Commits"));
-        let left_out: Vec<String> = commands(&feature, "master", &[], false, false, &[])
+        let left_out: Vec<String> = commands(&feature, "master", None, &[], false, false, &[])
             .into_iter()
             .flatten()
             .map(|(_, label)| label)
@@ -607,6 +599,24 @@ mod tests {
             leaf: None,
         };
         assert!(!has(&labels(&main_worktree), "Remove Worktree"));
+        // The main worktree is known by its folder, whatever it has checked out.
+        let main_on_feature = Target::Worktree {
+            path: "/repo".to_string(),
+            branch: Some("feature".to_string()),
+            commit: "abc".to_string(),
+            leaf: None,
+        };
+        assert!(!has(&labels(&main_on_feature), "Remove Worktree"));
+        assert!(has(&labels(&main_on_feature), "Rename Branch"));
+        let linked_on_master = Target::Worktree {
+            path: "/repo/wt".to_string(),
+            branch: Some("master".to_string()),
+            commit: "abc".to_string(),
+            leaf: Some(true),
+        };
+        let linked = labels(&linked_on_master);
+        assert!(has(&linked, "Remove Worktree — wt…"));
+        assert!(!has(&linked, "Rename Branch") && !has(&linked, "Remove Worktree wt and"));
 
         let leaf = Target::Worktree {
             path: "/repo/wt".to_string(),
@@ -649,6 +659,7 @@ mod tests {
         let labels: Vec<String> = commands(
             &branch,
             "master",
+            None,
             &[],
             true,
             false,
@@ -699,7 +710,7 @@ mod tests {
             commit: String::new(),
             leaf: None,
         };
-        let labels: Vec<String> = commands(&worktree, "master", &recent, true, false, &[])
+        let labels: Vec<String> = commands(&worktree, "master", None, &recent, true, false, &[])
             .into_iter()
             .flatten()
             .map(|(_, label)| label)

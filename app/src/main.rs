@@ -29,7 +29,10 @@ use crate::repo_view::{
 };
 
 fn main() {
-    let paths: Vec<String> = std::env::args().skip(1).collect();
+    let paths: Vec<String> = std::env::args()
+        .skip(1)
+        .map(|path| workspace::repository_path(&path))
+        .collect();
     // Folders dropped on the Dock icon come as URLs, outside any app context;
     // a channel hands them to the app.
     let (opened, mut to_open) = futures::channel::mpsc::unbounded::<Vec<String>>();

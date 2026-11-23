@@ -36,7 +36,6 @@ pub struct Attention {
     /// Tags label the commits they point to.
     pub tags: bool,
     /// Stashes mark the commits they were made on.
-    #[serde(default)]
     pub stashes: bool,
 }
 
@@ -56,6 +55,11 @@ impl Default for Attention {
 }
 
 impl Attention {
+    /// When the time window starts, in Unix seconds; `None` for all time.
+    pub fn since(&self, now: i64) -> Option<i64> {
+        self.window_days.map(|days| now - i64::from(days) * 86_400)
+    }
+
     /// Whether a branch with its latest commit at `time` by `author` is shown.
     pub fn shows(&self, name: &str, author: &str, time: i64, now: i64, worktree: bool) -> bool {
         if self.hidden.iter().any(|hidden| hidden == name) {
@@ -64,9 +68,7 @@ impl Attention {
         if worktree || self.pinned.iter().any(|pinned| pinned == name) {
             return true;
         }
-        let recent = self
-            .window_days
-            .is_none_or(|days| time >= now - i64::from(days) * 86_400);
+        let recent = self.since(now).is_none_or(|since| time >= since);
         let by_author = self.authors.is_empty() || self.authors.iter().any(|a| a == author);
         self.scope == Scope::Branches && recent && by_author
     }
