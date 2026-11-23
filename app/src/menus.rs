@@ -64,7 +64,7 @@ impl Default for MenuState {
             branches: Vec::new(),
             combine: true,
             names: WorktreeNames::FolderAndBranch,
-            order: WorktreeOrder::LastCommit,
+            order: WorktreeOrder::ForkPoint,
             panel: false,
             recent: Vec::new(),
         }
@@ -130,6 +130,7 @@ pub fn menus(state: &MenuState) -> Vec<Menu> {
     })
     .collect();
     let orders = [
+        (WorktreeOrder::ForkPoint, "By Fork Point"),
         (WorktreeOrder::LastCommit, "By Last Commit"),
         (WorktreeOrder::FirstCommit, "By First Commit"),
     ]

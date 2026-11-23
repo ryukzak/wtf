@@ -17,6 +17,65 @@ impl RepoView {
         )
     }
 
+    /// The current worktree's node: the last one selected, else the one
+    /// this tab opened.
+    pub(super) fn current_worktree(&self) -> Option<usize> {
+        let path = self.command_path()?;
+        let path = path.trim_end_matches('/');
+        self.graph.nodes.iter().position(
+            |node| matches!(&node.tip, Revision::Worktree(p) if p.trim_end_matches('/') == path),
+        )
+    }
+
+    /// The current worktree, when the graph is scrolled away from it, and
+    /// the arrow pointing to it.
+    pub(super) fn worktree_away(
+        &self,
+        layout: &graph_view::Layout,
+    ) -> Option<(usize, &'static str)> {
+        let w = self.current_worktree()?;
+        let (start, end, y) = *layout.nodes.get(w)?;
+        let pad = graph_view::MARGIN;
+        let (start, end, y) = (start + pad, end + pad, y + pad);
+        let view = self.graph_scroll.bounds().size;
+        let (width, height) = (f32::from(view.width), f32::from(view.height));
+        if width <= 0. {
+            return None;
+        }
+        let offset = self.graph_scroll.offset();
+        let (left, top) = (-f32::from(offset.x), -f32::from(offset.y));
+        let arrow = if end < left {
+            "←"
+        } else if start > left + width {
+            "→"
+        } else if y < top {
+            "↑"
+        } else if y > top + height {
+            "↓"
+        } else {
+            return None;
+        };
+        Some((w, arrow))
+    }
+
+    /// Scrolls the graph from a button floating over it, as if the button
+    /// were not there.
+    fn scroll_graph(
+        &mut self,
+        event: &gpui::ScrollWheelEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let delta = event.delta.pixel_delta(px(20.));
+        let offset = self.graph_scroll.offset();
+        let max = self.graph_scroll.max_offset();
+        let x = (offset.x + delta.x).clamp(-max.width, px(0.));
+        let y = (offset.y + delta.y).clamp(-max.height, px(0.));
+        self.graph_scroll.set_offset(point(x, y));
+        cx.stop_propagation();
+        cx.notify();
+    }
+
     /// Loads the whole history of the main branch and scrolls to its first
     /// commit.
     fn go_to_first_commit(&mut self, cx: &mut Context<Self>) {
@@ -42,7 +101,7 @@ impl RepoView {
 
     /// The graph's layout, made again only when the graph or what shapes it
     /// changes, not on every frame.
-    fn graph_layout(&self) -> Rc<graph_view::Layout> {
+    pub(super) fn graph_layout(&self) -> Rc<graph_view::Layout> {
         let key = (
             self.worktree_order,
             preferences::graph(),
@@ -61,7 +120,12 @@ impl RepoView {
         layout
     }
 
-    pub(super) fn graph_band(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn graph_band(
+        &self,
+        theme: &Theme,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         if let Some(error) = &self.graph_error {
             return placeholder("Cannot read the repository", Some(error.clone()), theme);
         }
@@ -77,12 +141,17 @@ impl RepoView {
         // A node selected from the commit list or Go To scrolls into view
         // when it is out of it; one picked in the graph already is in view.
         let view = self.graph_scroll.bounds().size;
-        // A repository opens with the graph scrolled to its newest work.
+        // A repository opens with the graph scrolled to its newest work, its
+        // top and right a little in from the band's edges; the margin past
+        // them is there to scroll into.
         if view.width > px(0.) && !self.graph.nodes.is_empty() && self.scroll_to_end.replace(false)
         {
+            let hidden = graph_view::MARGIN - GRAPH_EDGE;
             let width = layout.width + 2. * graph_view::MARGIN;
-            let x = (width - f32::from(view.width)).max(0.);
-            self.graph_scroll.set_offset(point(px(-x), px(0.)));
+            let x = (width - f32::from(view.width) - hidden).max(0.);
+            let height = layout.height + 2. * graph_view::MARGIN;
+            let y = hidden.min((height - f32::from(view.height)).max(0.));
+            self.graph_scroll.set_offset(point(px(-x), px(-y)));
         }
         if let Some((start, end, y)) =
             self.reveal
@@ -111,9 +180,12 @@ impl RepoView {
             };
             self.graph_scroll.set_offset(point(px(-x), px(-y)));
         }
-        let height = self
-            .graph_height
-            .unwrap_or(layout.height.clamp(MIN_GRAPH_HEIGHT, MAX_GRAPH_HEIGHT));
+        // As tall as the graph, up to a share of the window; then it scrolls.
+        let most = f32::from(window.viewport_size().height) * MAX_GRAPH_SHARE;
+        let height = self.graph_height.unwrap_or(
+            (layout.height + 2. * GRAPH_EDGE)
+                .clamp(MIN_PANEL_HEIGHT.min(most), most.max(MIN_PANEL_HEIGHT)),
+        );
         // Scrolled away from either end, a button goes there.
         if self.graph.older == 0 && !self.loading_older && self.scroll_to_start.replace(false) {
             let offset = self.graph_scroll.offset();
@@ -121,6 +193,39 @@ impl RepoView {
         }
         let (first, away) = self.graph_away_now();
         self.graph_away.set((first, away));
+        let worktree = self.worktree_away(&layout);
+        self.worktree_arrow.set(worktree.map(|(_, arrow)| arrow));
+        // Scrolled away from the worktree in review, a button goes back to
+        // it: at the bottom, where Latest is, and in its place on the right.
+        let worktree_away = worktree.map(|(w, arrow)| {
+            let name = graph_view::worktree_label(&self.graph.nodes[w], self.worktree_names);
+            let label = match arrow {
+                "←" => format!("← {name}"),
+                "→" => format!("{name} →"),
+                _ => format!("{name} {arrow}"),
+            };
+            let button = floating(div().id("graph-worktree"), theme)
+                .absolute()
+                .bottom(px(10.))
+                .px(px(8.))
+                .py(px(2.))
+                .rounded(px(4.))
+                .text_xs()
+                .cursor_pointer()
+                .hover(|button| button.bg(theme.selection))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_scroll_wheel(cx.listener(Self::scroll_graph))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.reveal.set(Some(w));
+                    cx.notify();
+                }))
+                .child(label);
+            match arrow {
+                "←" => button.left(px(10.)),
+                _ => button.right(px(10.)),
+            }
+        });
+        let away = away && worktree_away.is_none();
         let picked: Vec<String> = self
             .narrowed
             .iter()
@@ -166,15 +271,18 @@ impl RepoView {
                             },
                             hovered: self.hovered_node,
                             stash: self.stash_view.as_ref().map(|stash| stash.name.as_str()),
+                            current: self.current_worktree(),
                         },
                         &self.graph_scroll,
                         theme,
                         cx,
                     )))
+                    .children(worktree_away)
                     .when(away, |graph| {
                         graph.child(
                             graph_button("graph-latest", "Latest →", theme)
                                 .right(px(10.))
+                                .on_scroll_wheel(cx.listener(Self::scroll_graph))
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.scroll_to_end.set(true);
                                     cx.notify();
@@ -189,6 +297,7 @@ impl RepoView {
                         graph.child(
                             graph_button("graph-first", label, theme)
                                 .left(px(10.))
+                                .on_scroll_wheel(cx.listener(Self::scroll_graph))
                                 .on_click(
                                     cx.listener(|this, _, _, cx| this.go_to_first_commit(cx)),
                                 ),

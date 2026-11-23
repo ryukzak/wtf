@@ -133,12 +133,23 @@ pub fn commands(
             branch,
             commit,
         } => {
-            return vec![
+            let mut items = vec![
                 item(
                     Command::CopyName,
                     format!("Copy Branch Name — {remote}/{branch}"),
                 ),
                 item(Command::CopyHash, format!("Copy SHA — {}…", long(commit))),
+            ];
+            // Checked out, a remote branch becomes a local one tracking it.
+            if !worktrees.is_empty() {
+                items.push(None);
+            }
+            items.extend(
+                worktrees.iter().enumerate().map(|(k, label)| {
+                    item(Command::CheckoutIn(k), format!("Check Out in {label}"))
+                }),
+            );
+            items.extend([
                 None,
                 attention_item(shown, overridden),
                 None,
@@ -146,7 +157,8 @@ pub fn commands(
                     Command::DeleteRemote,
                     format!("Delete {branch} on {remote}…"),
                 ),
-            ];
+            ]);
+            return items;
         }
         Target::Tag { name, .. } => {
             return vec![
@@ -210,30 +222,43 @@ pub fn commands(
         ));
     }
     if let Target::Commit { .. } = target {
+        items.push(item(Command::CopyMessage, "Copy Message".to_string()));
+        // Any worktree can go to the commit, off its branch.
+        if !worktrees.is_empty() {
+            items.push(None);
+        }
+        items.extend(worktrees.iter().enumerate().map(|(k, label)| {
+            item(
+                Command::CheckoutIn(k),
+                format!("Check Out in {label} (Detached)"),
+            )
+        }));
         items.extend([
-            item(Command::CopyMessage, "Copy Message".to_string()),
             None,
             item(Command::NewBranch, "New Branch Here…".to_string()),
             item(Command::NewWorktree, "New Worktree Here…".to_string()),
         ]);
         return items;
     }
-    // A branch opens in a worktree of its own, or in one already open; the
-    // main branch stays in the main worktree.
-    if let Target::Branch { name, .. } = target
-        && name != main
-    {
-        items.push(None);
-        items.push(item(
-            Command::NewWorktree,
-            "New Worktree for Branch…".to_string(),
-        ));
+    // A branch checks out in a worktree already open, any branch, the main
+    // one too, where no other worktree has it; or in a worktree of its own,
+    // but for the main branch, which stays in the main worktree.
+    if let Target::Branch { name, .. } = target {
+        if !worktrees.is_empty() {
+            items.push(None);
+        }
         items.extend(
             worktrees
                 .iter()
                 .enumerate()
                 .map(|(k, label)| item(Command::CheckoutIn(k), format!("Check Out in {label}"))),
         );
+        if name != main {
+            items.push(item(
+                Command::NewWorktree,
+                "New Worktree for Branch…".to_string(),
+            ));
+        }
     }
     if attention_name(target) != main {
         items.push(None);
@@ -416,6 +441,16 @@ pub fn new_branch(repo: &str, name: &str, commit: &str) -> String {
 /// or another worktree has it.
 pub fn switch(worktree: &str, branch: &str) -> String {
     format!("git -C {} switch {}", quote(worktree), quote(branch))
+}
+
+/// Checks a commit out in a worktree, on no branch; git refuses when changes
+/// are in the way.
+pub fn switch_detached(worktree: &str, commit: &str) -> String {
+    format!(
+        "git -C {} switch --detach {}",
+        quote(worktree),
+        quote(commit)
+    )
 }
 
 pub fn stash_apply(worktree: &str, stash: &str, pop: bool) -> String {
@@ -673,6 +708,43 @@ mod tests {
         .collect();
         assert!(labels.contains(&"New Worktree for Branch…".to_string()));
         assert!(labels.contains(&"Check Out in wtf · master".to_string()));
+
+        // A commit goes into any worktree, off its branch.
+        let commit = Target::Commit {
+            commit: "abc123".to_string(),
+            message: "Fix".to_string(),
+        };
+        let items = commands(
+            &commit,
+            "master",
+            None,
+            &[],
+            true,
+            false,
+            &["wtf · master".to_string(), "wtf-x · x".to_string()],
+        );
+        let checkouts: Vec<(Command, String)> = items
+            .into_iter()
+            .flatten()
+            .filter(|(command, _)| matches!(command, Command::CheckoutIn(_)))
+            .collect();
+        assert_eq!(
+            checkouts,
+            [
+                (
+                    Command::CheckoutIn(0),
+                    "Check Out in wtf · master (Detached)".to_string()
+                ),
+                (
+                    Command::CheckoutIn(1),
+                    "Check Out in wtf-x · x (Detached)".to_string()
+                ),
+            ]
+        );
+        assert_eq!(
+            switch_detached("/my repo", "abc123"),
+            "git -C '/my repo' switch --detach abc123"
+        );
         assert_eq!(worktree_path("/src/wtf", "agent/fix"), "/src/wtf-agent-fix");
         assert_eq!(
             add_worktree_at("/src/wtf", "/src/wtf-x", "x", "abc"),

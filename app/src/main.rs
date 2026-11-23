@@ -4,6 +4,7 @@ mod console_view;
 mod diff_view;
 mod goto;
 mod graph_view;
+mod line_edit;
 mod menus;
 mod palette;
 mod popups;
@@ -24,7 +25,8 @@ use crate::menus::{
     About, CheckTools, Hide, HideOthers, InstallCommand, NewWindow, OpenSettings, Quit, ShowAll,
 };
 use crate::workspace::{
-    CloseTab, CloseWindow, NewTab, NextTab, PreviousTab, ReopenClosedTab, SelectTab, open_window,
+    ClearRecent, CloseTab, CloseWindow, NewTab, NextTab, OpenPath, PreviousTab, ReopenClosedTab,
+    SelectTab, open_window,
 };
 
 use crate::repo_view::{
@@ -102,6 +104,32 @@ fn main() {
         cx.set_menus(menus::menus(&menus::MenuState::default()));
 
         cx.on_action(|_: &NewWindow, cx| open_window(Vec::new(), cx));
+        // With every window closed, opening still works: a window comes for
+        // what is opened. While one is open, its own handlers come first.
+        cx.on_action(|action: &OpenPath, cx| workspace::open_paths(vec![action.path.clone()], cx));
+        cx.on_action(|_: &NewTab, cx| open_window(Vec::new(), cx));
+        cx.on_action(|_: &OpenRepository, cx| {
+            let paths = cx.prompt_for_paths(gpui::PathPromptOptions {
+                files: false,
+                directories: true,
+                multiple: false,
+                prompt: None,
+            });
+            cx.spawn(async move |cx| {
+                if let Ok(Ok(Some(paths))) = paths.await {
+                    let paths = paths
+                        .iter()
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .collect();
+                    cx.update(|cx| workspace::open_paths(paths, cx)).ok();
+                }
+            })
+            .detach();
+        });
+        cx.on_action(|_: &ClearRecent, cx| {
+            recent::clear();
+            cx.set_menus(menus::menus(&menus::MenuState::default()));
+        });
         // The windows from last time always return; repositories named on
         // the command line open as tabs in the front one, as folders handed
         // to a running app do. Opening only those would save them over the

@@ -62,11 +62,15 @@ const BACKGROUND_REFRESH: Duration = Duration::from_secs(10);
 /// A refresh waits at least this many times as long as the last one took,
 /// so a large repository never keeps git busy all the time.
 const REFRESH_SHARE: u32 = 3;
-const MAX_GRAPH_HEIGHT: f32 = 300.;
-/// The graph's starting height when it has few lanes, such as one branch.
-const MIN_GRAPH_HEIGHT: f32 = 160.;
+/// How long a stash asked for in the terminal is waited for.
+const STASH_WAIT: Duration = Duration::from_secs(120);
+/// The most of the window's height the graph takes by itself; dragged, it
+/// takes what it is given.
+const MAX_GRAPH_SHARE: f32 = 0.25;
+/// Room between the graph and its band's edges as it opens; its margin
+/// beyond them is there to scroll into.
+const GRAPH_EDGE: f32 = 8.;
 const DOCK_HEIGHT: f32 = 260.;
-const STATUS_HEIGHT: f32 = 24.;
 const MIN_PANEL_HEIGHT: f32 = 60.;
 /// Room left for the commit, file and diff panes when panels grow.
 const MIN_MAIN_HEIGHT: f32 = 200.;
@@ -286,7 +290,7 @@ enum Dropdown {
 /// A small panel asking for one line of text.
 struct Prompt {
     kind: PromptKind,
-    input: String,
+    edit: crate::line_edit::LineEdit,
 }
 
 enum PromptKind {
@@ -331,6 +335,9 @@ pub struct RepoView {
     context_menu: Option<(Target, Point<Pixels>)>,
     prompt: Option<Prompt>,
     prompt_focus: FocusHandle,
+    /// The prompt's caret shows; it blinks while the prompt is open.
+    caret_on: bool,
+    blink_task: Option<Task<()>>,
     /// The prune list, when open: stale branches by name, and whether each is
     /// ticked to go.
     prune: Option<Vec<(String, bool)>>,
@@ -389,6 +396,8 @@ pub struct RepoView {
     /// The graph is scrolled away from its oldest and newest work, or has
     /// older commits to load, as last drawn.
     graph_away: Cell<(bool, bool)>,
+    /// Where the button back to the worktree in review points, when shown.
+    worktree_arrow: Cell<Option<&'static str>>,
     /// Once the whole history is in, the graph scrolls to its first commit.
     scroll_to_start: Cell<bool>,
     /// How many commits before the graph's oldest node to bring in, grown
@@ -472,6 +481,16 @@ pub struct RepoView {
     console_open: bool,
     /// The window is the one in front; with `active`, how often to refresh.
     window_active: bool,
+    /// The selection saved when the repository was last open, by node keys,
+    /// for its first graph to show again.
+    restore_keys: Vec<String>,
+    /// The worktree work goes to: the last one selected, the tab's own until
+    /// one is. Pull, Push, the palette and Stash act on it; selecting commits
+    /// to look at them leaves it.
+    current_worktree: Option<String>,
+    /// A stash asked for in the terminal: the newest stash before it, and
+    /// when it was asked for.
+    awaiting_stash: Option<(Option<String>, std::time::Instant)>,
     hide_refresh: bool,
     log_seq: u64,
     /// The directory of the last command printed in the terminal.
@@ -527,10 +546,12 @@ impl RepoView {
             graph_scroll: ScrollHandle::new(),
             menus_for: None,
             worktree_names: WorktreeNames::FolderAndBranch,
-            worktree_order: WorktreeOrder::LastCommit,
+            worktree_order: WorktreeOrder::ForkPoint,
             context_menu: None,
             prompt: None,
             prompt_focus: cx.focus_handle(),
+            caret_on: true,
+            blink_task: None,
             goto: None,
             stash_picker: None,
             stash_flags: [true, false, false],
@@ -563,6 +584,7 @@ impl RepoView {
             graph_drag: None,
             scroll_to_end: Cell::new(true),
             graph_away: Cell::new((false, false)),
+            worktree_arrow: Cell::new(None),
             scroll_to_start: Cell::new(false),
             history: 0,
             loading_older: false,
@@ -612,6 +634,9 @@ impl RepoView {
             console_open: false,
             hide_refresh: true,
             window_active: true,
+            restore_keys: Vec::new(),
+            current_worktree: None,
+            awaiting_stash: None,
             log_seq: 0,
             announced_dir: None,
             dock_height: DOCK_HEIGHT,
@@ -636,6 +661,46 @@ impl RepoView {
 
     pub fn repo_path(&self) -> Option<&str> {
         self.repo_path.as_deref()
+    }
+
+    /// DEBUG: the worktree commands run in, and why: the one selected, or
+    /// the tab's own. Delete with its one use, `debug_worktree_label` in the
+    /// workspace.
+    pub fn debug_worktree(&self) -> Option<String> {
+        let path = self.command_path()?;
+        let why = match self.current_worktree_path().is_some() {
+            true => "chosen",
+            false => "tab",
+        };
+        Some(format!("{} · {why}", workspace::folder_name(&path)))
+    }
+
+    /// Notes that a stash is on its way, made in the terminal: the next graph
+    /// with a newer stash shows it, as picking it in the attention panel does.
+    pub(super) fn expect_stash(&mut self) {
+        let newest = self.graph.stashes.first().map(|stash| stash.id.clone());
+        self.awaiting_stash = Some((newest, std::time::Instant::now()));
+    }
+
+    /// The current worktree's path, when one was chosen and the graph still
+    /// has it; `None` for the tab's own.
+    pub(super) fn current_worktree_path(&self) -> Option<&str> {
+        let path = self.current_worktree.as_deref()?;
+        let tab = self.repo_path.as_deref().map(|p| p.trim_end_matches('/'));
+        let alive = self.graph.nodes.iter().any(|node| {
+            matches!(&node.tip, Revision::Worktree(p) if p.trim_end_matches('/') == path.trim_end_matches('/'))
+        });
+        (alive && tab != Some(path.trim_end_matches('/'))).then_some(path)
+    }
+
+    /// The tab's title: its repository, and the current worktree when it
+    /// is another, as `sansara › sansara-8853`.
+    pub fn tab_title(&self) -> Option<String> {
+        let name = self.repo_name()?;
+        Some(match self.current_worktree_path() {
+            Some(path) => format!("{name} › {}", workspace::folder_name(path)),
+            None => name,
+        })
     }
 
     pub fn repo_name(&self) -> Option<String> {
@@ -698,6 +763,8 @@ impl RepoView {
         self.files.clear();
         self.select_file(None, cx);
         self.attention = Attention::load(&path);
+        self.restore_keys = saved_selection(&path);
+        self.current_worktree = None;
         recent::remember(&path);
         self.update_menus(cx);
         self.start_refresh(cx);
@@ -1041,8 +1108,12 @@ impl RepoView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // The First and Latest buttons come and go as the view leaves either end.
-        if self.graph_away_now() != self.graph_away.get() {
+        // The First and Latest buttons come and go as the view leaves either
+        // end, and the one back to the worktree as it leaves the view.
+        let arrow = self
+            .worktree_away(&self.graph_layout())
+            .map(|(_, arrow)| arrow);
+        if self.graph_away_now() != self.graph_away.get() || arrow != self.worktree_arrow.get() {
             cx.notify();
         }
         let was_at_edge = self.at_left_edge;
@@ -1091,11 +1162,16 @@ impl RepoView {
 
         // Keeps the selection by node identity, falling back to the opened
         // worktree's current state, or else the main branch.
-        let keys: Vec<String> = self
+        let mut keys: Vec<String> = self
             .selected_nodes
             .iter()
             .map(|&i| self.graph.nodes[i].key.clone())
             .collect();
+        // The first graph of a repository opened before shows what was
+        // selected then.
+        if keys.is_empty() {
+            keys = std::mem::take(&mut self.restore_keys);
+        }
         self.graph = graph;
         self.graph_layout.take();
         // Drafts of worktrees the graph no longer has go, so a new one at
@@ -1127,6 +1203,28 @@ impl RepoView {
                     if Some(path.trim_end_matches('/')) == root)
             });
             selected.extend(current.or(self.graph.main_node));
+        }
+
+        // A stash made from here, once in, is shown and picked in the
+        // attention panel, its group open. One that never comes, failed or
+        // cancelled, is given up after a while.
+        if let Some((before, asked)) = &self.awaiting_stash {
+            let newest = self
+                .graph
+                .stashes
+                .first()
+                .map(|stash| (stash.id.clone(), stash.name.clone()));
+            match newest {
+                Some((id, name)) if Some(&id) != before.as_ref() => {
+                    self.awaiting_stash = None;
+                    self.collapsed_sections.remove(&Section::Stashes);
+                    self.show_stash(&name, cx);
+                    cx.notify();
+                    return;
+                }
+                _ if asked.elapsed() > STASH_WAIT => self.awaiting_stash = None,
+                _ => {}
+            }
         }
 
         // A branch shown from outside the graph stays shown.
@@ -1191,6 +1289,15 @@ impl RepoView {
     }
 
     /// A plain click selects one node; Cmd-click toggles it in the selection.
+    /// Selects a node from outside the graph, such as a list or Go To, and
+    /// scrolls the graph to it. A click in the graph leaves the graph where
+    /// it is: what was clicked is in view, or meant to be left there.
+    pub(super) fn select_and_reveal(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.click_node(index, false, cx);
+        self.reveal.set(Some(index));
+        cx.notify();
+    }
+
     pub fn click_node(&mut self, index: usize, toggle: bool, cx: &mut Context<Self>) {
         let mut selected = self.selected_nodes.clone();
         if !toggle {
@@ -1268,12 +1375,31 @@ impl RepoView {
     }
 
     fn set_selection(&mut self, selected: Vec<usize>, cx: &mut Context<Self>) {
+        // The last worktree among those selected becomes the current one.
+        if let Some(path) =
+            selected
+                .iter()
+                .rev()
+                .find_map(|&i| match &self.graph.nodes.get(i)?.tip {
+                    Revision::Worktree(path) => Some(path.clone()),
+                    Revision::Commit(_) => None,
+                })
+        {
+            self.current_worktree = Some(path);
+        }
+        if let Some(repo) = &self.repo_path {
+            let keys: Vec<&str> = selected
+                .iter()
+                .filter_map(|&i| self.graph.nodes.get(i))
+                .map(|node| node.key.as_str())
+                .collect();
+            save_selection(repo, &keys);
+        }
         self.worktree_split = None;
         self.line_selection = None;
         self.outside_graph = false;
         self.stash_view = None;
         self.range = self.graph.range(&selected);
-        self.reveal.set(selected.last().copied());
         self.selected_nodes = selected;
         self.narrowed.clear();
         self.commit_anchor = None;
@@ -1396,6 +1522,8 @@ impl RepoView {
             self.set_selection(vec![node], cx);
             self.pending_commit = Some(commit);
         }
+        // From outside the graph: the graph goes to it.
+        self.reveal.set(Some(node));
     }
 
     /// Narrows the diff to one listed commit.
@@ -1705,9 +1833,7 @@ impl RepoView {
                     self.snapshot_header_height = Some((start + y - from).clamp(2. * lines, max));
                 }
             }
-            Border::Dock => {
-                self.dock_height = (height - y - STATUS_HEIGHT).clamp(MIN_PANEL_HEIGHT, max)
-            }
+            Border::Dock => self.dock_height = (height - y).clamp(MIN_PANEL_HEIGHT, max),
             Border::Graph => {
                 let top = workspace::TAB_BAR_HEIGHT;
                 self.graph_height = Some((y - top).clamp(MIN_PANEL_HEIGHT, max))
@@ -2127,6 +2253,10 @@ const LIST_ITEM_HEIGHT: f32 = 40.;
 
 impl Render for RepoView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // An open prompt's caret blinks, from when it opened or was typed in.
+        if self.prompt.is_some() && self.blink_task.is_none() {
+            self.blink(cx);
+        }
         let theme = Theme::for_appearance(window.appearance());
         window.set_window_title(&self.title());
         self.request_summary(cx);
@@ -2296,7 +2426,7 @@ impl Render for RepoView {
                             .min_w_0()
                             .h_full()
                             .when(self.repo_path.is_some(), |view| {
-                                view.child(self.graph_band(&theme, cx))
+                                view.child(self.graph_band(&theme, window, cx))
                             })
                             .child(
                                 div()
@@ -2349,6 +2479,38 @@ impl Render for RepoView {
             .children(self.stash_picker_view(&theme, window, cx))
             .children(self.prune_view(&theme, window, cx))
     }
+}
+
+/// What each repository had selected, by node keys: a line a repository,
+/// its path then its keys, tab-separated.
+const SELECTIONS: &str = "selections";
+
+fn saved_selection(repo: &str) -> Vec<String> {
+    recent::load_list(SELECTIONS)
+        .iter()
+        .find_map(|line| {
+            let mut fields = line.split('\t');
+            (fields.next() == Some(repo)).then(|| fields.map(str::to_string).collect())
+        })
+        .unwrap_or_default()
+}
+
+/// Saves a repository's selection, the most recent first, for some
+/// repositories; a selection that cannot be saved only starts over.
+fn save_selection(repo: &str, keys: &[&str]) {
+    let mut lines = recent::load_list(SELECTIONS);
+    lines.retain(|line| line.split('\t').next() != Some(repo));
+    if !keys.is_empty() {
+        lines.insert(
+            0,
+            std::iter::once(repo)
+                .chain(keys.iter().copied())
+                .collect::<Vec<_>>()
+                .join("\t"),
+        );
+    }
+    lines.truncate(50);
+    recent::save_list(SELECTIONS, &lines);
 }
 
 /// The folders of a snapshot's files, each with whether a file in it changed.
@@ -3268,7 +3430,7 @@ mod tests {
                 .collect()
         };
         assert_eq!(
-            show(name_tree(&names, &HashSet::new())),
+            show(name_tree(&names, &HashSet::new(), false)),
             [
                 "0feature/",
                 "1parser",
@@ -3280,9 +3442,25 @@ mod tests {
         );
         let folded = HashSet::from(["feature/".to_string()]);
         assert_eq!(
-            show(name_tree(&names, &folded)),
+            show(name_tree(&names, &folded, false)),
             ["0feature/", "0origin/x/y/", "1z", "0bot"]
         );
+    }
+
+    #[test]
+    fn mixed_trees_sort_folders_and_files_together() {
+        let names = ["a.rs", "b/c.rs", "z.rs", "d/e.rs"];
+        let show = |mixed: bool| -> Vec<String> {
+            name_tree(&names, &HashSet::new(), mixed)
+                .into_iter()
+                .map(|row| match row {
+                    NameRow::Folder { label, .. } => label,
+                    NameRow::Leaf { name, .. } => name,
+                })
+                .collect()
+        };
+        assert_eq!(show(false), ["b/", "c.rs", "d/", "e.rs", "a.rs", "z.rs"]);
+        assert_eq!(show(true), ["a.rs", "b/", "c.rs", "d/", "e.rs", "z.rs"]);
     }
 
     #[test]

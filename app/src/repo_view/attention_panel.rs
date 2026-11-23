@@ -179,7 +179,7 @@ impl RepoView {
                     .collect(),
                 false => HashSet::new(),
             };
-            for row in name_tree(&names, &folded) {
+            for row in name_tree(&names, &folded, false) {
                 match row {
                     NameRow::Leaf { index, name, depth } => {
                         body = body.child(self.attention_row(
@@ -629,7 +629,7 @@ impl RepoView {
             })
         };
         if let Some(node) = worktree.or_else(tip) {
-            self.click_node(node, false, cx);
+            self.select_and_reveal(node, cx);
         } else if self
             .graph
             .branches

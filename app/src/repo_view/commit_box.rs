@@ -580,6 +580,7 @@ impl RepoView {
                                                     &this.draft.message,
                                                     &[],
                                                 );
+                                                this.expect_stash();
                                                 this.run_in_terminal(line, window, cx);
                                             }
                                         }))

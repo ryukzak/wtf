@@ -149,11 +149,17 @@ impl RepoView {
                 }
             }
             Command::CheckoutIn(k) => {
-                if let (Some(name), Some((path, _))) =
-                    (name, self.checkout_worktrees(&target).get(k).cloned())
-                {
-                    self.run_in_terminal(popups::switch(&path, &name), window, cx);
-                }
+                let Some((path, _)) = self.checkout_worktrees(&target).get(k).cloned() else {
+                    return;
+                };
+                let line = match (&target, name) {
+                    (Target::Commit { .. }, _) => popups::switch_detached(&path, &commit),
+                    // By its name alone, git makes a local branch tracking it.
+                    (Target::Remote { branch, .. }, _) => popups::switch(&path, branch),
+                    (_, Some(name)) => popups::switch(&path, &name),
+                    _ => return,
+                };
+                self.run_in_terminal(line, window, cx);
             }
             Command::DeleteWithCommits => {
                 if let Some(name) = name {
@@ -569,14 +575,9 @@ impl RepoView {
     /// The worktree the palette runs commands on: the selected one, or
     /// the repository's.
     pub(super) fn command_path(&self) -> Option<String> {
-        let selected = match self.selected_nodes[..] {
-            [selected] => self.graph.nodes.get(selected),
-            _ => None,
-        };
-        match selected.map(|node| &node.tip) {
-            Some(Revision::Worktree(path)) => Some(path.clone()),
-            _ => self.repo_path.clone(),
-        }
+        self.current_worktree_path()
+            .map(str::to_string)
+            .or_else(|| self.repo_path.clone())
     }
 
     /// What the picker lists for its query. Go To: the places it matches.
@@ -644,7 +645,7 @@ impl RepoView {
         }
         match entry.commit {
             Some(commit) => self.select_commit(entry.node, commit, cx),
-            None => self.click_node(entry.node, false, cx),
+            None => self.select_and_reveal(entry.node, cx),
         }
     }
 
@@ -869,8 +870,41 @@ impl RepoView {
     }
 
     pub(super) fn show_prompt(&mut self, kind: PromptKind, input: String, window: &mut Window) {
-        self.prompt = Some(Prompt { kind, input });
+        self.prompt = Some(Prompt {
+            kind,
+            edit: crate::line_edit::LineEdit::new(input),
+        });
         self.prompt_focus.focus(window);
+        self.caret_on = true;
+        self.blink_task = None;
+    }
+
+    /// Blinks the prompt's caret, as text fields' carets do, while the
+    /// prompt is open; typing shows it again at once.
+    pub(super) fn blink(&mut self, cx: &mut Context<Self>) {
+        if self.blink_task.is_some() {
+            return;
+        }
+        self.blink_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(CARET_BLINK).await;
+                let open = this.update(cx, |this, cx| {
+                    this.caret_on = !this.caret_on;
+                    cx.notify();
+                    this.prompt.is_some()
+                });
+                if !open.unwrap_or(false) {
+                    break;
+                }
+            }
+        }));
+    }
+
+    fn close_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.prompt = None;
+        self.blink_task = None;
+        self.focus.focus(window);
+        cx.notify();
     }
 
     fn prompt_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -880,11 +914,12 @@ impl RepoView {
         let keystroke = &event.keystroke;
         match keystroke.key.as_str() {
             "enter" => self.submit_prompt(window, cx),
-            "escape" => {
-                self.prompt = None;
-                self.focus.focus(window);
+            "escape" => self.close_prompt(window, cx),
+            _ if prompt.edit.key(keystroke, cx) => {
+                // The caret stays lit while typing, and blinks from there.
+                self.caret_on = true;
+                self.blink_task = None;
             }
-            _ if type_key(&mut prompt.input, keystroke, true, cx) => {}
             _ => return,
         }
         cx.stop_propagation();
@@ -896,7 +931,8 @@ impl RepoView {
             return;
         };
         self.focus.focus(window);
-        let input = prompt.input.trim().to_string();
+        self.blink_task = None;
+        let input = prompt.edit.text.trim().to_string();
         if input.is_empty() {
             return;
         }
@@ -976,8 +1012,8 @@ impl RepoView {
     fn checkout_worktrees(&self, target: &Target) -> Vec<(String, String)> {
         let name = match target {
             Target::Branch { name, .. } => Some(name),
-            // A stash goes into any worktree.
-            Target::Stash { .. } => None,
+            // A stash, a commit or a remote branch goes into any worktree.
+            Target::Stash { .. } | Target::Commit { .. } | Target::Remote { .. } => None,
             _ => return Vec::new(),
         };
         self.graph
@@ -1111,7 +1147,7 @@ impl RepoView {
         // loose shows at once.
         let hint = match &prompt.kind {
             PromptKind::AddChannel => {
-                let input = prompt.input.trim();
+                let input = prompt.edit.text.trim();
                 let names = self.channel_matches(input);
                 let shown: Vec<&str> = names.iter().take(8).map(String::as_str).collect();
                 match (input.is_empty(), names.len()) {
@@ -1154,10 +1190,11 @@ impl RepoView {
                     .font_weight(preferences::code_weight())
                     .whitespace_nowrap()
                     .overflow_hidden()
-                    .child(prompt.input.clone())
-                    .child(div().w(px(1.5)).h(px(14.)).bg(theme.foreground)),
+                    .children(field_with_caret(&prompt.edit, self.caret_on, theme)),
             )
-            .child(div().text_xs().text_color(theme.secondary).child(hint));
+            .child(div().text_xs().text_color(theme.secondary).child(hint))
+            // A click anywhere else closes it, as Esc does.
+            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close_prompt(window, cx)));
         Some(dialog_overlay(panel, PROMPT_WIDTH, 80., window))
     }
 
@@ -1192,6 +1229,7 @@ impl RepoView {
                 .map(|((flag, _), _)| *flag)
                 .collect();
             self.close_stash_picker(window, cx);
+            self.expect_stash();
             self.run_in_terminal(popups::stash_with(&path, &flags), window, cx);
             return;
         }
@@ -1339,16 +1377,68 @@ fn dialog_chrome<E: Styled>(panel: E, width: f32, theme: &Theme, window: &Window
 }
 
 /// Shows a dialog centred `top` below the window's top, over everything.
+/// A dialog over the window, on a backdrop that takes every click outside
+/// it: nothing behind answers, no menu opens there, and the dialog's own
+/// click-outside handler closes it.
 fn dialog_overlay(panel: impl IntoElement, width: f32, top: f32, window: &Window) -> AnyElement {
-    let viewport = f32::from(window.viewport_size().width);
-    let left = ((viewport - dialog_width(width, window)) / 2.).max(0.);
+    let viewport = window.viewport_size();
+    let left = ((f32::from(viewport.width) - dialog_width(width, window)) / 2.).max(0.);
     deferred(
-        anchored()
-            .position(Point::new(px(left), px(top)))
-            .child(panel),
+        anchored().position(Point::new(px(0.), px(0.))).child(
+            div()
+                .id("dialog-backdrop")
+                .occlude()
+                .w(viewport.width)
+                .h(viewport.height)
+                .child(div().absolute().left(px(left)).top(px(top)).child(panel)),
+        ),
     )
     .with_priority(2)
     .into_any_element()
+}
+
+/// How long the prompt's caret stays lit, and dark.
+const CARET_BLINK: std::time::Duration = std::time::Duration::from_millis(530);
+
+/// A one-line field's text with its selection marked and its caret, lit or
+/// not as it blinks.
+fn field_with_caret(
+    edit: &crate::line_edit::LineEdit,
+    caret_on: bool,
+    theme: &Theme,
+) -> Vec<AnyElement> {
+    let range = edit.selection();
+    let text = &edit.text;
+    // The caret takes no room: a mark drawn over the text, so the text
+    // stays put wherever the caret goes.
+    let caret = div()
+        .flex_none()
+        .relative()
+        .w(px(0.))
+        .h(px(15.))
+        .child(
+            div()
+                .absolute()
+                .left(px(-0.75))
+                .top_0()
+                .w(px(1.5))
+                .h(px(15.))
+                .when(caret_on, |caret| caret.bg(theme.foreground)),
+        )
+        .into_any_element();
+    // Spaces keep their width when a run ends with one.
+    let run = |part: &str| div().flex_none().child(part.replace(' ', "\u{a0}"));
+    let mut parts = vec![run(&text[..range.start]).into_any_element()];
+    let selected = run(&text[range.clone()])
+        .bg(theme.selection)
+        .into_any_element();
+    match (range.is_empty(), edit.caret == range.start) {
+        (true, _) => parts.push(caret),
+        (false, true) => parts.extend([caret, selected]),
+        (false, false) => parts.extend([selected, caret]),
+    }
+    parts.push(run(&text[range.end..]).into_any_element());
+    parts
 }
 
 fn dialog_width(width: f32, window: &Window) -> f32 {

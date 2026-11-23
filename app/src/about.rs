@@ -7,6 +7,12 @@ use crate::preferences;
 use crate::theme::Theme;
 use crate::workspace::{CloseTab, CloseWindow};
 
+/// The app's icon, drawn as the Dock's is.
+const ICON: &[u8] = include_bytes!("../icon/icon.svg");
+
+/// Where the project lives, as Cargo.toml says.
+const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
+
 /// The open About window, so a second About brings it forward.
 struct AboutWindow(Option<WindowHandle<About>>);
 
@@ -19,7 +25,7 @@ pub fn open(cx: &mut App) {
     }
     let options = WindowOptions {
         is_minimizable: false,
-        ..preferences::panel_options("About wtf", 360., 240., cx)
+        ..preferences::panel_options("About wtf", 360., 400., cx)
     };
     let opened = cx.open_window(options, |window, cx| {
         cx.new(|cx| {
@@ -61,12 +67,13 @@ impl Render for About {
             .text_color(theme.foreground)
             .font_family(preferences::ui_font())
             .text_sm()
+            // The app's icon, from the same drawing the Dock's is made of.
             .child(
-                div()
-                    .text_3xl()
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .font_family(preferences::code_font())
-                    .child("wtf"),
+                gpui::img(std::sync::Arc::new(gpui::Image::from_bytes(
+                    gpui::ImageFormat::Svg,
+                    ICON.to_vec(),
+                )))
+                .size(px(128.)),
             )
             .child(
                 div()
@@ -90,6 +97,16 @@ impl Render for About {
                     .text_center()
                     .text_color(theme.secondary)
                     .child("Also what you say when you open an agent's branch."),
+            )
+            .child(
+                div()
+                    .id("about-project")
+                    .mt(px(10.))
+                    .text_color(theme.accent)
+                    .cursor_pointer()
+                    .hover(|link| link.underline())
+                    .on_click(|_, _, cx| cx.open_url(REPOSITORY))
+                    .child(REPOSITORY.trim_start_matches("https://")),
             )
     }
 }

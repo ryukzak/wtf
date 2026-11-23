@@ -69,6 +69,8 @@ struct Settings {
     message_prompt: Option<String>,
     /// At launch, problems with external programs open the tools window.
     tool_check: bool,
+    /// File trees list folders before files; off, the two mix by name.
+    folders_first: bool,
     graph: GraphStyle,
     /// Minutes between background fetches; 0 for none.
     fetch_minutes: u32,
@@ -127,6 +129,7 @@ impl Default for Settings {
             summary_prompt: None,
             message_prompt: None,
             tool_check: true,
+            folders_first: true,
             graph: GraphStyle::default(),
             fetch_minutes: 5,
             fetch_prune: true,
@@ -393,6 +396,11 @@ pub fn set_summaries(on: bool, cx: &mut App) {
     change(|settings| settings.summaries = Some(on), cx);
 }
 
+/// Whether file trees list folders before files.
+pub fn folders_first() -> bool {
+    read().folders_first
+}
+
 /// Whether problems with external programs show at launch.
 pub fn tool_check() -> bool {
     read().tool_check
@@ -472,6 +480,7 @@ fn parse(text: &str) -> Settings {
             ("fetch_prune", _) => settings.fetch_prune = value == "on",
             ("sync_badges", _) => settings.sync_badges = value == "on",
             ("tool_check", _) => settings.tool_check = value == "on",
+            ("folders_first", _) => settings.folders_first = value == "on",
             ("pull_option", Some(n)) => settings.pull_option = n as usize,
             ("push_option", Some(n)) => settings.push_option = n as usize,
             ("summary_prompt", _) => settings.summary_prompt = Some(unescape(raw)),
@@ -538,6 +547,7 @@ fn format(settings: &Settings) -> String {
         format!("fetch_prune={}", on_off(settings.fetch_prune)),
         format!("sync_badges={}", on_off(settings.sync_badges)),
         format!("tool_check={}", on_off(settings.tool_check)),
+        format!("folders_first={}", on_off(settings.folders_first)),
         format!("pull_option={}", settings.pull_option),
         format!("push_option={}", settings.push_option),
         match settings.summaries {
@@ -1376,7 +1386,14 @@ impl Render for Preferences {
                     .flex()
                     .flex_col()
                     .gap(px(4.))
-                    .child(row("Commit summaries", &theme).child(segmented(
+                    .child(row("File tree", &theme).child(segmented(
+                        "folders-first",
+                        &[("Folders first", true), ("Mixed", false)],
+                        settings.folders_first,
+                        |first, cx| change(|settings| settings.folders_first = first, cx),
+                        &theme,
+                    )))
+                    .child(row("Commit summaries", &theme).mt(px(8.)).child(segmented(
                         "summaries",
                         ON_OFF,
                         on,

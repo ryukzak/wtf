@@ -2,8 +2,9 @@
 
 use super::*;
 
-/// The file list's rows: folders first, then files, by name; a worktree's
-/// files under their sections. Folded folders hide what is in them.
+/// The file list's rows: folders first, then files, by name, or the two
+/// mixed by name as Settings choose; a worktree's files under their
+/// sections. Folded folders hide what is in them.
 pub(super) fn file_tree(
     files: &[ChangedFile],
     split: Option<usize>,
@@ -18,18 +19,23 @@ pub(super) fn file_tree(
             .iter()
             .filter_map(|key| key.strip_prefix(section).map(str::to_string))
             .collect();
-        rows.extend(name_tree(&names, &folded).into_iter().map(|row| match row {
-            NameRow::Folder { path, label, depth } => TreeRow::Dir {
-                key: format!("{section}{path}"),
-                label: label.trim_end_matches('/').to_string(),
-                depth,
-            },
-            NameRow::Leaf { index, name, depth } => TreeRow::File {
-                index: indices[index],
-                name,
-                depth,
-            },
-        }));
+        let mixed = !crate::preferences::folders_first();
+        rows.extend(
+            name_tree(&names, &folded, mixed)
+                .into_iter()
+                .map(|row| match row {
+                    NameRow::Folder { path, label, depth } => TreeRow::Dir {
+                        key: format!("{section}{path}"),
+                        label: label.trim_end_matches('/').to_string(),
+                        depth,
+                    },
+                    NameRow::Leaf { index, name, depth } => TreeRow::File {
+                        index: indices[index],
+                        name,
+                        depth,
+                    },
+                }),
+        );
     };
     let mut rows = Vec::new();
     match split {
@@ -46,9 +52,10 @@ pub(super) fn file_tree(
     rows
 }
 
-/// Branch names as a tree of their `/` folders: folders first, by name, then
-/// branches in the given order; folders in `folded` hide what is in them.
-pub(super) fn name_tree(names: &[&str], folded: &HashSet<String>) -> Vec<NameRow> {
+/// Names as a tree of their `/` folders: folders first, by name, then the
+/// names in the given order; or, `mixed`, folders and names together by
+/// name. Folders in `folded` hide what is in them.
+pub(super) fn name_tree(names: &[&str], folded: &HashSet<String>, mixed: bool) -> Vec<NameRow> {
     #[derive(Default)]
     struct Node {
         folders: std::collections::BTreeMap<String, Node>,
@@ -59,9 +66,35 @@ pub(super) fn name_tree(names: &[&str], folded: &HashSet<String>) -> Vec<NameRow
         path: &str,
         depth: usize,
         folded: &HashSet<String>,
+        mixed: bool,
         rows: &mut Vec<NameRow>,
     ) {
-        for (name, mut inner) in &node.folders {
+        // Folders as `Ok`, names as `Err`; mixed, they go by name together.
+        let mut entries: Vec<(&str, Result<&Node, usize>)> = node
+            .folders
+            .iter()
+            .map(|(name, inner)| (name.as_str(), Ok(inner)))
+            .chain(
+                node.leaves
+                    .iter()
+                    .map(|(name, index)| (name.as_str(), Err(*index))),
+            )
+            .collect();
+        if mixed {
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+        }
+        for (name, entry) in entries {
+            let mut inner = match entry {
+                Ok(inner) => inner,
+                Err(index) => {
+                    rows.push(NameRow::Leaf {
+                        index,
+                        name: name.to_string(),
+                        depth,
+                    });
+                    continue;
+                }
+            };
             let mut label = format!("{name}/");
             while inner.leaves.is_empty() && inner.folders.len() == 1 {
                 let (next, deeper) = inner.folders.iter().next().unwrap();
@@ -76,15 +109,8 @@ pub(super) fn name_tree(names: &[&str], folded: &HashSet<String>) -> Vec<NameRow
                 depth,
             });
             if open {
-                emit(inner, &path, depth + 1, folded, rows);
+                emit(inner, &path, depth + 1, folded, mixed, rows);
             }
-        }
-        for (name, index) in &node.leaves {
-            rows.push(NameRow::Leaf {
-                index: *index,
-                name: name.clone(),
-                depth,
-            });
         }
     }
     let mut root = Node::default();
@@ -98,6 +124,6 @@ pub(super) fn name_tree(names: &[&str], folded: &HashSet<String>) -> Vec<NameRow
         node.leaves.push((leaf, index));
     }
     let mut rows = Vec::new();
-    emit(&root, "", 0, folded, &mut rows);
+    emit(&root, "", 0, folded, mixed, &mut rows);
     rows
 }

@@ -277,7 +277,7 @@ impl Workspace {
             });
         for (index, tab) in self.tabs.iter().enumerate() {
             let view = tab.read(cx);
-            let title = view.repo_name().unwrap_or_else(|| "New Tab".to_string());
+            let title = view.tab_title().unwrap_or_else(|| "New Tab".to_string());
             let active = index == self.active;
             let group = SharedString::from(format!("tab-{index}"));
             let dragged = DraggedTab {
@@ -376,11 +376,30 @@ impl Workspace {
                         .h_full()
                         .flex()
                         .items_center()
+                        .children(self.debug_worktree_label(theme, cx))
                         .child(self.sync_button(false, theme, cx))
                         .child(self.sync_button(true, theme, cx))
                         .child(self.fetch_button(theme, cx)),
                 )
             },
+        )
+    }
+
+    /// DEBUG: which worktree Pull, Push and the commands act on, and why.
+    /// Delete with `RepoView::debug_worktree` when no longer wanted.
+    fn debug_worktree_label(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let label = self.tabs[self.active].read(cx).debug_worktree()?;
+        Some(
+            div()
+                .mr(px(6.))
+                .px(px(6.))
+                .rounded(px(4.))
+                .border_1()
+                .border_color(theme.separator)
+                .text_xs()
+                .text_color(theme.secondary)
+                .child(format!("worktree: {label}"))
+                .into_any_element(),
         )
     }
 

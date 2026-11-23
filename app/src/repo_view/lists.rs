@@ -134,7 +134,7 @@ impl RepoView {
             .map(|(w, worktree)| {
                 let label = graph_view::worktree_label(worktree, self.worktree_names);
                 dim_list_item(("later", w), theme)
-                    .on_click(cx.listener(move |this, _, _, cx| this.click_node(w, false, cx)))
+                    .on_click(cx.listener(move |this, _, _, cx| this.select_and_reveal(w, cx)))
                     .child(div().truncate().child("Uncommitted changes"))
                     .child(div().truncate().text_xs().child(label))
                     .into_any_element()
@@ -162,7 +162,7 @@ impl RepoView {
                 rows.push(
                     dim_list_item(("earlier-node", index), theme)
                         .on_click(
-                            cx.listener(move |this, _, _, cx| this.click_node(index, false, cx)),
+                            cx.listener(move |this, _, _, cx| this.select_and_reveal(index, cx)),
                         )
                         .child(div().truncate().child(newest.summary.clone()))
                         .child(div().truncate().text_xs().child(detail)),

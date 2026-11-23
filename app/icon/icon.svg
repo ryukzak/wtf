@@ -1,30 +1,33 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
   <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#34404d"/>
-      <stop offset="1" stop-color="#1b2128"/>
-    </linearGradient>
     <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
       <feDropShadow dx="0" dy="12" stdDeviation="14" flood-color="#000" flood-opacity="0.35"/>
     </filter>
+    <clipPath id="square">
+      <rect x="100" y="100" width="824" height="824" rx="185"/>
+    </clipPath>
   </defs>
-  <!-- macOS icon grid: an 824 pt rounded square in a 1024 pt canvas -->
-  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#bg)" filter="url(#shadow)"/>
-  <rect x="101" y="101" width="822" height="822" rx="184" fill="none" stroke="#ffffff" stroke-opacity="0.08" stroke-width="2"/>
+  <!-- macOS icon grid: an 824 pt rounded square in a 1024 pt canvas; Swiss
+       style, paper, ink and one red -->
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="#f2ead8" filter="url(#shadow)"/>
+  <g clip-path="url(#square)">
+    <!-- the band, with the name -->
+    <rect x="100" y="100" width="824" height="270" fill="#e6382f"/>
+    <text x="160" y="320" font-family="Helvetica Neue, Helvetica, Arial" font-weight="bold"
+          font-size="220" fill="#f2ead8" letter-spacing="-10">wtf</text>
 
-  <!-- main lane -->
-  <path d="M250 632 H640" stroke="#7fb0e6" stroke-width="30" stroke-linecap="round" fill="none"/>
-  <!-- a branch forks off the main lane -->
-  <path d="M370 632 C 470 632, 450 392, 560 392 H 740" stroke="#b3a0eb" stroke-width="30" stroke-linecap="round" fill="none"/>
+    <!-- the main line, and a branch off it at a right angle -->
+    <path d="M170 700 H870" stroke="#141414" stroke-width="40"/>
+    <path d="M400 700 V530 H720" stroke="#141414" stroke-width="40" fill="none"/>
 
-  <!-- commits -->
-  <circle cx="250" cy="632" r="42" fill="#7fb0e6"/>
-  <circle cx="370" cy="632" r="42" fill="#7fb0e6"/>
-  <circle cx="510" cy="632" r="42" fill="#7fb0e6"/>
-  <circle cx="560" cy="392" r="42" fill="#b3a0eb"/>
-  <circle cx="670" cy="392" r="42" fill="#b3a0eb"/>
+    <!-- commits: the main line's in ink, the branch's in red -->
+    <circle cx="250" cy="700" r="70" fill="#141414"/>
+    <circle cx="400" cy="700" r="70" fill="#141414"/>
+    <circle cx="580" cy="530" r="70" fill="#e6382f"/>
 
-  <!-- worktrees: filled with uncommitted changes, outlined when clean -->
-  <rect x="740" y="344" width="96" height="96" rx="16" fill="#e6739f"/>
-  <rect x="628" y="590" width="84" height="84" rx="14" fill="#1f262e" stroke="#7fb0e6" stroke-width="16"/>
+    <!-- worktrees: filled with uncommitted changes, outlined when clean -->
+    <rect x="700" y="460" width="140" height="140" fill="#e6382f"/>
+    <rect x="720" y="630" width="140" height="140" fill="#f2ead8" stroke="#141414" stroke-width="30"/>
+  </g>
+  <rect x="101" y="101" width="822" height="822" rx="184" fill="none" stroke="#000" stroke-opacity="0.1" stroke-width="2"/>
 </svg>
