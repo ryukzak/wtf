@@ -2,6 +2,9 @@
 
 use super::*;
 
+/// How far each folder level of the attention lists steps in.
+const ATTENTION_INDENT: f32 = 5.;
+
 impl RepoView {
     /// The attention sidebar on the left of the graph, or a strip that opens it:
     /// a search field, the filters, and the branches by group.
@@ -215,7 +218,7 @@ impl RepoView {
                                 .items_center()
                                 .gap(px(6.))
                                 .h(px(FILE_ROW_HEIGHT))
-                                .pl(px(8. + (depth + 1) as f32 * 14.))
+                                .pl(px(8. + (depth + 1) as f32 * ATTENTION_INDENT))
                                 .pr(px(8.))
                                 .cursor_pointer()
                                 .hover(|row| row.bg(theme.selection.opacity(0.5)))
@@ -513,7 +516,7 @@ impl RepoView {
             .items_center()
             .gap(px(6.))
             .h(px(FILE_ROW_HEIGHT))
-            .pl(px(8. + depth as f32 * 14. + 16.))
+            .pl(px(8. + depth as f32 * ATTENTION_INDENT + 16.))
             .pr(px(8.))
             .whitespace_nowrap()
             .hover(|row| row.bg(theme.selection))
