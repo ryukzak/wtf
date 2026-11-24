@@ -2010,6 +2010,7 @@ mod tests {
             summary: String::new(),
             body: String::new(),
             author: String::new(),
+            email: String::new(),
             time,
             parent: None,
         };

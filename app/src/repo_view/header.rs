@@ -279,6 +279,10 @@ impl RepoView {
 
     /// The key a selection of several commits has its summary by.
     fn summary_key(&self) -> Option<String> {
+        // A whole bar shares the summary its header in the commit list has.
+        if let Some(node) = self.whole_bar() {
+            return Some(super::lists::bar_summary_key(node));
+        }
         let commits = self.header_commits();
         (commits.len() >= 2).then(|| {
             commits
@@ -296,6 +300,10 @@ impl RepoView {
             return;
         };
         if !preferences::summaries() || self.summaries.contains_key(&key) {
+            return;
+        }
+        if let Some(index) = self.whole_bar().and(self.selected_nodes.first().copied()) {
+            self.request_bar_summary(index, cx);
             return;
         }
         let commits = self.header_commits();
@@ -319,6 +327,20 @@ impl RepoView {
             .ok();
         })
         .detach();
+    }
+
+    /// The selected bar, when the diff covers it whole: one node of several
+    /// commits, none picked.
+    fn whole_bar(&self) -> Option<&wtf_core::GraphNode> {
+        let [index] = self.selected_nodes[..] else {
+            return None;
+        };
+        let node = self.graph.nodes.get(index)?;
+        (self.narrowed.is_empty()
+            && !self.snapshot_mode
+            && node.kind != wtf_core::NodeKind::Uncommitted
+            && node.commits.len() >= 2)
+            .then_some(node)
     }
 
     /// The summary of the selected commits, once the model has written it.
@@ -458,6 +480,8 @@ impl RepoView {
             self.narrowed.is_empty() && matches!(self.range, Some((_, Revision::Worktree(_))));
         let now = now_seconds();
 
+        // Wide, the facts stand on the right of the message or summary.
+        let wide = self.header_width >= WIDE_HEADER && !commits.is_empty();
         let mut description = div().flex().flex_col().gap(px(4.)).min_w_0();
         match &commits[..] {
             [] => {}
@@ -525,73 +549,83 @@ impl RepoView {
                             .into_any_element()
                     }
                 };
-                let sha = commit.id.clone();
-                let copied = self.copied.as_deref() == Some(commit.id.as_str());
-                // Who and when first, then the message.
-                description = description.child(
-                    div()
-                        .flex()
-                        .gap(px(8.))
-                        .text_xs()
-                        .text_color(theme.secondary)
-                        .child(
-                            div()
-                                .flex()
-                                .child(
-                                    div()
-                                        .id("copy-sha")
-                                        .cursor_pointer()
-                                        .hover(|sha| sha.text_color(theme.foreground))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.copy_sha(sha.clone(), cx)
-                                        }))
-                                        .child(match copied {
-                                            true => "Copied".to_string(),
-                                            false => commit.short_id.clone(),
-                                        }),
-                                )
-                                .child(format!(
-                                    " · {} · {} ({})",
-                                    commit.author,
-                                    local_datetime(commit.time),
-                                    relative_time(commit.time, now)
-                                )),
-                        )
-                        .map(|line| match editing {
-                            Some(_) => line
-                                .child(
-                                    link("reword-save", "Save")
-                                        .on_click(cx.listener(|this, _, _, cx| this.reword(cx))),
-                                )
-                                .child(link("reword-cancel", "Cancel").on_click(cx.listener(
-                                    |this, _, window, cx| {
-                                        this.rewording = None;
-                                        this.focus.focus(window);
-                                        cx.notify();
-                                    },
-                                )))
-                                .child("⌘↩ saves; later commits are copied"),
-                            None if editable => {
-                                line.child(link("reword", "Edit message").on_click(cx.listener(
-                                    move |this, _, window, cx| {
-                                        this.start_reword(&edited, window, cx)
-                                    },
-                                )))
-                            }
-                            None => line,
-                        }),
-                );
-                description = description.child(message);
+                // The links under the message; narrow, after the facts on
+                // one line, which stand on the right when wide.
+                let info = div()
+                    .flex()
+                    .gap(px(8.))
+                    .text_xs()
+                    .text_color(theme.secondary)
+                    .when(!wide, |line| {
+                        line.child(self.facts_line(&commits, now, theme, cx))
+                    })
+                    .map(|line| match editing {
+                        Some(_) => line
+                            .child(
+                                link("reword-save", "Save")
+                                    .on_click(cx.listener(|this, _, _, cx| this.reword(cx))),
+                            )
+                            .child(link("reword-cancel", "Cancel").on_click(cx.listener(
+                                |this, _, window, cx| {
+                                    this.rewording = None;
+                                    this.focus.focus(window);
+                                    cx.notify();
+                                },
+                            )))
+                            .child("⌘↩ saves; later commits are copied"),
+                        None if editable => {
+                            line.child(link("reword", "Edit message").on_click(cx.listener(
+                                move |this, _, window, cx| this.start_reword(&edited, window, cx),
+                            )))
+                        }
+                        None => line,
+                    });
+                description = description.child(message).child(info);
             }
             several => {
-                // A summary from the model leads, when summaries are on; the
+                // A summary from the model leads, when summaries are on, its
+                // mark beside it: a click there asks for another. The
                 // commits' own subjects show while it is written, when it
                 // failed, or when asked for.
-                let state = self
-                    .summary_key()
-                    .and_then(|key| self.summaries.get(&key).cloned());
-                let summarizing = preferences::summaries() && matches!(state, Some(None) | None);
+                let key = self.summary_key();
+                let state = key
+                    .as_ref()
+                    .and_then(|key| self.summaries.get(key).cloned());
+                let on = preferences::summaries();
+                let summarizing = on && matches!(state, Some(None) | None);
                 let summary = self.summary().cloned();
+                let failed = match &state {
+                    Some(Some(Err(error))) if on => Some(error.clone()),
+                    _ => None,
+                };
+                let mark = div()
+                    .id("summary-mark")
+                    .flex_none()
+                    .text_size(px(preferences::ui_size() * 1.2))
+                    .text_color(theme.accent)
+                    .cursor_pointer()
+                    .child("✦")
+                    .tooltip(move |_, cx| {
+                        let text = match summarizing {
+                            true => "Apple Intelligence is summarizing",
+                            false => "Summary by Apple Intelligence · click for another",
+                        };
+                        cx.new(|_| crate::workspace::TabPreview(text.to_string()))
+                            .into()
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| this.regenerate_summary(cx)));
+                let mark = match summarizing {
+                    true => mark
+                        .with_animation(
+                            "summary-mark-pulse",
+                            Animation::new(Duration::from_millis(1200))
+                                .repeat()
+                                .with_easing(pulsating_between(0.25, 1.)),
+                            |mark, delta| mark.opacity(delta),
+                        )
+                        .into_any_element(),
+                    false => mark.into_any_element(),
+                };
                 if let Some(summary) = &summary {
                     let mut text = summary.header.clone();
                     let header = text.len();
@@ -615,14 +649,32 @@ impl RepoView {
                             },
                         ),
                     ];
-                    let key = format!("summary-{}", self.summary_key().unwrap_or_default());
-                    description =
-                        description.child(self.selectable_text(key, text, styles, None, theme, cx));
+                    let id = format!("summary-{}", key.clone().unwrap_or_default());
+                    description = description.child(
+                        div()
+                            .flex()
+                            .items_start()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(self.selectable_text(id, text, styles, None, theme, cx)),
+                            )
+                            .child(mark),
+                    );
+                } else if summarizing {
+                    description = description.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .text_color(theme.secondary)
+                            .child(format!("Summarizing {} commits…", several.len()))
+                            .child(div().flex_1())
+                            .child(mark),
+                    );
                 }
-                let failed = match &state {
-                    Some(Some(Err(error))) if preferences::summaries() => Some(error.clone()),
-                    _ => None,
-                };
                 let show_subjects = summary.is_none() || self.show_subjects;
                 // Each commit's first line, marked when its message goes on,
                 // as one text to select; their hashes and times beside them.
@@ -633,7 +685,7 @@ impl RepoView {
                         format!("{}{more}", commit.summary)
                     })
                     .collect();
-                let key = several
+                let ids = several
                     .iter()
                     .map(|commit| commit.short_id.as_str())
                     .collect();
@@ -657,7 +709,7 @@ impl RepoView {
                                         .overflow_hidden()
                                         .whitespace_nowrap()
                                         .child(self.selectable_text(
-                                            key,
+                                            ids,
                                             subjects.join("\n"),
                                             Vec::new(),
                                             None,
@@ -676,21 +728,21 @@ impl RepoView {
                                 ),
                         )
                     })
-                    // Who and when, and what the summary is and how to see
-                    // the commits under it.
+                    // Narrow, who and when under it; wide, they are facts.
                     .child(
                         div()
                             .flex()
                             .gap(px(8.))
                             .text_xs()
                             .text_color(theme.secondary)
-                            .child(aggregate(&several.iter().collect::<Vec<_>>(), now))
-                            .when(summarizing, |line| line.child("· ✦ Summarizing…"))
+                            .when(!wide, |line| {
+                                line.child(self.facts_line(&commits, now, theme, cx))
+                            })
                             .children(failed.map(|error| {
-                                div().truncate().child(format!("· no summary: {error}"))
+                                div().truncate().child(format!("no summary: {error}"))
                             }))
                             .when(summary.is_some(), |line| {
-                                line.child("· ✦ summary by Apple Intelligence ·").child(
+                                line.child(
                                     div()
                                         .id("show-subjects")
                                         .text_color(theme.accent)
@@ -700,8 +752,8 @@ impl RepoView {
                                             cx.notify();
                                         }))
                                         .child(match self.show_subjects {
-                                            true => "Hide commits",
-                                            false => "Show commits",
+                                            true => "Hide commits".to_string(),
+                                            false => format!("Show {} commits", several.len()),
                                         }),
                                 )
                             }),
@@ -755,9 +807,13 @@ impl RepoView {
         let measure = canvas(
             move |bounds, _, cx| {
                 let height = f32::from(bounds.size.height);
+                let width = f32::from(bounds.size.width);
                 view.update(cx, |this, cx| {
-                    if (this.header_height - height).abs() > 0.5 {
+                    if (this.header_height - height).abs() > 0.5
+                        || (this.header_width - width).abs() > 0.5
+                    {
                         this.header_height = height;
+                        this.header_width = width;
                         cx.notify();
                     }
                 })
@@ -783,6 +839,216 @@ impl RepoView {
             .line_height(rems(HEADER_LINE))
             .child(measure)
             .child(div().flex_1().min_w_0().child(description))
+            .when(wide, |header| {
+                header.child(self.facts(&commits, now, theme, cx))
+            })
+    }
+
+    /// Asks the model again for the summary shown.
+    fn regenerate_summary(&mut self, cx: &mut Context<Self>) {
+        if let Some(key) = self.summary_key() {
+            // One being written is left to finish.
+            if matches!(self.summaries.get(&key), Some(Some(_))) {
+                self.summaries.remove(&key);
+                self.request_summary(cx);
+                cx.notify();
+            }
+        }
+    }
+
+    /// The facts of the commits shown, by name: the commit or how many,
+    /// what the diff changes, who and when. Hovering shows full names and
+    /// exact times; a commit id copies on a click.
+    fn fact_parts(
+        &self,
+        commits: &[Commit],
+        now: i64,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Vec<(&'static str, AnyElement)> {
+        let tip = |text: String| {
+            move |_: &mut Window, cx: &mut gpui::App| -> gpui::AnyView {
+                cx.new(|_| crate::workspace::TabPreview(text.clone()))
+                    .into()
+            }
+        };
+        let sha = |id: &str, short: &str, key: &'static str| {
+            let copied = self.copied.as_deref() == Some(id);
+            let id = id.to_string();
+            div()
+                .id(SharedString::from(format!("facts-{key}")))
+                .cursor_pointer()
+                .hover(|sha| sha.text_color(theme.accent))
+                .on_click(cx.listener(move |this, _, _, cx| this.copy_sha(id.clone(), cx)))
+                .child(match copied {
+                    true => "Copied".to_string(),
+                    false => short.to_string(),
+                })
+        };
+        let range = commit_range(&self.commits, &self.narrowed).or_else(|| self.range.clone());
+        let changes = self
+            .totals
+            .as_ref()
+            .filter(|(of, _)| Some(of) == range.as_ref())
+            .map(|(_, (files, added, removed))| {
+                div()
+                    .flex()
+                    .gap(px(6.))
+                    .child(format!(
+                        "{files} {}",
+                        if *files == 1 { "file" } else { "files" }
+                    ))
+                    .child(div().text_color(ADDED).child(format!("+{added}")))
+                    .child(div().text_color(REMOVED).child(format!("−{removed}")))
+            });
+        // Each author once, with their address as git gives it.
+        let mut authors: Vec<&str> = Vec::new();
+        let mut signatures: Vec<String> = Vec::new();
+        for commit in commits {
+            if !authors.contains(&commit.author.as_str()) {
+                authors.push(&commit.author);
+                signatures.push(match commit.email.is_empty() {
+                    true => commit.author.clone(),
+                    false => format!("{} <{}>", commit.author, commit.email),
+                });
+            }
+        }
+        let short_names: Vec<String> = authors
+            .iter()
+            .take(3)
+            .map(|name| short_name(name))
+            .collect();
+        let more = authors.len().saturating_sub(3);
+        let who = match more {
+            0 => short_names.join(", "),
+            n => format!("{}, +{n}", short_names.join(", ")),
+        };
+        let (Some(newest), Some(oldest)) = (commits.first(), commits.last()) else {
+            return Vec::new();
+        };
+        let (from, to) = (
+            relative_time(oldest.time, now),
+            relative_time(newest.time, now),
+        );
+        let when = match from == to {
+            true => from,
+            false => format!("{from} – {to}"),
+        };
+        let exact = match commits.len() {
+            1 => local_datetime(newest.time),
+            _ => format!(
+                "{} – {}",
+                local_datetime(oldest.time),
+                local_datetime(newest.time)
+            ),
+        };
+        let first = match commits {
+            [commit] => div().child(sha(&commit.id, &commit.short_id, "sha")),
+            several => div()
+                .flex()
+                .gap(px(4.))
+                .child(format!("{} commits ·", several.len()))
+                .child(sha(&newest.id, &newest.short_id, "newest"))
+                .child("…")
+                .child(sha(&oldest.id, &oldest.short_id, "oldest")),
+        };
+        let (label, who_label) = match commits.len() {
+            1 => ("Commit", "Author"),
+            _ => ("Commits", "Authors"),
+        };
+        let mut parts = vec![(label, first.into_any_element())];
+        parts.extend(changes.map(|changes| ("Changes", changes.into_any_element())));
+        parts.push((
+            who_label,
+            div()
+                .id("facts-who")
+                .truncate()
+                .child(who)
+                .tooltip(tip(signatures.join("\n")))
+                .into_any_element(),
+        ));
+        parts.push((
+            "When",
+            div()
+                .id("facts-when")
+                .child(when)
+                .tooltip(tip(exact))
+                .into_any_element(),
+        ));
+        parts
+    }
+
+    /// The facts beside a wide header, a line each under its name.
+    fn facts(
+        &self,
+        commits: &[Commit],
+        now: i64,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .flex_none()
+            .w(px(FACTS_WIDTH))
+            .ml(px(16.))
+            .pl(px(12.))
+            .border_l_1()
+            .border_color(theme.separator)
+            .text_xs()
+            .text_color(theme.secondary)
+            .children(
+                self.fact_parts(commits, now, theme, cx)
+                    .into_iter()
+                    .map(|(name, value)| {
+                        div()
+                            .flex()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .w(px(FACT_NAME_WIDTH))
+                                    .text_color(theme.secondary.opacity(0.7))
+                                    .child(name),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_color(theme.foreground)
+                                    .child(value),
+                            )
+                    }),
+            )
+    }
+
+    /// The facts on a line, for a narrow header, or more when they do not
+    /// fit.
+    fn facts_line(
+        &self,
+        commits: &[Commit],
+        now: i64,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let parts = self.fact_parts(commits, now, theme, cx);
+        let count = parts.len();
+        // What does not fit goes on to the next line, a fact whole, its
+        // dot kept with it.
+        div()
+            .flex()
+            .flex_wrap()
+            .gap_x(px(6.))
+            .min_w_0()
+            .children(parts.into_iter().enumerate().map(move |(k, (_, value))| {
+                div()
+                    .flex()
+                    .gap(px(6.))
+                    .whitespace_nowrap()
+                    .child(value)
+                    .when(k + 1 < count, |part| part.child("·"))
+            }))
     }
 
     /// The diff `list` with the commit header scrolling above its first rows,
@@ -827,42 +1093,40 @@ impl RepoView {
     }
 }
 
-/// "5 commits · Ann, Bot · 3 days ago – 2 hours ago": the authors, most
-/// commits first, and the time span of several commits.
-pub(super) fn aggregate(commits: &[&Commit], now: i64) -> String {
-    let mut authors: Vec<(&str, usize)> = Vec::new();
-    for commit in commits {
-        match authors.iter_mut().find(|(name, _)| *name == commit.author) {
-            Some((_, count)) => *count += 1,
-            None => authors.push((&commit.author, 1)),
+/// The summary bar's height: the header's first line with its padding.
+/// How wide the header is before the facts stand on its right, and how
+/// wide they are.
+const WIDE_HEADER: f32 = 900.;
+const FACTS_WIDTH: f32 = 290.;
+/// How wide the facts' names are.
+const FACT_NAME_WIDTH: f32 = 52.;
+
+/// Lines added and removed, as the facts count them.
+const ADDED: gpui::Hsla = gpui::Hsla {
+    h: 0.38,
+    s: 0.55,
+    l: 0.4,
+    a: 1.,
+};
+const REMOVED: gpui::Hsla = gpui::Hsla {
+    h: 0.01,
+    s: 0.6,
+    l: 0.5,
+    a: 1.,
+};
+
+/// A name as the facts give it: the first name and the last one's first
+/// letter, "Andrey L.".
+pub(super) fn short_name(name: &str) -> String {
+    let mut words = name.split_whitespace();
+    match (words.next(), words.last()) {
+        (Some(first), Some(last)) => {
+            format!("{first} {}.", last.chars().next().unwrap_or_default())
         }
+        _ => name.to_string(),
     }
-    authors.sort_by_key(|&(_, count)| std::cmp::Reverse(count));
-    let authors: Vec<&str> = authors.into_iter().map(|(name, _)| name).collect();
-    let oldest = commits
-        .iter()
-        .map(|commit| commit.time)
-        .min()
-        .unwrap_or(now);
-    let newest = commits
-        .iter()
-        .map(|commit| commit.time)
-        .max()
-        .unwrap_or(now);
-    let (from, to) = (relative_time(oldest, now), relative_time(newest, now));
-    let span = if from == to {
-        from
-    } else {
-        format!("{from} – {to}")
-    };
-    format!(
-        "{} commits · {} · {span}",
-        commits.len(),
-        authors.join(", ")
-    )
 }
 
-/// The summary bar's height: the header's first line with its padding.
 pub(super) fn summary_bar_height() -> f32 {
     2. * HEADER_PADDING + HEADER_LINE * preferences::ui_size() + 1.
 }

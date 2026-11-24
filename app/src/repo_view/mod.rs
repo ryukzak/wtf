@@ -372,6 +372,8 @@ pub struct RepoView {
     snapshot_tasks: [Option<Task<()>>; 4],
     snapshot_scroll: UniformListScrollHandle,
     snapshot_search_focus: FocusHandle,
+    /// The commit list's, for ↑ and ↓ through it and its ⌘A.
+    commit_list_focus: FocusHandle,
     /// The last commands used to open a worktree, newest first.
     open_with: Vec<String>,
     /// Shell commands run from the palette, newest first.
@@ -517,6 +519,11 @@ pub struct RepoView {
     stacked_scroll: UniformListScrollHandle,
     /// The commit header's height, as last laid out; the diff starts below it.
     header_height: f32,
+    /// How wide the commit header was last drawn.
+    header_width: f32,
+    /// What a diff changes, by its range: files, lines added and removed.
+    totals: Option<(DiffRange, (usize, u64, u64))>,
+    totals_task: Option<Task<()>>,
     is_loading_diff: bool,
     error_message: Option<String>,
 
@@ -612,6 +619,7 @@ impl RepoView {
             snapshot_tasks: [None, None, None, None],
             snapshot_scroll: UniformListScrollHandle::new(),
             snapshot_search_focus: cx.focus_handle(),
+            commit_list_focus: cx.focus_handle(),
             prune: None,
             prune_focus: cx.focus_handle(),
             open_with: popups::load_recent("open-with"),
@@ -694,6 +702,9 @@ impl RepoView {
             is_loading_stacked: false,
             stacked_scroll: UniformListScrollHandle::new(),
             header_height: 0.,
+            header_width: 0.,
+            totals: None,
+            totals_task: None,
             is_loading_diff: false,
             error_message: None,
             console_open: false,
@@ -1412,6 +1423,7 @@ impl RepoView {
                 None => "Stashed on a detached HEAD.".to_string(),
             },
             author: String::new(),
+            email: String::new(),
             time: stash.time,
             parent: Some(stash.base.clone()),
         }];
@@ -1616,6 +1628,37 @@ impl RepoView {
     }
 
     /// Loads the changed files, keeping `keep` selected if it is still there.
+    /// Counts what the diff from `base` to `tip` changes, for the header,
+    /// unless it is counted already.
+    fn load_totals(
+        &mut self,
+        repo: &str,
+        base: Option<String>,
+        tip: Revision,
+        cx: &mut Context<Self>,
+    ) {
+        let range = (base.clone(), tip.clone());
+        // A worktree's files change on disk, so its counts are read again.
+        let fixed = matches!(tip, Revision::Commit(_));
+        if fixed && self.totals.as_ref().is_some_and(|(of, _)| *of == range) {
+            return;
+        }
+        let repo = repo.to_string();
+        let count = cx
+            .background_executor()
+            .spawn(async move { wtf_core::diff_totals(&repo, base.as_deref(), &tip) });
+        self.totals_task = Some(cx.spawn(async move |this, cx| {
+            let totals = count.await;
+            this.update(cx, |this, cx| {
+                if let Ok(totals) = totals {
+                    this.totals = Some((range, totals));
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+    }
+
     fn load_files(&mut self, keep: Option<String>, cx: &mut Context<Self>) {
         // A snapshot's open file is the one whose changes load, for its tints.
         let keep = match self.snapshot_mode {
@@ -1630,6 +1673,7 @@ impl RepoView {
         let (Some(repo_path), Some((base, tip))) = (self.repo_path.clone(), range) else {
             return;
         };
+        self.load_totals(&repo_path, base.clone(), tip.clone(), cx);
         // A selected worktree alone shows its changes split for staging.
         let worktree = self.staging_worktree();
         let stash = self.stash_view.clone();
@@ -2383,6 +2427,9 @@ fn local_datetime(time: i64) -> String {
 /// The height of a commit list row.
 const LIST_ITEM_HEIGHT: f32 = 40.;
 
+/// A diff's two ends: a base, `None` for the empty tree, and a tip.
+type DiffRange = (Option<String>, Revision);
+
 impl Render for RepoView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // An open prompt's caret blinks, from when it opened or was typed in.
@@ -2524,6 +2571,18 @@ impl Render for RepoView {
                 let modifiers = keystroke.modifiers;
                 let alt = modifiers.alt && !modifiers.platform && !modifiers.control;
                 let arrow = matches!(keystroke.key.as_str(), "left" | "right" | "up" | "down");
+                // ↑ and ↓ go through the commit list while it has the keys,
+                // and ⌥↑ ⌥↓ from the graph.
+                let vertical = matches!(keystroke.key.as_str(), "up" | "down");
+                if vertical
+                    && this.context_menu.is_none()
+                    && ((this.commit_list_focus.is_focused(window) && !modifiers.modified())
+                        || (alt && !modifiers.shift && this.focus.is_focused(window)))
+                {
+                    this.step_list(keystroke.key == "down", cx);
+                    cx.stop_propagation();
+                    return;
+                }
                 if arrow && this.focus.is_focused(window) && this.context_menu.is_none() {
                     match (
                         modifiers.modified(),
@@ -3546,6 +3605,7 @@ mod tests {
             summary: String::new(),
             body: String::new(),
             author: String::new(),
+            email: String::new(),
             time: 0,
             parent: Some(parent.to_string()),
         }
@@ -3743,20 +3803,10 @@ mod tests {
     }
 
     #[test]
-    fn aggregates_authors_and_time_span() {
-        let now = 10_000_000;
-        let mut commits = [commit("c3", "c2"), commit("c2", "c1"), commit("c1", "c0")];
-        let days = [1, 3, 3];
-        let authors = ["Bot", "Ann", "Bot"];
-        for ((commit, days), author) in commits.iter_mut().zip(days).zip(authors) {
-            commit.time = now - days * 86_400;
-            commit.author = author.to_string();
-        }
-        let refs: Vec<&Commit> = commits.iter().collect();
-        assert_eq!(
-            aggregate(&refs, now),
-            "3 commits · Bot, Ann · 3 days ago – 1 day ago"
-        );
+    fn names_shorten_to_first_name_and_initial() {
+        assert_eq!(header::short_name("Andrey Listopadov"), "Andrey L.");
+        assert_eq!(header::short_name("Ann"), "Ann");
+        assert_eq!(header::short_name("Mary Ann Smith"), "Mary S.");
     }
 
     #[test]

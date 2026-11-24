@@ -47,6 +47,7 @@ pub struct Commit {
     /// The message after the summary line.
     pub body: String,
     pub author: String,
+    pub email: String,
     pub time: i64,
     /// First parent; `None` for a root commit.
     pub parent: Option<String>,
@@ -154,6 +155,16 @@ pub fn write_commit_message(
         &format!("{examples}{prompt}"),
         varied,
     )
+}
+
+/// How many files changed from `base` to `tip`, and lines added and
+/// removed. Read quietly, with the refresh commands.
+pub fn diff_totals(
+    repo_path: &str,
+    base: Option<&str>,
+    tip: &Revision,
+) -> Result<(usize, u64, u64), CoreError> {
+    console::as_refresh(|| git::diff_totals(repo_path, base, tip))
 }
 
 /// A summary of commits, newest first, and the changes from `base` to

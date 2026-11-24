@@ -90,15 +90,93 @@ impl RepoView {
                 (*past <= SUMMARY_AHEAD).then_some(node)
             })
             .collect();
-        gpui::list(
+        let list = gpui::list(
             self.commit_list_state.clone(),
             cx.processor(|this, row: usize, window, cx| {
                 let theme = Theme::for_appearance(window.appearance());
                 this.next_bar_summary(cx);
                 this.line_row(row, &theme, cx)
             }),
-        )
-        .size_full()
+        );
+        // A press anywhere in it gives the list the keys: ↑ and ↓ go through
+        // its commits.
+        div()
+            .id("commit-history")
+            .size_full()
+            .track_focus(&self.commit_list_focus)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, _| this.commit_list_focus.focus(window)),
+            )
+            .child(list.size_full())
+    }
+
+    /// ↑ and ↓ in the list: the commit above or below the one picked, or
+    /// from the selection's first row, picked as a click would; headers
+    /// are passed over.
+    pub(super) fn step_list(&mut self, down: bool, cx: &mut Context<Self>) {
+        let rows = self.commit_rows.borrow().clone();
+        let picked = self
+            .pending_commit
+            .clone()
+            .or_else(|| match self.narrowed[..] {
+                [i] => self.commits.get(i).map(|commit| commit.id.clone()),
+                _ => None,
+            });
+        let id_of = |row: &LineRow| match row {
+            LineRow::Commit { node, at, .. } => {
+                Some(self.graph.nodes[*node].commits[*at].id.clone())
+            }
+            LineRow::Loose(index) => self.commits.get(*index).map(|c| c.id.clone()),
+            _ => None,
+        };
+        let steppable = |row: &LineRow| {
+            matches!(
+                row,
+                LineRow::Commit { .. } | LineRow::Loose(_) | LineRow::Uncommitted { .. }
+            )
+        };
+        let current = match &picked {
+            Some(id) => rows.iter().position(|row| id_of(row).as_ref() == Some(id)),
+            // A selected worktree's changes are where it starts.
+            None => rows.iter().position(|row| match row {
+                LineRow::Uncommitted { covered, .. } => *covered,
+                _ => false,
+            }),
+        };
+        let next = match current {
+            Some(at) if down => (at + 1..rows.len()).find(|&k| steppable(&rows[k])),
+            Some(at) => (0..at).rev().find(|&k| steppable(&rows[k])),
+            // Nothing picked: the selection's first commit.
+            None => rows.iter().position(|row| match row {
+                LineRow::Commit { covered, .. } => *covered,
+                LineRow::Loose(_) => true,
+                _ => false,
+            }),
+        };
+        let Some(next) = next else {
+            return;
+        };
+        match rows[next].clone() {
+            LineRow::Uncommitted { node, .. } => self.select_and_reveal(node, cx),
+            LineRow::Loose(index) => self.click_commit(index, Modifiers::default(), cx),
+            LineRow::Commit {
+                node, at, covered, ..
+            } => {
+                let id = self.graph.nodes[node].commits[at].id.clone();
+                match covered
+                    .then(|| self.commits.iter().position(|c| c.id == id))
+                    .flatten()
+                {
+                    Some(index) => self.click_commit(index, Modifiers::default(), cx),
+                    None => self.select_commit(node, id, cx),
+                }
+            }
+            _ => return,
+        }
+        self.keep_list_scroll();
+        self.commit_list_state.scroll_to_reveal_item(next);
+        cx.notify();
     }
 
     /// The rows of the list's line.
@@ -306,7 +384,7 @@ impl RepoView {
                     (true, Some(index)) => {
                         item.on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                             // Focus moves to the list, for its ⌘A.
-                            this.focus.focus(window);
+                            this.commit_list_focus.focus(window);
                             this.click_commit(index, event.modifiers(), cx)
                         }))
                     }
@@ -356,7 +434,7 @@ impl RepoView {
                 let picked = self.narrowed.is_empty() || self.narrowed.contains(&index);
                 let item = bar(list_item(("loose", index), picked, theme), theme).on_click(
                     cx.listener(move |this, event: &ClickEvent, window, cx| {
-                        this.focus.focus(window);
+                        this.commit_list_focus.focus(window);
                         this.click_commit(index, event.modifiers(), cx)
                     }),
                 );
@@ -512,7 +590,7 @@ impl RepoView {
         }
     }
 
-    fn request_bar_summary(&mut self, index: usize, cx: &mut Context<Self>) {
+    pub(super) fn request_bar_summary(&mut self, index: usize, cx: &mut Context<Self>) {
         let (Some(node), Some(repo)) = (self.graph.nodes.get(index), self.repo_path.clone()) else {
             return;
         };
@@ -942,7 +1020,7 @@ fn hoverable(item: Stateful<gpui::Div>, theme: &Theme) -> Stateful<gpui::Div> {
 
 /// The key a bar's summary is kept by: its commits, newest first, as the
 /// commit panel keys a selection's.
-fn bar_summary_key(node: &wtf_core::GraphNode) -> String {
+pub(super) fn bar_summary_key(node: &wtf_core::GraphNode) -> String {
     node.commits
         .iter()
         .rev()

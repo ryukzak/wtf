@@ -10,7 +10,7 @@ use gix::ObjectId;
 use crate::{ChangedFile, Commit, CoreError, Revision, WorktreeStatus, console, patch};
 
 /// Fields split by 0x1f, records ended by 0x1e; read by [`parse_log`].
-pub const LOG_FORMAT: &str = "--format=%H%x1f%P%x1f%ct%x1f%an%x1f%s%x1f%b%x1e";
+pub const LOG_FORMAT: &str = "--format=%H%x1f%P%x1f%ct%x1f%an%x1f%ae%x1f%s%x1f%b%x1e";
 
 const NULL_ID: &str = "0000000000000000000000000000000000000000";
 
@@ -523,7 +523,7 @@ pub fn parse_log(raw: &str) -> Vec<(Commit, Vec<String>)> {
     raw.split('\x1e')
         .filter_map(|record| {
             let fields: Vec<&str> = record.trim_start_matches('\n').split('\x1f').collect();
-            let [id, parents, time, author, summary, body] = fields[..] else {
+            let [id, parents, time, author, email, summary, body] = fields[..] else {
                 return None;
             };
             let parents: Vec<String> = parents.split_whitespace().map(str::to_string).collect();
@@ -533,6 +533,7 @@ pub fn parse_log(raw: &str) -> Vec<(Commit, Vec<String>)> {
                 summary: summary.to_string(),
                 body: body.trim().to_string(),
                 author: author.to_string(),
+                email: email.to_string(),
                 time: time.parse().unwrap_or_default(),
                 parent: parents.first().cloned(),
             };
@@ -570,6 +571,46 @@ pub fn diff_stat(repo_path: &str, base: Option<&str>, tip: &Revision) -> Result<
     };
     let (dir, rev) = locate(repo_path, tip);
     run(dir, &["diff", "--stat=100", &base, rev])
+}
+
+/// How many files changed from `base` (`None` is the empty tree) to `tip`,
+/// and how many lines came and went; a worktree's new files are left out.
+pub fn diff_totals(
+    repo_path: &str,
+    base: Option<&str>,
+    tip: &Revision,
+) -> Result<(usize, u64, u64), CoreError> {
+    let base = match base {
+        Some(base) => base.to_string(),
+        None => empty_tree(repo_path)?,
+    };
+    let (dir, rev) = locate(repo_path, tip);
+    let mut args = vec!["diff", "--shortstat", base.as_str()];
+    if let Revision::Commit(_) = tip {
+        args.push(rev);
+    }
+    Ok(parse_shortstat(&run(dir, &args)?))
+}
+
+/// " 3 files changed, 10 insertions(+), 2 deletions(-)", in its parts.
+fn parse_shortstat(text: &str) -> (usize, u64, u64) {
+    let mut totals = (0, 0, 0);
+    for part in text.trim().split(", ") {
+        let mut words = part.split_whitespace();
+        let (Some(number), Some(word)) = (words.next(), words.next()) else {
+            continue;
+        };
+        let Ok(number) = number.parse::<u64>() else {
+            continue;
+        };
+        match word {
+            w if w.starts_with("file") => totals.0 = number as usize,
+            w if w.starts_with("insertion") => totals.1 = number,
+            w if w.starts_with("deletion") => totals.2 = number,
+            _ => {}
+        }
+    }
+    totals
 }
 
 /// Files changed from `base` (`None` is the empty tree) to `tip`. A worktree tip
@@ -746,6 +787,20 @@ fn read_blob(repo: &gix::Repository, id: &str) -> Result<Vec<u8>, CoreError> {
 }
 
 #[cfg(test)]
+mod shortstat_tests {
+    #[test]
+    fn shortstats_read_in_their_parts() {
+        let read = super::parse_shortstat;
+        assert_eq!(
+            read(" 3 files changed, 10 insertions(+), 2 deletions(-)\n"),
+            (3, 10, 2)
+        );
+        assert_eq!(read(" 1 file changed, 1 deletion(-)"), (1, 0, 1));
+        assert_eq!(read(""), (0, 0, 0));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -769,13 +824,14 @@ mod tests {
 
     #[test]
     fn parses_log_records() {
-        let raw = "aaaaaaaaa\x1fbbb ccc\x1f100\x1fAnn\x1fMerge it\x1fWhy:\nbecause\n\x1e\nddd\x1f\x1f50\x1fBob\x1fRoot\x1f\x1e\n";
+        let raw = "aaaaaaaaa\x1fbbb ccc\x1f100\x1fAnn\x1fann@x.org\x1fMerge it\x1fWhy:\nbecause\n\x1e\nddd\x1f\x1f50\x1fBob\x1f\x1fRoot\x1f\x1e\n";
         let log = parse_log(raw);
         assert_eq!(log.len(), 2);
         assert_eq!(log[0].0.short_id, "aaaaaaa");
         assert_eq!(log[0].0.parent.as_deref(), Some("bbb"));
         assert_eq!(log[0].1, vec!["bbb", "ccc"]);
         assert_eq!(log[0].0.body, "Why:\nbecause");
+        assert_eq!(log[0].0.email, "ann@x.org");
         assert_eq!(log[1].0.parent, None);
         assert_eq!(log[1].0.body, "");
         assert_eq!(log[1].0.time, 50);

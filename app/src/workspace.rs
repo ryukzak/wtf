@@ -67,7 +67,7 @@ struct DraggedTab {
 }
 
 /// What follows the mouse while a tab is dragged, and a button's tooltip.
-struct TabPreview(String);
+pub(crate) struct TabPreview(pub(crate) String);
 
 impl Render for TabPreview {
     fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
