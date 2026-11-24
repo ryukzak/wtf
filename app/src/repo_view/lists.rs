@@ -3,105 +3,696 @@
 use super::*;
 
 impl RepoView {
-    /// Sections of rows alike: uncommitted changes, the selection's commits,
-    /// then earlier ones; each row a title over a dimmed detail line.
-    pub(super) fn commit_list(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
-        let uncommitted = matches!(self.range, Some((_, Revision::Worktree(_))));
-        let worktree = self
-            .single_node()
-            .filter(|(_, node)| node.kind == wtf_core::NodeKind::Uncommitted)
-            .map(|(_, node)| graph_view::worktree_label(node, self.worktree_names));
-        let later = self.later_worktrees(theme, cx);
-        div()
-            .flex()
-            .flex_col()
-            .size_full()
-            .when(uncommitted || !later.is_empty(), |list| {
-                list.child(list_heading("Uncommitted".to_string(), theme))
+    /// One line of history, newest first, straight from the graph: a
+    /// worktree's changes, empty or not, then every commit down the line.
+    /// A bar on the left marks what the diff covers; a click inside it
+    /// picks, a click outside selects the commit, and the line stays as it
+    /// is to go forward again.
+    pub(super) fn commit_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let rows = self.line_rows();
+        let changed = *self.commit_rows.borrow() != rows;
+        if changed {
+            // Only the rows that changed are measured again, and the view
+            // stays where it was: a splice over the top row would scroll
+            // the list back to the splice's start.
+            let old = self.commit_rows.borrow();
+            let same_start = old.iter().zip(&rows).take_while(|(a, b)| a == b).count();
+            let same_end = old[same_start..]
+                .iter()
+                .rev()
+                .zip(rows[same_start..].iter().rev())
+                .take_while(|(a, b)| a == b)
+                .count();
+            let old_len = old.len();
+            drop(old);
+            let top = self.commit_list_state.logical_scroll_top();
+            self.commit_list_state.splice(
+                same_start..old_len - same_end,
+                rows.len() - same_start - same_end,
+            );
+            if (same_start..old_len - same_end).contains(&top.item_ix) {
+                self.commit_list_state.scroll_to(gpui::ListOffset {
+                    item_ix: top.item_ix.min(rows.len().saturating_sub(1)),
+                    offset_in_item: top.offset_in_item,
+                });
+            }
+            *self.commit_rows.borrow_mut() = rows;
+        }
+        // A new selection starts at the top of the panel, with the heading
+        // over it.
+        if self.commit_list_selection.borrow().as_slice() != self.selected_nodes.as_slice() {
+            *self.commit_list_selection.borrow_mut() = self.selected_nodes.clone();
+            let first = self.commit_rows.borrow().iter().position(|row| match row {
+                LineRow::Uncommitted { covered, .. }
+                | LineRow::Bar { covered, .. }
+                | LineRow::Commit { covered, .. } => *covered,
+                LineRow::Detached => false,
+                LineRow::Loose(_) => true,
+                LineRow::Heading(..) => false,
+            });
+            if let Some(first) = first {
+                let rows = self.commit_rows.borrow();
+                let heading = matches!(rows.get(first.wrapping_sub(1)), Some(LineRow::Heading(..)));
+                self.commit_list_state.scroll_to(gpui::ListOffset {
+                    item_ix: first - usize::from(heading),
+                    offset_in_item: px(0.),
+                });
+            }
+        }
+        if let Some(index) = self.scroll_to_commit.take() {
+            let id = self.commits.get(index).map(|commit| commit.id.as_str());
+            let row = self.commit_rows.borrow().iter().position(|row| match row {
+                LineRow::Commit { node, at, .. } => {
+                    Some(self.graph.nodes[*node].commits[*at].id.as_str()) == id
+                }
+                LineRow::Loose(loose) => *loose == index,
+                _ => false,
+            });
+            if let Some(row) = row {
+                self.commit_list_state.scroll_to_reveal_item(row);
+            }
+        }
+        // Bars from the top of the view down, and a few past its bottom,
+        // have their summaries made in that order.
+        let top = self.commit_list_state.logical_scroll_top().item_ix;
+        *self.summary_wanted.borrow_mut() = self
+            .commit_rows
+            .borrow()
+            .iter()
+            .enumerate()
+            .skip(top)
+            .filter_map(|(at, row)| match row {
+                LineRow::Bar { node, .. } => Some((at, *node)),
+                _ => None,
             })
-            .when(uncommitted, |list| {
-                list.child(
-                    list_item("uncommitted", self.narrowed.is_empty(), theme)
-                        .on_click(cx.listener(|this, _, _, cx| this.show_all_commits(cx)))
-                        .child(div().truncate().child("Uncommitted changes"))
-                        .child(
-                            div()
-                                .truncate()
-                                .text_xs()
-                                .text_color(theme.secondary)
-                                .child(worktree.unwrap_or_default()),
-                        ),
-                )
+            .scan(0, |past, (at, node)| {
+                *past += usize::from(at > top + VIEW_ROWS);
+                (*past <= SUMMARY_AHEAD).then_some(node)
             })
-            .children(later)
-            .when(!self.commits.is_empty(), |list| {
-                list.child(list_heading(
-                    format!("Commits · {}", self.commits.len()),
-                    theme,
-                ))
-            })
-            .child(
-                uniform_list(
-                    "commits",
-                    self.commits.len(),
-                    cx.processor(|this, range: std::ops::Range<usize>, window, cx| {
-                        let theme = Theme::for_appearance(window.appearance());
-                        let now = now_seconds();
-                        range
-                            .map(|index| {
-                                let commit = &this.commits[index];
-                                let selected =
-                                    this.narrowed.is_empty() || this.narrowed.contains(&index);
-                                let target = Target::Commit {
-                                    commit: commit.id.clone(),
-                                    message: full_message(commit),
-                                };
-                                list_item(("commit", index), selected, &theme)
-                                    // Focus moves to the list, for its ⌘A.
-                                    .on_click(cx.listener(
-                                        move |this, event: &ClickEvent, window, cx| {
-                                            this.focus.focus(window);
-                                            this.click_commit(index, event.modifiers(), cx)
-                                        },
-                                    ))
-                                    // The menu leaves the selection as it is.
-                                    .on_mouse_down(
-                                        MouseButton::Right,
-                                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                            this.open_context_menu(
-                                                target.clone(),
-                                                event.position,
-                                                cx,
-                                            );
-                                            cx.stop_propagation();
-                                        }),
-                                    )
-                                    .child(div().truncate().child(commit.summary.clone()))
-                                    .child(
-                                        div()
-                                            .truncate()
-                                            .text_xs()
-                                            .text_color(theme.secondary)
-                                            .child(format!(
-                                                "{} · {} · {}",
-                                                commit.short_id,
-                                                commit.author,
-                                                short_age(commit.time, now)
-                                            )),
-                                    )
-                            })
-                            .collect()
+            .collect();
+        gpui::list(
+            self.commit_list_state.clone(),
+            cx.processor(|this, row: usize, window, cx| {
+                let theme = Theme::for_appearance(window.appearance());
+                this.next_bar_summary(cx);
+                this.line_row(row, &theme, cx)
+            }),
+        )
+        .size_full()
+    }
+
+    /// The rows of the list's line.
+    fn line_rows(&self) -> Vec<LineRow> {
+        let nodes = &self.graph.nodes;
+        let chain = self.thread_chain();
+        let sides = self.sides(&chain);
+        let position = |node: Option<usize>| node.and_then(|n| chain.iter().position(|&c| c == n));
+        let span = position(self.selected_nodes.iter().max().copied())
+            .zip(position(self.selected_nodes.iter().min().copied()));
+        // A selection on a branch merged into the line shows under its merge.
+        let on_side = !self.selected_nodes.is_empty()
+            && self
+                .selected_nodes
+                .iter()
+                .all(|node| sides.values().any(|side| side.contains(node)));
+        let mut rows = Vec::new();
+        let Some((from, to)) = span.or(on_side.then_some((usize::MAX, usize::MAX))) else {
+            // Off any line, such as a branch the graph cannot draw.
+            if !self.commits.is_empty() {
+                rows.push(LineRow::Heading("Commits".to_string(), String::new()));
+                rows.extend((0..self.commits.len()).map(LineRow::Loose));
+            }
+            return rows;
+        };
+        let shared = |index: usize| {
+            self.graph.on_main.get(index).copied().unwrap_or(false) || nodes[index].channel
+        };
+        let now = now_seconds();
+        // A line no worktree is on says so where the changes would be.
+        if chain
+            .first()
+            .is_some_and(|&top| nodes[top].kind != wtf_core::NodeKind::Uncommitted)
+        {
+            rows.push(LineRow::Heading("Uncommitted".to_string(), String::new()));
+            rows.push(LineRow::Detached);
+        }
+        let (mut own_seen, mut shared_seen) = (false, false);
+        for (at, &index) in chain.iter().enumerate() {
+            let node = &nodes[index];
+            let covered = (from..=to).contains(&at);
+            if node.kind == wtf_core::NodeKind::Uncommitted {
+                rows.push(LineRow::Heading("Uncommitted".to_string(), String::new()));
+                rows.push(LineRow::Uncommitted {
+                    node: index,
+                    covered,
+                });
+                continue;
+            }
+            let is_shared = shared(index);
+            if is_shared && !shared_seen {
+                shared_seen = true;
+                let name = match self.graph.on_main.get(index) {
+                    Some(true) => self.graph.main.clone(),
+                    _ => node
+                        .refs
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| "Earlier".into()),
+                };
+                let note = match (own_seen, node.commits.last()) {
+                    (true, Some(fork)) => format!("forked {} ago", short_age(fork.time, now)),
+                    _ => String::new(),
+                };
+                rows.push(LineRow::Heading(name, note));
+            } else if !is_shared && !own_seen {
+                own_seen = true;
+                let name = chain
+                    .first()
+                    .and_then(|&top| nodes[top].branch.clone())
+                    .or_else(|| node.refs.first().cloned())
+                    .unwrap_or_else(|| "Commits".into());
+                rows.push(LineRow::Heading(name, String::new()));
+            }
+            // A bar of several commits has a header: a click selects them
+            // all, and folded, its summary stands for them.
+            if node.commits.len() >= 2 {
+                let folded = self.folds.get(&node.key).copied().unwrap_or(false);
+                rows.push(LineRow::Bar {
+                    node: index,
+                    covered,
+                    folded,
+                });
+                if folded {
+                    continue;
+                }
+            }
+            // A merge folds what it brought in under it: folded, unless
+            // the selection is there.
+            let side = sides.get(&index);
+            let side_covered =
+                side.is_some_and(|side| side.iter().any(|node| self.selected_nodes.contains(node)));
+            let side_folded = self
+                .folds
+                .get(&side_key(node))
+                .copied()
+                .unwrap_or(!side_covered);
+            rows.extend((0..node.commits.len()).rev().map(|at| LineRow::Commit {
+                node: index,
+                at,
+                covered,
+                shared: is_shared,
+                side: false,
+                merged: (at == 0 && side.is_some()).then_some(side_folded),
+            }));
+            if let Some(side) = side.filter(|_| !side_folded) {
+                for &branch in side {
+                    let covered = self.selected_nodes.contains(&branch);
+                    rows.extend(
+                        (0..nodes[branch].commits.len())
+                            .rev()
+                            .map(|at| LineRow::Commit {
+                                node: branch,
+                                at,
+                                covered,
+                                shared: is_shared,
+                                side: true,
+                                merged: None,
+                            }),
+                    );
+                }
+            }
+        }
+        rows
+    }
+
+    fn line_row(&self, row: usize, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let Some(line_row) = self.commit_rows.borrow().get(row).cloned() else {
+            return div().into_any_element();
+        };
+        let now = now_seconds();
+        match line_row {
+            LineRow::Heading(text, note) => heading_with(text, note, theme).into_any_element(),
+            LineRow::Uncommitted {
+                node: index,
+                covered,
+            } => {
+                let node = &self.graph.nodes[index];
+                let label = graph_view::worktree_label(node, self.worktree_names);
+                let detail = match (node.added, node.removed) {
+                    (0, 0) => format!("{label} · no changes"),
+                    (added, removed) => format!("{label} · +{added} −{removed}"),
+                };
+                let item = list_item(("uncommitted", index), covered, theme);
+                let item = match covered {
+                    true => bar(item, theme)
+                        .on_click(cx.listener(|this, _, _, cx| this.show_all_commits(cx))),
+                    false => hoverable(item, theme).on_click(cx.listener(move |this, _, _, cx| {
+                        this.select_and_reveal(index, cx);
+                        this.keep_list_scroll();
+                    })),
+                };
+                item.child(div().truncate().child("Uncommitted changes"))
+                    .child(
+                        div()
+                            .truncate()
+                            .text_xs()
+                            .text_color(theme.secondary)
+                            .child(detail),
+                    )
+                    .into_any_element()
+            }
+            LineRow::Bar {
+                node: index,
+                covered,
+                folded,
+            } => self.bar_header(index, covered, folded, theme, cx),
+            LineRow::Detached => {
+                let current = self.current_worktree_node();
+                let label = current
+                    .map(|node| {
+                        graph_view::worktree_label(&self.graph.nodes[node], self.worktree_names)
+                    })
+                    .map(|label| format!("{label} is elsewhere · click to go back"))
+                    .unwrap_or_default();
+                hoverable(list_item("detached", false, theme), theme)
+                    .text_color(theme.secondary)
+                    .when_some(current, |item, node| {
+                        item.on_click(
+                            cx.listener(move |this, _, _, cx| this.select_and_reveal(node, cx)),
+                        )
+                    })
+                    .child(div().truncate().child("Detached from worktree"))
+                    .child(div().truncate().text_xs().child(label))
+                    .into_any_element()
+            }
+            LineRow::Commit {
+                node,
+                at,
+                covered,
+                shared,
+                side,
+                merged,
+            } => {
+                let commit = &self.graph.nodes[node].commits[at];
+                // Where the diff's commits, once loaded, hold it.
+                let loaded = covered
+                    .then(|| self.commits.iter().position(|c| c.id == commit.id))
+                    .flatten();
+                let picked = covered
+                    && (self.narrowed.is_empty()
+                        || loaded.is_some_and(|i| self.narrowed.contains(&i)));
+                let item = list_item(("line", row), picked, theme);
+                let item = match (covered, shared) {
+                    (true, _) => bar(item, theme),
+                    (false, true) => dim_list_item(("line", row), theme),
+                    (false, false) => hoverable(item, theme),
+                };
+                let id = commit.id.clone();
+                let item = match (covered, loaded) {
+                    (true, Some(index)) => {
+                        item.on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                            // Focus moves to the list, for its ⌘A.
+                            this.focus.focus(window);
+                            this.click_commit(index, event.modifiers(), cx)
+                        }))
+                    }
+                    _ => item.on_click(cx.listener(move |this, _, _, cx| {
+                        this.select_commit(node, id.clone(), cx);
+                        this.keep_list_scroll();
+                    })),
+                };
+                // Under a bar's header, a guide down to its last commit.
+                let item = match (side, self.graph.nodes[node].commits.len() >= 2) {
+                    (true, _) => {
+                        item.pl(px(LIST_INDENT + SIDE_INDENT - if covered { 4. } else { 0. }))
+                    }
+                    (false, false) if merged.is_some() => indented(item, covered),
+                    (false, true) => guide(indented(item, covered), covered, false, at == 0, theme),
+                    (false, false) => item,
+                };
+                let fold = merged.map(|folded| {
+                    let merge = &self.graph.nodes[node];
+                    let chain = self.thread_chain();
+                    let count: usize = self
+                        .sides(&chain)
+                        .get(&node)
+                        .map(|side| {
+                            side.iter()
+                                .map(|&n| self.graph.nodes[n].commits.len())
+                                .sum()
+                        })
+                        .unwrap_or_default();
+                    (side_key(merge), folded, count)
+                });
+                self.commit_row(item, commit, now, fold, theme, cx)
+            }
+            LineRow::Loose(index) => {
+                let commit = &self.commits[index];
+                let picked = self.narrowed.is_empty() || self.narrowed.contains(&index);
+                let item = bar(list_item(("loose", index), picked, theme), theme).on_click(
+                    cx.listener(move |this, event: &ClickEvent, window, cx| {
+                        this.focus.focus(window);
+                        this.click_commit(index, event.modifiers(), cx)
                     }),
+                );
+                self.commit_row(item, commit, now, None, theme, cx)
+            }
+        }
+    }
+
+    /// A bar's header: a chevron that folds it, then its summary, or what
+    /// stands for one, over its count and age.
+    fn bar_header(
+        &self,
+        index: usize,
+        covered: bool,
+        folded: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let node = &self.graph.nodes[index];
+        let key = node.key.clone();
+        let count = node.commits.len();
+        let age = short_age(node.last_time, now_seconds());
+        let (title, waiting) = match self.summaries.get(&bar_summary_key(node)) {
+            Some(Some(Ok(summary))) if preferences::summaries() => (summary.header.clone(), false),
+            Some(None) => (String::new(), true),
+            _ => (String::new(), false),
+        };
+        let title = match title.is_empty() {
+            false => title,
+            true => node
+                .refs
+                .first()
+                .cloned()
+                .unwrap_or_else(|| format!("{count} commits")),
+        };
+        let detail = format!("{count} commits · {age}");
+        let summarized = !waiting
+            && self
+                .summaries
+                .get(&bar_summary_key(node))
+                .is_some_and(|summary| matches!(summary, Some(Ok(_))) && preferences::summaries());
+        let item = list_item(("bar", index), covered && self.narrowed.is_empty(), theme);
+        let item = indented(
+            match covered {
+                true => bar(item, theme),
+                false => hoverable(item, theme),
+            },
+            covered,
+        );
+        // The chevron hangs in the row's padding, so the title lines up
+        // with the commits' summaries.
+        let mark = match (waiting, summarized) {
+            (true, _) => Some(
+                div()
+                    .flex_none()
+                    .text_xs()
+                    .text_color(theme.secondary)
+                    .child("✦")
+                    .with_animation(
+                        ("summarizing", index),
+                        Animation::new(Duration::from_millis(1200))
+                            .repeat()
+                            .with_easing(pulsating_between(0.25, 1.)),
+                        |mark, delta| mark.opacity(delta),
+                    )
+                    .into_any_element(),
+            ),
+            (false, true) => Some(
+                div()
+                    .flex_none()
+                    .text_xs()
+                    .text_color(theme.secondary)
+                    .child("✦")
+                    .into_any_element(),
+            ),
+            _ => None,
+        };
+        let item = match folded {
+            true => item,
+            false => guide(item, covered, true, false, theme),
+        };
+        item.on_click(cx.listener(move |this, _, _, cx| {
+            match this.selected_nodes == [index] {
+                true => this.show_all_commits(cx),
+                false => this.select_and_reveal(index, cx),
+            }
+            this.keep_list_scroll();
+        }))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                // The chevron hangs in the padding, on the title's line.
+                .child(
+                    div()
+                        .id(("fold", index))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .w(px(12.))
+                        .ml(px(-15.))
+                        .mr(px(-3.))
+                        .cursor_pointer()
+                        .child(chevron(!folded, theme.secondary, 10.))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.folds.insert(key.clone(), !folded);
+                            cx.stop_propagation();
+                            cx.notify();
+                        })),
                 )
-                .track_scroll(self.commit_scroll.clone())
-                // As tall as its commits, shrinking to scroll when they run
-                // past the column, so the earlier ones follow right under it.
-                .h(px(self.commits.len() as f32 * LIST_ITEM_HEIGHT))
-                .flex_shrink()
-                .min_h_0(),
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .child(title),
+                )
+                .children(mark),
+        )
+        .child(
+            div()
+                .truncate()
+                .text_xs()
+                .text_color(theme.secondary)
+                .child(detail),
+        )
+        .into_any_element()
+    }
+
+    /// Leaves the commit list where it is for a selection made in it.
+    fn keep_list_scroll(&self) {
+        *self.commit_list_selection.borrow_mut() = self.selected_nodes.clone();
+    }
+
+    /// Asks the model to sum up a bar's commits, as the commit panel does a
+    /// selection's, when summaries are on and none is made or on its way.
+    /// Starts the next summary wanted, top down, when none is being made.
+    fn next_bar_summary(&mut self, cx: &mut Context<Self>) {
+        if self.bar_summary_running || !preferences::summaries() {
+            return;
+        }
+        let next = self.summary_wanted.borrow().iter().copied().find(|&node| {
+            self.graph
+                .nodes
+                .get(node)
+                .is_some_and(|node| !self.summaries.contains_key(&bar_summary_key(node)))
+        });
+        if let Some(node) = next {
+            self.request_bar_summary(node, cx);
+        }
+    }
+
+    fn request_bar_summary(&mut self, index: usize, cx: &mut Context<Self>) {
+        let (Some(node), Some(repo)) = (self.graph.nodes.get(index), self.repo_path.clone()) else {
+            return;
+        };
+        let key = bar_summary_key(node);
+        if !preferences::summaries() || self.summaries.contains_key(&key) {
+            return;
+        }
+        let commits: Vec<Commit> = node.commits.iter().rev().cloned().collect();
+        let (base, tip) = (node.base.clone(), node.tip.clone());
+        self.summaries.insert(key.clone(), None);
+        self.bar_summary_running = true;
+        let prompt = preferences::summary_prompt();
+        let run = cx.background_executor().spawn(async move {
+            wtf_core::summarize_commits(&repo, &commits, base.as_deref(), &tip, &prompt)
+                .map_err(message)
+        });
+        cx.spawn(async move |this, cx| {
+            let summary = run.await;
+            this.update(cx, |this, cx| {
+                this.summaries.insert(key, Some(summary));
+                this.bar_summary_running = false;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// A commit's summary over its detail, with its menu.
+    fn commit_row(
+        &self,
+        item: Stateful<gpui::Div>,
+        commit: &Commit,
+        now: i64,
+        fold: Option<(String, bool, usize)>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let detail = match &fold {
+            Some((_, _, count)) => format!("{} · +{count} merged", commit_detail(commit, now)),
+            None => commit_detail(commit, now),
+        };
+        // A merge's chevron hangs in the padding, on the summary's line.
+        let chevron_mark = fold.map(|(key, folded, _)| {
+            div()
+                .id(SharedString::from(key.clone()))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .w(px(12.))
+                .ml(px(-15.))
+                .mr(px(3.))
+                .cursor_pointer()
+                .child(chevron(!folded, theme.secondary, 10.))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.folds.insert(key.clone(), !folded);
+                    cx.stop_propagation();
+                    cx.notify();
+                }))
+        });
+        let target = Target::Commit {
+            commit: commit.id.clone(),
+            message: full_message(commit),
+        };
+        item
+            // The menu leaves the selection as it is.
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    this.open_context_menu(target.clone(), event.position, cx);
+                    cx.stop_propagation();
+                }),
             )
-            .children(self.earlier_commits(theme, cx))
-            .children(self.earlier_nodes(theme, cx))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .min_w_0()
+                    .children(chevron_mark)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .child(commit.summary.clone()),
+                    ),
+            )
+            .child(
+                div()
+                    .truncate()
+                    .text_xs()
+                    .text_color(theme.secondary)
+                    .child(detail),
+            )
+            .into_any_element()
+    }
+
+    /// The line the list shows, newest node first, down first parents.
+    fn thread_chain(&self) -> Vec<usize> {
+        let top = self
+            .thread
+            .as_deref()
+            .and_then(|key| self.graph.nodes.iter().position(|node| node.key == key))
+            .or_else(|| self.selected_nodes.iter().max().copied());
+        self.chain_from(top)
+    }
+
+    fn chain_from(&self, top: Option<usize>) -> Vec<usize> {
+        let mut chain = Vec::new();
+        let mut at = top.filter(|&top| top < self.graph.nodes.len());
+        while let Some(index) = at {
+            chain.push(index);
+            at = self.graph.nodes[index].parents.first().copied();
+        }
+        chain
+    }
+
+    /// What each merge on the line brought in: the nodes of the branch it
+    /// merged, newest first, back to where that branch left the line.
+    fn sides(&self, chain: &[usize]) -> HashMap<usize, Vec<usize>> {
+        let nodes = &self.graph.nodes;
+        let on_line: HashSet<usize> = chain.iter().copied().collect();
+        let mut sides = HashMap::new();
+        for &merge in chain {
+            let mut side = Vec::new();
+            for &parent in nodes[merge].parents.iter().skip(1) {
+                let mut at = Some(parent);
+                while let Some(index) = at.filter(|index| {
+                    !on_line.contains(index) && !side.contains(index) && side.len() < MAX_SIDE
+                }) {
+                    side.push(index);
+                    at = nodes[index].parents.first().copied();
+                }
+            }
+            if !side.is_empty() {
+                sides.insert(merge, side);
+            }
+        }
+        sides
+    }
+
+    /// The current worktree's node: the one last selected, or the tab's own.
+    fn current_worktree_node(&self) -> Option<usize> {
+        let current = self
+            .current_worktree_path()
+            .map(str::to_string)
+            .or_else(|| self.repo_path.clone())?;
+        let current = current.trim_end_matches('/');
+        self.graph.nodes.iter().position(|node| {
+            matches!(&node.tip, Revision::Worktree(path) if path.trim_end_matches('/') == current)
+        })
+    }
+
+    /// Whether the line starting at `top` holds `node`, on it or merged in.
+    fn line_holds(&self, top: usize, node: usize) -> bool {
+        let chain = self.chain_from(Some(top));
+        chain.contains(&node) || self.sides(&chain).values().any(|side| side.contains(&node))
+    }
+
+    /// Keeps the list's line while the selection stays on it; else takes the
+    /// line of a worktree holding the selection, the current one first, or
+    /// starts at the selection.
+    pub(super) fn follow_thread(&mut self) {
+        let Some(&top) = self.selected_nodes.iter().max() else {
+            return;
+        };
+        // The current worktree's line first, when it holds the selection;
+        // then the line shown, to go back and forth along it; else the
+        // selection's own, detached from any worktree.
+        if let Some(worktree) = self
+            .current_worktree_node()
+            .filter(|&worktree| self.line_holds(worktree, top))
+        {
+            self.thread = Some(self.graph.nodes[worktree].key.clone());
+            return;
+        }
+        let line = self
+            .thread
+            .as_deref()
+            .and_then(|key| self.graph.nodes.iter().position(|node| node.key == key));
+        if line.is_some_and(|line| self.line_holds(line, top)) {
+            return;
+        }
+        self.thread = Some(self.graph.nodes[top].key.clone());
     }
 
     /// The selected node when it is the only one.
@@ -110,127 +701,6 @@ impl RepoView {
             return None;
         };
         Some((selected, self.graph.nodes.get(selected)?))
-    }
-
-    /// Above a node's commits: the uncommitted changes of worktrees on it,
-    /// dimmed, one click away.
-    fn later_worktrees(&self, theme: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let Some((selected, node)) = self.single_node() else {
-            return Vec::new();
-        };
-        if node.kind == wtf_core::NodeKind::Uncommitted {
-            return Vec::new();
-        }
-        self.graph
-            .nodes
-            .iter()
-            .enumerate()
-            // Only worktrees with changes: a clean one has nothing to show.
-            .filter(|(_, worktree)| {
-                worktree.kind == wtf_core::NodeKind::Uncommitted
-                    && worktree.parents.first() == Some(&selected)
-                    && (worktree.added, worktree.removed) != (0, 0)
-            })
-            .map(|(w, worktree)| {
-                let label = graph_view::worktree_label(worktree, self.worktree_names);
-                dim_list_item(("later", w), theme)
-                    .on_click(cx.listener(move |this, _, _, cx| this.select_and_reveal(w, cx)))
-                    .child(div().truncate().child("Uncommitted changes"))
-                    .child(div().truncate().text_xs().child(label))
-                    .into_any_element()
-            })
-            .collect()
-    }
-
-    /// Below a node's commits: the nodes before it, a row each, to step back
-    /// along the line one click at a time.
-    fn earlier_nodes(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let (_, node) = self.single_node()?;
-        if node.kind == wtf_core::NodeKind::Uncommitted || self.commits.is_empty() {
-            return None;
-        }
-        let mut rows = Vec::new();
-        let mut at = node.parents.first().copied();
-        while let Some(index) = at.filter(|_| rows.len() < EARLIER_NODES) {
-            let earlier = &self.graph.nodes[index];
-            if let Some(newest) = earlier.commits.last() {
-                let count = earlier.commits.len();
-                let detail = match count {
-                    1 => format!("{} · {}", newest.short_id, newest.author),
-                    _ => format!("{count} commits · {}", newest.author),
-                };
-                rows.push(
-                    dim_list_item(("earlier-node", index), theme)
-                        .on_click(
-                            cx.listener(move |this, _, _, cx| this.select_and_reveal(index, cx)),
-                        )
-                        .child(div().truncate().child(newest.summary.clone()))
-                        .child(div().truncate().text_xs().child(detail)),
-                );
-            }
-            at = earlier.parents.first().copied();
-        }
-        if rows.is_empty() {
-            return None;
-        }
-        Some(
-            div()
-                .flex()
-                .flex_col()
-                .flex_none()
-                .child(list_heading("Earlier".to_string(), theme))
-                .children(rows)
-                .into_any_element(),
-        )
-    }
-
-    /// Below a worktree's uncommitted changes, which have no commits of their
-    /// own: the commits leading to them, dimmed, back to the oldest shown.
-    /// Clicking one selects its node in the graph.
-    fn earlier_commits(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if !self.commits.is_empty() {
-            return None;
-        }
-        let [selected] = self.selected_nodes[..] else {
-            return None;
-        };
-        let worktree = self.graph.nodes.get(selected)?;
-        if worktree.kind != wtf_core::NodeKind::Uncommitted {
-            return None;
-        }
-        let mut earlier = Vec::new();
-        let mut at = worktree.parents.first().copied();
-        while let Some(index) = at {
-            let node = &self.graph.nodes[index];
-            earlier.extend(node.commits.iter().rev().map(|commit| (index, commit)));
-            at = node.parents.first().copied();
-        }
-        let items = earlier.into_iter().enumerate().map(|(k, (node, commit))| {
-            let id = commit.id.clone();
-            dim_list_item(("earlier", k), theme)
-                .on_click(
-                    cx.listener(move |this, _, _, cx| this.select_commit(node, id.clone(), cx)),
-                )
-                .child(div().truncate().child(commit.summary.clone()))
-                .child(
-                    div()
-                        .truncate()
-                        .text_xs()
-                        .child(format!("{} · {}", commit.short_id, commit.author)),
-                )
-        });
-        Some(
-            div()
-                .id("earlier-commits")
-                .flex()
-                .flex_col()
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scroll()
-                .child(list_heading("Earlier".to_string(), theme))
-                .children(items)
-                .into_any_element(),
-        )
     }
 
     /// Files in the order the file tree lists them, folded folders included.
@@ -333,3 +803,139 @@ impl RepoView {
         .py(px(4.))
     }
 }
+
+/// How many bars past the view have their summaries made ahead of being
+/// seen, and about how many rows the view shows.
+const SUMMARY_AHEAD: usize = 3;
+const VIEW_ROWS: usize = 30;
+
+/// A row of the commit list.
+#[derive(Clone, PartialEq)]
+pub(super) enum LineRow {
+    /// A section title and a note on its right.
+    Heading(String, String),
+    /// A worktree's changes; `covered` when the diff shows them.
+    Uncommitted { node: usize, covered: bool },
+    /// A graph node's commit, by its place in the node.
+    Commit {
+        node: usize,
+        at: usize,
+        covered: bool,
+        shared: bool,
+        /// On a branch merged into the line, under its merge.
+        side: bool,
+        /// On a merge that brought commits in: whether they are folded.
+        merged: Option<bool>,
+    },
+    /// In place of a worktree's changes on a line no worktree is on.
+    Detached,
+    /// The header of a bar of several commits.
+    Bar {
+        node: usize,
+        covered: bool,
+        folded: bool,
+    },
+    /// One of the diff's commits, for a selection off the graph's lines.
+    Loose(usize),
+}
+
+/// A short id, the author's first name and an age.
+fn commit_detail(commit: &Commit, now: i64) -> String {
+    let author = commit.author.split_whitespace().next().unwrap_or_default();
+    format!(
+        "{} · {author} · {}",
+        commit.short_id,
+        short_age(commit.time, now)
+    )
+}
+
+/// A row the diff covers: a bar along its left edge.
+fn bar(item: Stateful<gpui::Div>, theme: &Theme) -> Stateful<gpui::Div> {
+    item.border_l(px(4.))
+        .border_color(theme.accent)
+        .pl(px(LIST_PADDING - 4.))
+}
+
+/// A bar's header or one of its commits, set in under its chevron.
+fn indented(item: Stateful<gpui::Div>, covered: bool) -> Stateful<gpui::Div> {
+    item.pl(px(LIST_INDENT - if covered { 4. } else { 0. }))
+}
+
+/// A section title with a note on the right.
+fn heading_with(text: String, note: String, theme: &Theme) -> gpui::Div {
+    div()
+        .flex_none()
+        .pl(px(LIST_PADDING))
+        .pr(px(10.))
+        .pt(px(8.))
+        .pb(px(2.))
+        .text_xs()
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(theme.secondary)
+        .flex()
+        .justify_between()
+        .gap(px(8.))
+        .child(div().truncate().child(text))
+        .child(
+            div()
+                .flex_none()
+                .font_weight(gpui::FontWeight::NORMAL)
+                .child(note),
+        )
+}
+
+/// A line down the gutter under a bar's chevron, through its commits: from
+/// under the chevron on the header, and ending short on the last commit.
+/// Not on the selected bar, which its blue edge marks.
+fn guide(
+    item: Stateful<gpui::Div>,
+    covered: bool,
+    header: bool,
+    last: bool,
+    theme: &Theme,
+) -> Stateful<gpui::Div> {
+    // A selected bar has its blue edge to show where it ends.
+    if covered {
+        return item;
+    }
+    let left = LIST_INDENT - 9.;
+    let top = if header { 26. } else { 0. };
+    let bottom = if last { 8. } else { 0. };
+    item.relative().child(
+        div()
+            .absolute()
+            .left(px(left))
+            .top(px(top))
+            .h(px(LIST_ITEM_HEIGHT - top - bottom))
+            .w(px(1.))
+            .bg(theme.secondary.opacity(0.5)),
+    )
+}
+
+/// A row outside the diff on the branch's own line: a click selects it.
+fn hoverable(item: Stateful<gpui::Div>, theme: &Theme) -> Stateful<gpui::Div> {
+    item.cursor_pointer()
+        .hover(|item| item.bg(theme.selection.opacity(0.5)))
+}
+
+/// The key a bar's summary is kept by: its commits, newest first, as the
+/// commit panel keys a selection's.
+fn bar_summary_key(node: &wtf_core::GraphNode) -> String {
+    node.commits
+        .iter()
+        .rev()
+        .map(|commit| commit.id.as_str())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The key a merge's side branch is folded by.
+fn side_key(merge: &wtf_core::GraphNode) -> String {
+    format!("side:{}", merge.key)
+}
+
+/// How much further in a merge's commits sit than the merge.
+const SIDE_INDENT: f32 = 12.;
+
+/// The most nodes a merge's side branch lists.
+const MAX_SIDE: usize = 200;

@@ -88,8 +88,6 @@ const PULL_DISTANCE: f32 = 160.;
 /// The Go To picker's width and how many results it lists.
 const GOTO_WIDTH: f32 = 600.;
 const GOTO_ROWS: usize = 14;
-/// How many nodes back the commit list offers under a node's commits.
-const EARLIER_NODES: usize = 3;
 const PROMPT_WIDTH: f32 = 420.;
 const ATTENTION_PANEL_WIDTH: f32 = 240.;
 const MIN_SIDEBAR_WIDTH: f32 = 180.;
@@ -457,7 +455,21 @@ pub struct RepoView {
     commit_focus: FocusHandle,
     /// A commit picked in the graph, to select once its node's commits load.
     pending_commit: Option<String>,
-    commit_scroll: UniformListScrollHandle,
+    commit_list_state: gpui::ListState,
+    /// The rows the commit list was last drawn with.
+    commit_rows: RefCell<Vec<lists::LineRow>>,
+    /// The selection the commit list last scrolled to.
+    commit_list_selection: RefCell<Vec<usize>>,
+    /// A listed commit to scroll to once the list is drawn.
+    scroll_to_commit: Cell<Option<usize>>,
+    /// The key of the node the commit list's line starts at.
+    thread: Option<String>,
+    /// Bars of the commit list folded or opened by hand, by node key.
+    folds: HashMap<String, bool>,
+    /// The bars whose summaries are wanted, top down, and whether one is
+    /// being made: they are made one at a time.
+    summary_wanted: RefCell<Vec<usize>>,
+    bar_summary_running: bool,
     message_scroll: ScrollHandle,
     /// A commit message being edited: the commit, the worktree whose latest
     /// commit it is, and the text so far.
@@ -638,7 +650,14 @@ impl RepoView {
             drafts: HashMap::new(),
             commit_focus: cx.focus_handle(),
             pending_commit: None,
-            commit_scroll: UniformListScrollHandle::new(),
+            commit_list_state: gpui::ListState::new(0, gpui::ListAlignment::Top, px(400.)),
+            commit_rows: RefCell::new(Vec::new()),
+            commit_list_selection: RefCell::new(Vec::new()),
+            scroll_to_commit: Cell::new(None),
+            thread: None,
+            folds: HashMap::new(),
+            summary_wanted: RefCell::new(Vec::new()),
+            bar_summary_running: false,
             message_scroll: ScrollHandle::new(),
             rewording: None,
             message_selection: None,
@@ -1426,6 +1445,7 @@ impl RepoView {
         self.selected_nodes = selected;
         self.narrowed.clear();
         self.commit_anchor = None;
+        self.follow_thread();
         // A snapshot keeps the last commits and files in view until the new
         // ones come, so stepping through versions does not flash.
         if !self.snapshot_mode {
@@ -1556,8 +1576,7 @@ impl RepoView {
         };
         self.narrowed = vec![index];
         self.commit_anchor = Some(index);
-        self.commit_scroll
-            .scroll_to_item(index, ScrollStrategy::Center);
+        self.scroll_to_commit.set(Some(index));
         self.reload_files(cx);
     }
 
@@ -2487,10 +2506,7 @@ impl Render for RepoView {
                                     .flex()
                                     .flex_1()
                                     .min_h_0()
-                                    .child(
-                                        column(self.commits_width)
-                                            .child(self.commit_list(&theme, cx)),
-                                    )
+                                    .child(column(self.commits_width).child(self.commit_list(cx)))
                                     .child(self.column_handle(
                                         "commits-border",
                                         Border::Commits,

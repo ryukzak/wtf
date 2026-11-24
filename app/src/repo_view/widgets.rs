@@ -58,18 +58,10 @@ pub(super) fn side_border_handle(id: &'static str, theme: &Theme) -> Stateful<gp
         )
 }
 
-/// A section title in the commit list.
-pub(super) fn list_heading(text: String, theme: &Theme) -> gpui::Div {
-    div()
-        .flex_none()
-        .px(px(10.))
-        .pt(px(8.))
-        .pb(px(2.))
-        .text_xs()
-        .font_weight(gpui::FontWeight::SEMIBOLD)
-        .text_color(theme.secondary)
-        .child(text)
-}
+/// Where the commit list's text starts, and inside a bar of several
+/// commits, with room for its chevron.
+pub(super) const LIST_PADDING: f32 = 10.;
+pub(super) const LIST_INDENT: f32 = 18.;
 
 pub(super) fn list_item(
     id: impl Into<gpui::ElementId>,
@@ -84,7 +76,8 @@ pub(super) fn list_item(
         .justify_center()
         .w_full()
         .h(px(LIST_ITEM_HEIGHT))
-        .px(px(10.))
+        .pl(px(LIST_PADDING))
+        .pr(px(10.))
         .overflow_hidden()
         .when(selected, |item| item.bg(theme.selection))
 }
