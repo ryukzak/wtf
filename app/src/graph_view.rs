@@ -231,6 +231,28 @@ pub struct StashPlace {
 
 pub fn layout(graph: &WorkflowGraph, order: WorktreeOrder) -> Layout {
     let mut xs = topological(graph);
+    // Branches stacked on others get lanes of their own, as stairs; the
+    // layout's other lanes come after them.
+    let (lane_of, mut step_from) = stair_lanes(graph);
+    let base = step_from.len();
+    // With stairs, a branch growing off another branch, not the main line,
+    // goes below it too, however its lane came about: a stack reads down.
+    if crate::preferences::stacks_as_stairs() {
+        for (i, node) in graph.nodes.iter().enumerate() {
+            let lane = lane_of[i];
+            let Some(&p) = node.parents.first() else {
+                continue;
+            };
+            let first = node.kind != NodeKind::Uncommitted
+                && lane_of[p] != lane
+                && lane_of[p] != 0
+                && step_from[lane].is_none()
+                && !graph.nodes[p].channel;
+            if first {
+                step_from[lane] = Some(lane_of[p]);
+            }
+        }
+    }
 
     // A clean worktree is a frame around its HEAD commit. A changed one is a
     // square right after that commit when nothing follows it; otherwise later
@@ -322,25 +344,38 @@ pub fn layout(graph: &WorkflowGraph, order: WorktreeOrder) -> Layout {
     // on the commit, but their leads rise to rows of their own above the
     // main row, not along the commit's row past later commits and their
     // labels, which would read as if the worktree were on them.
+    // Only what goes on along the commit's own row counts: branches forking
+    // off it go elsewhere, so the lead along the row passes none of them.
+    let mut continued = vec![false; graph.nodes.len()];
+    for (i, node) in graph.nodes.iter().enumerate() {
+        if node.kind == NodeKind::Uncommitted {
+            continue;
+        }
+        for &p in &node.parents {
+            if lane_of[p] == lane_of[i] {
+                continued[p] = true;
+            }
+        }
+    }
+    // A detached one has no branch to start from: its lead leaves the
+    // commit for a row of its own, whatever follows the commit.
     let framed_up: Vec<usize> = framed
         .iter()
         .copied()
-        .filter(|&w| followed[graph.nodes[w].parents[0]])
+        .filter(|&w| continued[graph.nodes[w].parents[0]] || graph.nodes[w].branch.is_none())
         .collect();
-    let lane_count = graph.lane_count + detached.len() + stash_rows.len() + framed_up.len();
+    let lane_count = base + detached.len() + stash_rows.len() + framed_up.len();
     // A worktree off the middle of the main line goes up; off another line,
     // down. Without the main line's history known, every one goes up.
     let goes_up = |worktree: usize| {
         let commit = graph.nodes[worktree].parents[0];
         followed[commit] && graph.on_main.get(commit).copied().unwrap_or(true)
     };
-    let own_lane = |worktree: usize| {
-        graph.lane_count + detached.iter().position(|&w| w == worktree).unwrap_or(0)
-    };
-    let stash_lane = |k: usize| graph.lane_count + detached.len() + k;
+    let own_lane =
+        |worktree: usize| base + detached.iter().position(|&w| w == worktree).unwrap_or(0);
+    let stash_lane = |k: usize| base + detached.len() + k;
     let framed_lane = |worktree: usize| {
-        graph.lane_count
-            + detached.len()
+        base + detached.len()
             + stash_rows.len()
             + framed_up.iter().position(|&w| w == worktree).unwrap_or(0)
     };
@@ -351,8 +386,8 @@ pub fn layout(graph: &WorkflowGraph, order: WorktreeOrder) -> Layout {
         match node.kind {
             NodeKind::Uncommitted if detached.contains(&i) => own_lane(i),
             NodeKind::Uncommitted if framed_up.contains(&i) => framed_lane(i),
-            NodeKind::Uncommitted => graph.nodes[node.parents[0]].lane,
-            _ => node.lane,
+            NodeKind::Uncommitted => lane_of[node.parents[0]],
+            _ => lane_of[i],
         }
     };
     let mut spans: Vec<Option<(f32, f32)>> = vec![None; lane_count];
@@ -389,10 +424,10 @@ pub fn layout(graph: &WorkflowGraph, order: WorktreeOrder) -> Layout {
             false => tags_start(i, &xs) + labels_width(graph, node),
             true => f32::INFINITY,
         };
-        widen(&mut spans, node.lane, start, end);
+        widen(&mut spans, lane_of[i], start, end);
         // A merge rail runs in the merged lane's row up to the merge.
         for &p in node.parents.iter().skip(1) {
-            if let Some(span) = &mut spans[graph.nodes[p].lane] {
+            if let Some(span) = &mut spans[lane_of[p]] {
                 span.1 = span.1.max(xs[i].0);
             }
         }
@@ -410,13 +445,13 @@ pub fn layout(graph: &WorkflowGraph, order: WorktreeOrder) -> Layout {
                         touches_main[own_lane(i)] = true;
                     }
                 }
-                false => named[graph.nodes[node.parents[0]].lane] = true,
+                false => named[lane_of[node.parents[0]]] = true,
             }
             continue;
         }
-        named[node.lane] |= !node.refs.is_empty();
+        named[lane_of[i]] |= !node.refs.is_empty();
         for &p in &node.parents {
-            match (node.lane, graph.nodes[p].lane) {
+            match (lane_of[i], lane_of[p]) {
                 (0, 0) => {}
                 (0, lane) => touches_main[lane] = true,
                 (lane, 0) => touches_main[lane] = true,
@@ -430,11 +465,7 @@ pub fn layout(graph: &WorkflowGraph, order: WorktreeOrder) -> Layout {
     // row between; so do worktrees stacked under another at a tip.
     let mid_lane = |k: usize| goes_up(detached[k]);
     let mut lanes: Vec<(usize, (f32, f32))> = (1..stash_lane(0))
-        .filter(|&lane| {
-            !(graph.lane_count..stash_lane(0)).contains(&lane) || {
-                !mid_lane(lane - graph.lane_count)
-            }
-        })
+        .filter(|&lane| !(base..stash_lane(0)).contains(&lane) || { !mid_lane(lane - base) })
         .chain(
             framed_up
                 .iter()
@@ -447,12 +478,13 @@ pub fn layout(graph: &WorkflowGraph, order: WorktreeOrder) -> Layout {
     // commit; other lanes follow by where they start.
     let mut worktree_lane = vec![false; lane_count];
     let mut times: Vec<Option<(i64, i64)>> = vec![None; lane_count];
-    for node in graph
+    for (i, node) in graph
         .nodes
         .iter()
-        .filter(|n| n.kind != NodeKind::Uncommitted)
+        .enumerate()
+        .filter(|(_, n)| n.kind != NodeKind::Uncommitted)
     {
-        let time = times[node.lane].get_or_insert((node.first_time, node.last_time));
+        let time = times[lane_of[i]].get_or_insert((node.first_time, node.last_time));
         *time = (time.0.min(node.first_time), time.1.max(node.last_time));
     }
     for (i, node) in graph.nodes.iter().enumerate() {
@@ -500,15 +532,55 @@ pub fn layout(graph: &WorkflowGraph, order: WorktreeOrder) -> Layout {
             })
     });
 
-    // Each lane takes the first row with a free stretch for it.
+    // Each lane takes the first row with a free stretch for it; a stair,
+    // one below the lane it steps down from.
     let mut row_of = vec![0; lane_count];
     let mut rows: Vec<Vec<(f32, f32)>> = vec![Vec::new()];
-    for (lane, (start, end)) in lanes {
+    // A stack goes in whole: each lane right after the one it steps down
+    // from, whatever its own place in the order, so it knows that one's row
+    // and no other lane comes between.
+    let in_order: Vec<usize> = lanes.iter().map(|&(lane, _)| lane).collect();
+    let parent_of = |lane: usize| {
+        step_from
+            .get(lane)
+            .copied()
+            .flatten()
+            .filter(|from| in_order.contains(from))
+    };
+    let mut ordered: Vec<(usize, (f32, f32))> = Vec::with_capacity(lanes.len());
+    let mut stack: Vec<usize> = Vec::new();
+    for &(root, _) in lanes.iter().filter(|&&(lane, _)| parent_of(lane).is_none()) {
+        stack.push(root);
+        while let Some(lane) = stack.pop() {
+            if let Some(&found) = lanes.iter().find(|&&(l, _)| l == lane) {
+                ordered.push(found);
+            }
+            // Children in the order's own order, the first on top.
+            let children: Vec<usize> = in_order
+                .iter()
+                .copied()
+                .filter(|&child| parent_of(child) == Some(lane))
+                .collect();
+            stack.extend(children.into_iter().rev());
+        }
+    }
+    // Any left, as a cycle would leave them, keep their place.
+    for &(lane, span) in &lanes {
+        if !ordered.iter().any(|&(l, _)| l == lane) {
+            ordered.push((lane, span));
+        }
+    }
+    for (lane, (start, end)) in ordered {
         let free = |row: &Vec<(f32, f32)>| {
             row.iter()
                 .all(|&(s, e)| end + ROW_GAP < s || e + ROW_GAP < start)
         };
-        let row = match (1..rows.len()).find(|&row| free(&rows[row])) {
+        let lowest = step_from
+            .get(lane)
+            .copied()
+            .flatten()
+            .map_or(1, |from| row_of[from] + 1);
+        let row = match (lowest.max(1)..rows.len()).find(|&row| free(&rows[row])) {
             Some(row) => row,
             None => {
                 rows.push(Vec::new());
@@ -531,7 +603,7 @@ pub fn layout(graph: &WorkflowGraph, order: WorktreeOrder) -> Layout {
     let mut above_row: Vec<Option<usize>> = vec![None; lane_count];
     let mut up: Vec<(usize, (f32, f32))> = (0..detached.len())
         .filter(|&k| mid_lane(k))
-        .map(|k| graph.lane_count + k)
+        .map(|k| base + k)
         .chain(
             framed_up
                 .iter()
@@ -803,17 +875,57 @@ const QUIET_AFTER: i64 = 86_400;
 /// How many beads past the first a release line's commits take at most.
 const RELEASE_BEADS: usize = 2;
 
+/// Whether node `i` steps down from its parent `p`, a branch stacked on
+/// another: it carries `p`'s lane on, `p` ends a named branch, and stacks
+/// are laid out as stairs. The main line and release lines never step.
+fn steps_down(graph: &WorkflowGraph, p: usize, i: usize) -> bool {
+    let (parent, node) = (&graph.nodes[p], &graph.nodes[i]);
+    crate::preferences::stacks_as_stairs()
+        && node.kind != NodeKind::Uncommitted
+        && parent.lane == node.lane
+        && node.lane != 0
+        && !parent.channel
+        && !node.channel
+        && parent
+            .refs
+            .iter()
+            .any(|name| graph.branches.iter().any(|b| b.name == *name))
+}
+
+/// The lanes the layout gives rows to: the graph's, with each branch
+/// stacked on another moved to a lane of its own; and for each lane made
+/// so, the lane it steps down from. Lanes made start at `graph.lane_count`.
+fn stair_lanes(graph: &WorkflowGraph) -> (Vec<usize>, Vec<Option<usize>>) {
+    let mut lane = vec![0; graph.nodes.len()];
+    let mut from: Vec<Option<usize>> = vec![None; graph.lane_count];
+    for (i, node) in graph.nodes.iter().enumerate() {
+        lane[i] = match node.parents.first() {
+            Some(&p) if node.kind != NodeKind::Uncommitted && steps_down(graph, p, i) => {
+                from.push(Some(lane[p]));
+                from.len() - 1
+            }
+            Some(&p) if graph.nodes[p].lane == node.lane => lane[p],
+            Some(&p) if node.kind == NodeKind::Uncommitted => lane[p],
+            _ => node.lane,
+        };
+    }
+    (lane, from)
+}
+
 /// Each node one column after its parents, as long as its commits' beads, and
 /// past a parent's labels when it continues that parent's branch.
 fn topological(graph: &WorkflowGraph) -> Vec<(f32, f32)> {
     let mut xs: Vec<(f32, f32)> = Vec::with_capacity(graph.nodes.len());
-    for node in &graph.nodes {
+    for (index, node) in graph.nodes.iter().enumerate() {
         let start = node
             .parents
             .iter()
             .map(|&p| {
                 let parent = &graph.nodes[p];
-                let labels = match parent.lane == node.lane {
+                // A branch stepping down from it clears its labels on the
+                // row below, so it starts as a fork would.
+                let continues = parent.lane == node.lane && !steps_down(graph, p, index);
+                let labels = match continues {
                     true => {
                         style().dot / 2. + TAG_GAP + labels_width(graph, parent) + style().curve
                     }
@@ -866,8 +978,6 @@ pub fn render(
         stash: shown_stash,
         current,
     } = marks;
-    // The commit the current worktree has checked out.
-    let current_head = current.and_then(|w| graph.nodes[w].parents.first().copied());
     // History, and a release line work grows from, are not the work's own:
     // muted.
     let color = |node: &GraphNode| match node.kind {
@@ -1170,36 +1280,6 @@ pub fn render(
         // A selected commit, bar or worktree's changes is underlined in the
         // text's color, near black or, when dark, near white: a border on the dots,
         // or the accent, would vanish on lanes of a like colour.
-        // The commit the current worktree has checked out has a line over
-        // it, as the current worktree's labels have: over its newest bead,
-        // above a drawn frame.
-        if current_head == Some(i) {
-            let frames = layout
-                .framed
-                .iter()
-                .filter(|&&w| graph.nodes[w].parents.first() == Some(&i))
-                .filter(|w| selected.contains(w))
-                .count();
-            let half = match frames {
-                0 => style().dot / 2.,
-                n => style().dot / 2. + FRAME_PAD + (n - 1) as f32 * FRAME_STEP,
-            };
-            let width = if end > start {
-                bead_width()
-            } else {
-                style().dot
-            };
-            content = content.child(
-                div()
-                    .absolute()
-                    .left(px(end - width / 2. - (half - style().dot / 2.)))
-                    .top(px(y - half - 3. - 2.5))
-                    .w(px(width + 2. * (half - style().dot / 2.)))
-                    .h(px(2.5))
-                    .rounded(px(1.5))
-                    .bg(theme.foreground),
-            );
-        }
         // Framed by a selected clean worktree, whose frame is drawn, the line
         // goes under the outermost frame, clear of it, as wide as the frame.
         if is_selected {
@@ -1595,7 +1675,8 @@ fn rails(edges: Vec<Edge>, width: f32) -> impl IntoElement {
 
 /// A node's commits as narrow ellipses close together over `length` pixels,
 /// one per commit up to what fits.
-/// Clicking a bead selects its commit; when commits outnumber the beads,
+/// Clicking a bead selects its commit, Cmd-click adds or removes it and
+/// Shift-click picks the commits from the last one; when commits outnumber the beads,
 /// each stands for the commit at its place along the node.
 /// With `selection`, the node is selected: beads for the commits picked in
 /// the commit list stand out and the others fade.
@@ -1667,12 +1748,18 @@ fn beads(
                 .cursor_pointer()
                 .on_mouse_down(MouseButton::Right, open_menu(menu.clone(), cx))
                 .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                    if event.modifiers().platform {
+                    let modifiers = event.modifiers();
+                    // Cmd or Shift on a selected node's bead picks commits as
+                    // in the commit list; elsewhere Cmd adds the node.
+                    let picked = (modifiers.platform || modifiers.shift)
+                        && this.pick_bead(node, &commit, modifiers, cx);
+                    if modifiers.platform && !picked {
                         return;
                     }
                     cx.stop_propagation();
                     match event.click_count() {
                         2 => this.check_out_here(&menu, window, cx),
+                        _ if picked => {}
                         _ => this.click_bead(node, commit.clone(), cx),
                     }
                 })),
@@ -2174,6 +2261,8 @@ mod tests {
         for parent in [1, 2] {
             let mut worktree = node(parent, &[parent], 1, 0);
             worktree.kind = NodeKind::Uncommitted;
+            // On a branch: a detached one would take a row of its own.
+            worktree.branch = Some(format!("b{parent}"));
             nodes.push(worktree);
         }
         let graph = graph(nodes);
@@ -2197,6 +2286,8 @@ mod tests {
         for parent in [1, 3] {
             let mut worktree = node(parent, &[parent], 1, 0);
             worktree.kind = NodeKind::Uncommitted;
+            // On a branch: a detached one would take a row of its own.
+            worktree.branch = Some(format!("b{parent}"));
             nodes.push(worktree);
         }
         let graph = graph(nodes);
@@ -2219,6 +2310,37 @@ mod tests {
             .iter()
             .map(|node| node.2)
             .collect()
+    }
+
+    #[test]
+    fn stacked_branches_step_down_a_row_each() {
+        // main, then a, b on a and c on b, all in one graph lane.
+        let mut nodes = vec![node(0, &[], 2, 0), node(1, &[0], 1, 1), node(1, &[1], 3, 2)];
+        nodes.push(node(1, &[2], 3, 3));
+        for (k, name) in ["a", "b", "c"].into_iter().enumerate() {
+            nodes[k + 1].refs = vec![name.to_string()];
+        }
+        let mut graph = graph(nodes);
+        graph.branches = ["a", "b", "c"]
+            .into_iter()
+            .map(|name| wtf_core::Branch {
+                name: name.to_string(),
+                ..Default::default()
+            })
+            .collect();
+        let rows = layout_rows(&graph, WorktreeOrder::ForkPoint);
+        if crate::preferences::stacks_as_stairs() {
+            assert!(
+                rows[1] < rows[2] && rows[2] < rows[3],
+                "each a row lower: {rows:?}"
+            );
+        }
+        let (lanes, from) = stair_lanes(&graph);
+        assert_eq!(lanes[1], 1);
+        if crate::preferences::stacks_as_stairs() {
+            assert_eq!(from[lanes[2]], Some(1));
+            assert_eq!(from[lanes[3]], Some(lanes[2]));
+        }
     }
 
     #[test]

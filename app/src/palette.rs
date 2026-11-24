@@ -27,7 +27,7 @@ pub fn commands() -> Vec<(&'static str, Box<dyn Action>)> {
         ("Toggle Side Panel", Box::new(ToggleSidePanel)),
         ("Toggle Attention Panel", Box::new(ToggleAttentionPanel)),
         ("Toggle Console", Box::new(ToggleConsole)),
-        ("Toggle Refresh Commands", Box::new(ToggleRefreshCommands)),
+        ("Show All Commands", Box::new(ToggleRefreshCommands)),
         (
             "Attention: Worktrees Only",
             Box::new(SetScope {

@@ -297,6 +297,8 @@ enum Section {
 enum Dropdown {
     Window,
     Authors,
+    /// The strip's pairs of modes past the first so many, which did not fit.
+    Modes(usize),
 }
 
 /// A small panel asking for one line of text.
@@ -353,6 +355,8 @@ pub struct RepoView {
     /// The prune list, when open: stale branches by name, and whether each is
     /// ticked to go.
     prune: Option<Vec<overlays::PruneItem>>,
+    /// The prune dialog's sections folded.
+    prune_folds: HashSet<overlays::PruneFold>,
     prune_focus: FocusHandle,
     /// The Go To picker or the command palette, when open: the query, the
     /// highlighted result, and whether it lists commands.
@@ -378,6 +382,9 @@ pub struct RepoView {
     open_with: Vec<String>,
     /// Shell commands run from the palette, newest first.
     shell_commands: Vec<String>,
+    /// What the palette ran lately, newest first, its commands and the
+    /// app's alike: `sh` or `app`, a tab, then the command or its name.
+    palette_recent: Vec<String>,
     /// File names a Tab in the palette left to choose from.
     completions: Vec<String>,
     /// The open side panel, and the one ⌘R opens.
@@ -405,6 +412,10 @@ pub struct RepoView {
     hovered_line: Cell<Option<(usize, usize)>>,
     /// Code colors of the diffs shown, by file, appearance and view.
     syntax: RefCell<HashMap<ColorKey, Rc<syntax::Colors>>>,
+    /// Colors being made, and how many times the made ones were dropped:
+    /// colors made for diffs replaced since are not kept.
+    syntax_making: RefCell<HashSet<ColorKey>>,
+    syntax_generation: Cell<u64>,
     /// A drag of the graph: where the mouse went down and the scroll then.
     graph_drag: Option<(Point<Pixels>, Point<Pixels>)>,
     /// Set when a repository opens, until the graph is first laid out.
@@ -445,14 +456,27 @@ pub struct RepoView {
     diff_mode: DiffMode,
     /// Long diff lines wrap; otherwise they run on and scroll sideways.
     wrap_lines: bool,
+    /// Diffs in one column or split, as chosen by hand; `None` to go by
+    /// the room there is.
+    unified: Option<bool>,
+    /// What the room called for when last drawn: a change drops a choice.
+    one_column_by_room: Cell<Option<bool>>,
+    /// Whether diffs show in one column now, by choice or for want of room.
+    one_column: Cell<bool>,
     /// How far the diff's code is scrolled sideways, and how far it can go.
     diff_x: Cell<f32>,
     diff_max_x: Cell<f32>,
+    /// The room for code a side has, and a character's width: where lines
+    /// run past the edge.
+    scroll_room: Cell<(f32, f32)>,
     /// The diff's width when last drawn, and the characters a side then
     /// holds, which the wrapped all-files view is laid out at.
     diff_width: Cell<(f32, f32)>,
     wrap_cols: Option<usize>,
     stacked: Vec<StackItem>,
+    /// The longest line among the rows the stack shows, in characters: as
+    /// far as its code scrolls sideways.
+    stacked_widest: usize,
     stacked_diffs: Vec<Result<FileDiff, String>>,
     /// The files `stacked_diffs` were made from: until a refresh brings
     /// new diffs, `files` may hold others at the same places.
@@ -496,6 +520,8 @@ pub struct RepoView {
     /// Summaries of selections of several commits, by their commits: `None`
     /// while the model writes one.
     summaries: HashMap<String, Option<Result<wtf_core::Summary, String>>>,
+    /// Summaries asked for again, shown until the new ones come.
+    replaced_summaries: HashMap<String, wtf_core::Summary>,
     /// The commits' own subjects show under a summary.
     show_subjects: bool,
     selecting_message: bool,
@@ -519,6 +545,8 @@ pub struct RepoView {
     stacked_scroll: UniformListScrollHandle,
     /// The commit header's height, as last laid out; the diff starts below it.
     header_height: f32,
+    /// How tall the side strip was last drawn, to know what fits in it.
+    strip_height: Cell<f32>,
     /// How wide the commit header was last drawn.
     header_width: f32,
     /// What a diff changes, by its range: files, lines added and removed.
@@ -540,7 +568,8 @@ pub struct RepoView {
     /// A stash asked for in the terminal: the newest stash before it, and
     /// when it was asked for.
     awaiting_stash: Option<(Option<String>, std::time::Instant)>,
-    hide_refresh: bool,
+    /// Every command the app runs in the terminal, whatever Settings say.
+    show_all_commands: bool,
     log_seq: u64,
     /// The directory of the last command printed in the terminal.
     announced_dir: Option<String>,
@@ -621,9 +650,11 @@ impl RepoView {
             snapshot_search_focus: cx.focus_handle(),
             commit_list_focus: cx.focus_handle(),
             prune: None,
+            prune_folds: HashSet::new(),
             prune_focus: cx.focus_handle(),
             open_with: popups::load_recent("open-with"),
             shell_commands: popups::load_recent("commands"),
+            palette_recent: popups::load_recent("palette-recent"),
             completions: Vec::new(),
             side_panel: None,
             last_panel: SidePanel::Attention,
@@ -640,6 +671,8 @@ impl RepoView {
             reveal_stash: false,
             hovered_line: Cell::new(None),
             syntax: RefCell::new(HashMap::new()),
+            syntax_making: RefCell::new(HashSet::new()),
+            syntax_generation: Cell::new(0),
             graph_drag: None,
             scroll_to_end: Cell::new(true),
             graph_away: Cell::new((false, false)),
@@ -662,11 +695,16 @@ impl RepoView {
             selected_file: None,
             diff_mode: DiffMode::Text,
             wrap_lines: false,
+            unified: None,
+            one_column_by_room: Cell::new(None),
+            one_column: Cell::new(false),
             diff_x: Cell::new(0.),
             diff_max_x: Cell::new(0.),
+            scroll_room: Cell::new((0., 0.)),
             diff_width: Cell::new((-1., -1.)),
             wrap_cols: None,
             stacked: Vec::new(),
+            stacked_widest: 0,
             stacked_diffs: Vec::new(),
             stacked_files: Vec::new(),
             worktree_split: None,
@@ -689,6 +727,7 @@ impl RepoView {
             rewording: None,
             message_selection: None,
             summaries: HashMap::new(),
+            replaced_summaries: HashMap::new(),
             show_subjects: false,
             selecting_message: false,
             message_focus: cx.focus_handle(),
@@ -703,12 +742,13 @@ impl RepoView {
             stacked_scroll: UniformListScrollHandle::new(),
             header_height: 0.,
             header_width: 0.,
+            strip_height: Cell::new(0.),
             totals: None,
             totals_task: None,
             is_loading_diff: false,
             error_message: None,
             console_open: false,
-            hide_refresh: true,
+            show_all_commands: false,
             window_active: true,
             restore_keys: Vec::new(),
             current_worktree: None,
@@ -1587,6 +1627,35 @@ impl RepoView {
         }
     }
 
+    /// Cmd- or Shift-click on a bead of a selected node: adds or removes its
+    /// commit, or picks the run from the last picked one, as in the commit
+    /// list. False when the node isn't selected or its commits aren't loaded.
+    pub fn pick_bead(
+        &mut self,
+        node: usize,
+        commit: &str,
+        modifiers: Modifiers,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.selected_nodes.contains(&node) {
+            return false;
+        }
+        let Some(index) = self.commits.iter().position(|c| c.id == commit) else {
+            return false;
+        };
+        // Nothing picked yet: the whole node was shown; a Shift-click then
+        // runs from the node's newest commit.
+        if self.narrowed.is_empty() && modifiers.shift && self.commit_anchor.is_none() {
+            self.commit_anchor = Some(0);
+        }
+        self.click_commit(index, modifiers, cx);
+        if self.narrowed.is_empty() {
+            self.commit_anchor = None;
+        }
+        cx.notify();
+        true
+    }
+
     /// Selects a commit from elsewhere, such as Go To: its node, then the
     /// commit once the node's commits are loaded.
     fn select_commit(&mut self, node: usize, commit: String, cx: &mut Context<Self>) {
@@ -1827,9 +1896,10 @@ impl RepoView {
         };
         self.is_loading_diff = !refresh;
         let (file, mode) = (file.clone(), self.diff_mode);
+        let text_only = preferences::text_only_rule();
         let load = cx
             .background_executor()
-            .spawn(async move { wtf_core::file_diff(repo_path, file, mode) });
+            .spawn(async move { wtf_core::file_diff(repo_path, file, mode, &text_only) });
         self.diff_task = Some(cx.spawn(async move |this, cx| {
             let result = load.await;
             this.update(cx, |this, cx| {
@@ -1837,7 +1907,8 @@ impl RepoView {
                 match result {
                     Ok(diff) => {
                         if !refresh {
-                            let first = diff_view::first_change(&diff.rows).unwrap_or(0);
+                            let first =
+                                diff_view::first_change(this.shown_rows(&diff)).unwrap_or(0);
                             // Changes near the top leave the commit header in view.
                             let row = match first.saturating_sub(CONTEXT_ROWS) {
                                 0 => 0,
@@ -1848,6 +1919,7 @@ impl RepoView {
                         }
                         this.diff = Some(diff);
                         this.syntax.borrow_mut().clear();
+                        this.syntax_generation.set(this.syntax_generation.get() + 1);
                         this.error_message = None;
                     }
                     Err(error) => this.error_message = Some(message(error)),
@@ -1868,7 +1940,8 @@ impl RepoView {
         }
         // The log is shared by all windows; this one shows its repository's.
         new.retain(|entry| self.runs_here(&entry.dir));
-        let lines = console_view::lines(&new, self.hide_refresh, &mut self.announced_dir);
+        let shown = preferences::terminal_shown(self.show_all_commands);
+        let lines = console_view::lines(&new, &shown, &mut self.announced_dir);
         if let Some(terminal) = &self.terminal {
             terminal.update(cx, |terminal, cx| terminal.announce(lines, cx));
         }
@@ -2026,8 +2099,90 @@ impl RepoView {
     }
 
     fn toggle_refresh_commands(&mut self, cx: &mut Context<Self>) {
-        self.hide_refresh = !self.hide_refresh;
+        self.show_all_commands = !self.show_all_commands;
         cx.notify();
+    }
+
+    /// A tab with no repository yet: a line on what wtf is for, a button
+    /// to open one, and the ones opened lately, a click away.
+    fn welcome(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let recent: Vec<String> = recent::load().into_iter().take(WELCOME_RECENT).collect();
+        let rows = recent.into_iter().enumerate().map(|(k, path)| {
+            let name = workspace::folder_name(&path);
+            let open = path.clone();
+            div()
+                .id(("welcome-recent", k))
+                .flex()
+                .items_baseline()
+                .gap(px(8.))
+                .px(px(10.))
+                .py(px(5.))
+                .rounded(px(5.))
+                .cursor_pointer()
+                .hover(|row| row.bg(theme.selection))
+                .on_click(cx.listener(move |_, _, window, cx| {
+                    window.dispatch_action(Box::new(OpenPath { path: open.clone() }), cx)
+                }))
+                .child(
+                    div()
+                        .flex_none()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .child(name),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .text_color(theme.secondary)
+                        .child(popups::tilde(&path)),
+                )
+        });
+        let recent = rows.collect::<Vec<_>>();
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .items_center()
+            .justify_center()
+            .gap(px(16.))
+            .child(
+                div()
+                    .text_color(theme.secondary)
+                    .child("Open a Git repository to review its worktrees and commits."),
+            )
+            .child(
+                div()
+                    .id("welcome-open")
+                    .px(px(14.))
+                    .py(px(6.))
+                    .rounded(px(6.))
+                    .bg(theme.accent)
+                    .text_color(gpui::white())
+                    .cursor_pointer()
+                    .hover(|button| button.opacity(0.9))
+                    .on_click(cx.listener(|this, _, window, cx| this.choose_repository(window, cx)))
+                    .child("Open Repository…  ⌘O"),
+            )
+            .when(!recent.is_empty(), |page| {
+                page.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .w(px(420.))
+                        .max_w_full()
+                        .child(
+                            div()
+                                .px(px(10.))
+                                .pb(px(4.))
+                                .text_xs()
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(theme.secondary)
+                                .child("Recent"),
+                        )
+                        .children(recent),
+                )
+            })
     }
 
     fn detail(&self, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> AnyElement {
@@ -2091,15 +2246,9 @@ impl RepoView {
                 .bounds()
                 .size
                 .width;
-            let widest = self
-                .stacked_diffs
-                .iter()
-                .flatten()
-                .map(|diff| diff_view::widest(&diff.rows))
-                .max()
-                .unwrap_or(0);
+            let widest = self.stacked_widest;
             self.track_widest(widest, f32::from(width), true, window);
-            let list = uniform_list(
+            let list = vertical_only(uniform_list(
                 "stacked",
                 spacers + self.stacked.len(),
                 cx.processor(move |this, range: std::ops::Range<usize>, window, cx| {
@@ -2114,7 +2263,7 @@ impl RepoView {
                         })
                         .collect()
                 }),
-            )
+            ))
             .track_scroll(self.stacked_scroll.clone())
             .flex_1()
             .size_full()
@@ -2182,43 +2331,48 @@ impl RepoView {
             return self.with_header(placeholder("Loading…", None, theme), theme, window, cx);
         }
         let shown = match &self.diff {
-            Some(diff) if !diff.rows.is_empty() => {
+            Some(diff) if !self.shown_rows(diff).is_empty() => {
                 let spacers = self.header_rows();
                 let width = self.diff_scroll.0.borrow().base_handle.bounds().size.width;
                 let cols = self.wrap_cols_for(f32::from(width), false, window);
-                let widest = diff_view::widest(&diff.rows);
+                let widest = diff_view::widest_changed(self.shown_rows(diff));
+                let one = self.one_column.get();
                 self.track_widest(widest, f32::from(width), false, window);
                 // Wrapped, each row takes as many list rows as it has lines.
                 let lines: Rc<Vec<(usize, usize)>> = Rc::new(match cols {
-                    Some(cols) => diff
-                        .rows
+                    Some(cols) => self
+                        .shown_rows(diff)
                         .iter()
                         .enumerate()
                         .flat_map(|(i, row)| {
                             (0..diff_view::parts(row, cols)).map(move |part| (i, part))
                         })
                         .collect(),
-                    None => (0..diff.rows.len()).map(|i| (i, 0)).collect(),
+                    None => (0..self.shown_rows(diff).len()).map(|i| (i, 0)).collect(),
                 });
                 let count = lines.len();
-                let list = uniform_list(
+                let list = vertical_only(uniform_list(
                     "diff",
                     spacers + count,
-                    cx.processor(move |this, range: std::ops::Range<usize>, window, _| {
+                    cx.processor(move |this, range: std::ops::Range<usize>, window, cx| {
                         let theme = Theme::for_appearance(window.appearance());
-                        let rows = this.diff.as_ref().map_or(&[][..], |diff| &diff.rows);
+                        let rows = this
+                            .diff
+                            .as_ref()
+                            .map_or(&[][..], |diff| diff_view::shown(diff, one));
                         range
                             .filter_map(|index| match index.checked_sub(spacers) {
                                 None => Some(spacer()),
                                 Some(index) => {
                                     let &(i, part) = lines.get(index)?;
                                     rows.get(i).map(|row| {
-                                        let colors = this.diff_colors(None, &theme);
+                                        let colors = this.diff_colors(None, &theme, cx);
                                         diff_view::row(
                                             row,
                                             &theme,
                                             colors.as_deref(),
                                             this.fit(cols, part),
+                                            one,
                                         )
                                         .into_any_element()
                                     })
@@ -2226,7 +2380,7 @@ impl RepoView {
                             })
                             .collect()
                     }),
-                )
+                ))
                 .track_scroll(self.diff_scroll.clone())
                 .size_full()
                 .font_family(preferences::code_font())
@@ -2350,6 +2504,26 @@ impl RepoView {
             .border_l_1()
             .border_color(theme.separator)
             .bg(theme.graph_background)
+            .relative()
+            .child({
+                // Its height decides how many modes it shows.
+                let view = cx.entity().downgrade();
+                canvas(
+                    move |bounds, _, cx| {
+                        let height = f32::from(bounds.size.height);
+                        view.update(cx, |this, cx| {
+                            if (this.strip_height.get() - height).abs() > 0.5 {
+                                this.strip_height.set(height);
+                                cx.notify();
+                            }
+                        })
+                        .ok();
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full()
+            })
             .child(tab(SidePanel::Attention, "Attention"))
             .child(tab(SidePanel::Files, "Files"))
             .child(div().w(px(16.)).h(px(1.)).bg(theme.separator))
@@ -2426,6 +2600,9 @@ fn local_datetime(time: i64) -> String {
 
 /// The height of a commit list row.
 const LIST_ITEM_HEIGHT: f32 = 40.;
+
+/// How many recent repositories a new tab offers.
+const WELCOME_RECENT: usize = 8;
 
 /// A diff's two ends: a base, `None` for the empty tree, and a tip.
 type DiffRange = (Option<String>, Revision);
@@ -2627,62 +2804,78 @@ impl Render for RepoView {
             .bg(theme.background)
             .text_color(theme.foreground)
             .text_sm()
-            .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .min_h_0()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .when(self.repo_path.is_some(), |view| {
-                                view.child(self.graph_band(&theme, window, cx))
-                            })
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_1()
-                                    .min_h_0()
-                                    .child(column(self.commits_width).child(self.commit_list(cx)))
-                                    .child(self.column_handle(
-                                        "commits-border",
-                                        Border::Commits,
-                                        &theme,
-                                        cx,
-                                    ))
-                                    .child(
-                                        div().flex().flex_col().flex_1().min_w_0().h_full().child(
+            // A new tab: what to open, and nothing else.
+            .when(self.repo_path.is_none(), |root| {
+                root.child(self.welcome(&theme, cx))
+            })
+            .when(self.repo_path.is_some(), |root| {
+                root.child(
+                    div()
+                        .flex()
+                        .flex_1()
+                        .min_h_0()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .min_w_0()
+                                .h_full()
+                                .when(self.repo_path.is_some(), |view| {
+                                    view.child(self.graph_band(&theme, window, cx))
+                                })
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_1()
+                                        .min_h_0()
+                                        .child(
+                                            column(self.commits_width).child(self.commit_list(cx)),
+                                        )
+                                        .child(self.column_handle(
+                                            "commits-border",
+                                            Border::Commits,
+                                            &theme,
+                                            cx,
+                                        ))
+                                        .child(
                                             div()
+                                                .flex()
+                                                .flex_col()
                                                 .flex_1()
-                                                .min_h_0()
-                                                .child(self.detail(&theme, window, cx)),
+                                                .min_w_0()
+                                                .h_full()
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .min_h_0()
+                                                        .child(self.detail(&theme, window, cx)),
+                                                ),
                                         ),
+                                )
+                                .when(self.console_open, |view| view.child(self.dock(&theme, cx))),
+                        )
+                        // The open sidebar's left edge resizes it.
+                        .when(
+                            self.repo_path.is_some() && self.side_panel.is_some(),
+                            |row| {
+                                // The same grip as the graph's border, standing up.
+                                row.child(
+                                    side_border_handle("sidebar-border", &theme).on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.dragging = Some(Border::Sidebar);
+                                            cx.stop_propagation();
+                                        }),
                                     ),
-                            )
-                            .when(self.console_open, |view| view.child(self.dock(&theme, cx))),
-                    )
-                    // The open sidebar's left edge resizes it.
-                    .when(
-                        self.repo_path.is_some() && self.side_panel.is_some(),
-                        |row| {
-                            // The same grip as the graph's border, standing up.
-                            row.child(side_border_handle("sidebar-border", &theme).on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    this.dragging = Some(Border::Sidebar);
-                                    cx.stop_propagation();
-                                }),
-                            ))
-                        },
-                    )
-                    .when(self.repo_path.is_some(), |row| {
-                        row.child(self.side_panel_view(&theme, window, cx))
-                    }),
-            )
+                                )
+                            },
+                        )
+                        .when(self.repo_path.is_some(), |row| {
+                            row.child(self.side_panel_view(&theme, window, cx))
+                        }),
+                )
+            })
             .children(self.context_menu_view(&theme, cx))
             .children(self.dropdown_view(&theme, cx))
             .children(self.prompt_view(&theme, window, cx))
@@ -3011,16 +3204,21 @@ impl RepoView {
         };
         match self.node_of_commit(&id) {
             Some(node) => self.select_commit(node, id, cx),
-            // Beyond the graph: its history comes in first.
-            None => {
-                self.snapshot.pending = Some(id);
-                if self.graph.older > 0 && !self.loading_older {
-                    self.loading_older = true;
-                    self.history += self.graph.older;
-                    self.start_refresh(cx);
-                }
-            }
+            // Not in the graph, as on an old merged branch it leaves out:
+            // shown on its own, as the graph cannot select it.
+            None => self.show_commit_off_graph(id, cx),
         }
+        cx.notify();
+    }
+
+    /// Shows a commit the graph has no node for: its changes from its first
+    /// parent, its own commit listed alone.
+    fn show_commit_off_graph(&mut self, id: String, cx: &mut Context<Self>) {
+        self.set_selection(Vec::new(), cx);
+        self.range = Some((Some(format!("{id}^")), Revision::Commit(id)));
+        self.outside_graph = true;
+        self.load_commits(cx);
+        self.load_files(None, cx);
         cx.notify();
     }
 
@@ -3454,9 +3652,9 @@ impl RepoView {
             match cached {
                 Some((made_dark, colors)) if made_dark == dark => colors,
                 _ => {
-                    let diff = FileDiff {
-                        language: String::new(),
-                        rows: lines
+                    let diff = FileDiff::new(
+                        String::new(),
+                        lines
                             .iter()
                             .enumerate()
                             .map(|(i, line)| wtf_core::DiffRow {
@@ -3468,7 +3666,7 @@ impl RepoView {
                                 }),
                             })
                             .collect(),
-                    };
+                    );
                     let colors = Rc::new(syntax::colors(&path, &diff, dark));
                     self.snapshot.colors.replace(Some((dark, colors.clone())));
                     colors
@@ -3592,10 +3790,7 @@ mod tests {
                 }
             })
             .collect();
-        FileDiff {
-            language: "Text".to_string(),
-            rows,
-        }
+        FileDiff::new("Text".to_string(), rows)
     }
 
     fn commit(id: &str, parent: &str) -> Commit {
@@ -3735,6 +3930,7 @@ mod tests {
             [false; 2],
             false,
             None,
+            false,
         )
         .iter()
         .map(|item| match item {
@@ -3757,6 +3953,7 @@ mod tests {
             [true, false],
             false,
             None,
+            false,
         )
         .iter()
         .map(|item| match item {
@@ -3768,25 +3965,35 @@ mod tests {
         assert_eq!(folded_unstaged, ["?", "false:2", "?", "true:1", "?", "H2"]);
 
         // Each hunk of a worktree file gets a header before its rows.
-        let open: Vec<String> =
-            stack_items(&diffs[2..], &[false], Some(0), [false; 2], false, None)
-                .iter()
-                .map(|item| match item {
-                    StackItem::Section(staged, count) => format!("{staged}:{count}"),
-                    StackItem::Header(file) => format!("H{file}"),
-                    StackItem::Hunk(file, start, end) => format!("@{file}:{start}-{end}"),
-                    StackItem::Row(file, row, _) => format!("{file}:{row}"),
-                    _ => "?".to_string(),
-                })
-                .collect();
+        let open: Vec<String> = stack_items(
+            &diffs[2..],
+            &[false],
+            Some(0),
+            [false; 2],
+            false,
+            None,
+            false,
+        )
+        .iter()
+        .map(|item| match item {
+            StackItem::Section(staged, count) => format!("{staged}:{count}"),
+            StackItem::Header(file) => format!("H{file}"),
+            StackItem::Hunk(file, start, end) => format!("@{file}:{start}-{end}"),
+            StackItem::Row(file, row, _) => format!("{file}:{row}"),
+            _ => "?".to_string(),
+        })
+        .collect();
+        // An empty unstaged section says so, with a note.
         assert_eq!(
             open,
-            ["?", "false:0", "?", "true:1", "?", "H0", "@0:0-1", "0:0"]
+            [
+                "?", "false:0", "?", "?", "true:1", "?", "H0", "@0:0-1", "0:0"
+            ]
         );
 
         // Too many files to open at once: a note says why, and every file
         // keeps its header, folded.
-        let many = stack_items(&diffs, &[true; 3], Some(2), [false; 2], true, None);
+        let many = stack_items(&diffs, &[true; 3], Some(2), [false; 2], true, None, false);
         assert!(matches!(&many[0], StackItem::Note(note) if note.starts_with("3 files")));
         let headers = many
             .iter()
@@ -3795,7 +4002,15 @@ mod tests {
         assert_eq!(headers, 3);
         assert!(!many.iter().any(|item| matches!(item, StackItem::Row(..))));
 
-        let nothing_staged = stack_items(&diffs[..1], &[true], Some(1), [false; 2], false, None);
+        let nothing_staged = stack_items(
+            &diffs[..1],
+            &[true],
+            Some(1),
+            [false; 2],
+            false,
+            None,
+            false,
+        );
         assert!(matches!(
             nothing_staged.last(),
             Some(StackItem::Section(true, 0))
@@ -3850,7 +4065,7 @@ mod tests {
             Err("binary".to_string()),
         ];
         let kinds = |folded: &[bool]| -> Vec<String> {
-            stack_items(&diffs, folded, None, [false; 2], false, None)
+            stack_items(&diffs, folded, None, [false; 2], false, None, false)
                 .iter()
                 .map(|item| match item {
                     StackItem::Section(staged, count) => format!("S{staged}:{count}"),

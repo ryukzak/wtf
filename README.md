@@ -8,6 +8,13 @@ A native macOS Git client for reviewing what your AI agents did: worktrees and b
 
 The tool's purpose: understand what our agents did and why, change direction on the fly, and find the fairway.
 
+Sources of ideas:
+
+- [Sublime Merge](https://www.sublimemerge.com), [Magit](https://magit.vc) (how we work with commits, UI logic)
+- [Git time machine](https://github.com/emacsmirror/git-timemachine) (Tree view and read specific commit history)
+- [Difftastic](https://github.com/wilfred/difftastic) (Structured diff)
+- Original (working with worktrees from above)
+
 ## Run
 
 macOS only; needs Rust and Git. Structural diffs need [difftastic](https://difftastic.wilfred.me.uk) (`brew install difftastic`):
@@ -59,7 +66,7 @@ To open repositories from a terminal, choose **wtf › Install 'wtf' Command…*
 | ⌘R          | Toggle the side panel                                                   |
 | ⌘J, ⌃`      | Toggle the terminal                                                     |
 | ⌥⌘1, ⌥⌘2    | Structural or text diff                                                 |
-| ⌘T, ⌘W, ⌃⇧T | New, close, reopen tab                                                  |
+| ⌘T, ⌘W, ⇧⌘T | New, close, reopen tab (⌃⇧T too)                                        |
 | ⌘1…⌘9       | Switch tab                                                              |
 | ⌘O          | Open a repository                                                       |
 | ⌘,          | Settings                                                                |

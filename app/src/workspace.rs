@@ -50,6 +50,9 @@ pub struct Workspace {
     closed: Vec<String>,
     /// A press landed on a tab or button, not on the bar's empty part.
     tab_pressed: bool,
+    /// Whether the window was last set to hold still, so moves of the mouse
+    /// need not tell macOS again.
+    held_still: bool,
     /// The options of the Pull (`false`) or Push (`true`) button, open.
     sync_menu: Option<bool>,
     /// A menu closed by the press that began a click, so the click on its
@@ -147,6 +150,7 @@ impl Workspace {
             active: 0,
             closed: Vec::new(),
             tab_pressed: false,
+            held_still: false,
             sync_menu: None,
             sync_menu_closed: None,
         };
@@ -271,11 +275,16 @@ impl Workspace {
             .text_xs()
             // The empty part of the bar moves the window, as a title bar does;
             // a press on a tab or button is theirs, so a tab can be dragged.
+            // The window is movable only for that move: macOS would else
+            // start moving it on a press anywhere in the bar, a tab's too,
+            // before the tab hears of it.
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, window, _| {
                     if !std::mem::take(&mut this.tab_pressed) {
-                        window.start_window_move();
+                        this.held_still = false;
+                        set_window_movable(window, true);
+                        drag_window(window);
                     }
                 }),
             )
@@ -661,6 +670,31 @@ impl Workspace {
     }
 }
 
+/// Moves the window with the mouse from the press under way, as a title
+/// bar does: GPUI's own `start_window_move` does nothing on macOS.
+// objc's macros check a `cargo-clippy` feature this crate does not declare.
+#[allow(unexpected_cfgs)]
+fn drag_window(window: &Window) {
+    use objc::{class, msg_send, runtime::Object, sel, sel_impl};
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let Ok(handle) = HasWindowHandle::window_handle(window) else {
+        return;
+    };
+    if let RawWindowHandle::AppKit(handle) = handle.as_raw() {
+        let view = handle.ns_view.as_ptr() as *mut Object;
+        // SAFETY: on the main thread, in the handling of a mouse press,
+        // with the window's live content view; the event is the press.
+        unsafe {
+            let ns_window: *mut Object = msg_send![view, window];
+            let app: *mut Object = msg_send![class!(NSApplication), sharedApplication];
+            let event: *mut Object = msg_send![app, currentEvent];
+            if !ns_window.is_null() && !event.is_null() {
+                let () = msg_send![ns_window, performWindowDragWithEvent: event];
+            }
+        }
+    }
+}
+
 /// Lets the title bar move the window, or not: AppKit moves it on any drag
 /// that starts there, tabs included.
 // objc's macros check a `cargo-clippy` feature this crate does not declare.
@@ -785,9 +819,21 @@ impl Render for Workspace {
             .bg(theme.background)
             .text_color(theme.foreground)
             .font_family(crate::preferences::ui_font())
+            // Held still again after a move: a press on a tab drags the tab.
+            // A move takes the mouse's release itself, so the next motion
+            // sees to it too.
             .on_mouse_up(MouseButton::Left, |_, window, _| {
-                set_window_movable(window, true)
+                set_window_movable(window, false)
             })
+            // Not while a button is down: that is the move getting under way.
+            .on_mouse_move(
+                cx.listener(|this, event: &gpui::MouseMoveEvent, window, _| {
+                    if !this.held_still && event.pressed_button.is_none() {
+                        this.held_still = true;
+                        set_window_movable(window, false);
+                    }
+                }),
+            )
             .on_action(cx.listener(|this, action: &OpenPath, window, cx| {
                 this.open_path(action.path.clone(), window, cx)
             }))

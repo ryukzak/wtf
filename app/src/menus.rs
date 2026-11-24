@@ -312,7 +312,7 @@ pub fn menus(state: &MenuState) -> Vec<Menu> {
                 MenuItem::submenu(attention_menu),
                 MenuItem::separator(),
                 MenuItem::action("Toggle Console", ToggleConsole),
-                MenuItem::action("Toggle Refresh Commands", ToggleRefreshCommands),
+                MenuItem::action("Show All Commands", ToggleRefreshCommands),
             ],
         },
         Menu {

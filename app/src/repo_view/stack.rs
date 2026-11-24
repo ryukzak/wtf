@@ -22,15 +22,15 @@ impl RepoView {
             .iter()
             .map(|file| self.many_files() && self.is_folded(file.path()))
             .collect();
+        let text_only = preferences::text_only_rule();
         let load = cx.background_executor().spawn(async move {
             let diffs = files
                 .iter()
                 .zip(skip)
                 .map(|(file, skip)| match skip {
                     true => Err(NOT_LOADED.to_string()),
-                    false => {
-                        wtf_core::file_diff(repo_path.clone(), file.clone(), mode).map_err(message)
-                    }
+                    false => wtf_core::file_diff(repo_path.clone(), file.clone(), mode, &text_only)
+                        .map_err(message),
                 })
                 .collect::<Vec<_>>();
             (files, diffs)
@@ -49,6 +49,7 @@ impl RepoView {
                 this.stacked_diffs = diffs;
                 this.stacked_files = files;
                 this.syntax.borrow_mut().clear();
+                this.syntax_generation.set(this.syntax_generation.get() + 1);
                 this.restack();
                 cx.notify();
             })
@@ -70,7 +71,53 @@ impl RepoView {
             self.folded_sections,
             self.many_files(),
             self.wrap_cols,
+            self.one_column.get(),
         );
+        // Only changed rows shown count: folded files, the lines between
+        // hunks and the unchanged ones around changes do not.
+        self.stacked_widest = self
+            .stacked
+            .iter()
+            .filter_map(|item| match *item {
+                StackItem::Row(file, row, 0) => match self.stacked_diffs.get(file) {
+                    Some(Ok(diff)) => self.shown_rows(diff).get(row),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .map(|row| diff_view::widest_changed(std::slice::from_ref(row)))
+            .max()
+            .unwrap_or(0);
+    }
+
+    /// A diff's rows as they show now: split or in one column.
+    pub(super) fn shown_rows<'a>(&self, diff: &'a FileDiff) -> &'a [wtf_core::DiffRow] {
+        diff_view::shown(diff, self.one_column.get())
+    }
+
+    /// Shows diffs in one column, or split, until the room changes enough
+    /// to call for the other.
+    pub(super) fn set_unified(
+        &mut self,
+        unified: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.unified = Some(unified);
+        self.diff_x.set(0.);
+        self.sync_wrap(window, cx);
+        cx.notify();
+    }
+
+    /// Whether a list `width` wide calls for one column: when a side of a
+    /// split diff would hold fewer characters than Settings ask.
+    fn one_column_for(&self, width: f32, stacked: bool, window: &Window) -> bool {
+        let below = preferences::one_column_below();
+        if below == 0 || width <= 0. {
+            return false;
+        }
+        let split = self.split_code_width(width, stacked) / code_char_width(window);
+        split < below as f32
     }
 
     /// Wraps long diff lines, or lets them run on to scroll sideways.
@@ -98,6 +145,29 @@ impl RepoView {
             self.diff_width.set(widths);
             cx.on_next_frame(window, |_, _, cx| cx.notify());
         }
+        // One column or two, by choice or by the room there is; picked
+        // lines are rows of the other layout, so they go.
+        let width = match self.stacked.is_empty() {
+            true => widths.1,
+            false => widths.0,
+        };
+        // The room decides when it changes enough to; a choice made by hand
+        // stands until then.
+        let fits = self.one_column_for(width, !self.stacked.is_empty(), window);
+        if self
+            .one_column_by_room
+            .replace(Some(fits))
+            .is_some_and(|was| was != fits)
+        {
+            self.unified = None;
+        }
+        let one = self.unified.unwrap_or(fits);
+        if one != self.one_column.get() {
+            self.one_column.set(one);
+            self.line_selection = None;
+            self.restack();
+            cx.notify();
+        }
         let cols = self.wrap_cols_for(widths.0, true, window);
         if cols != self.wrap_cols {
             self.wrap_cols = cols;
@@ -124,11 +194,23 @@ impl RepoView {
     /// of it, less the line numbers and, where lines are picked for staging,
     /// the bar marking them.
     fn code_width(&self, width: f32, stacked: bool) -> f32 {
-        let bar = match stacked && self.worktree_split.is_some() && self.stash_view.is_none() {
+        match self.one_column.get() {
+            true => (width - self.line_bar(stacked) - 2. * diff_view::gutter_width()).max(0.),
+            false => self.split_code_width(width, stacked),
+        }
+    }
+
+    /// The room a side of a split diff has for code.
+    fn split_code_width(&self, width: f32, stacked: bool) -> f32 {
+        ((width - self.line_bar(stacked) - 1.) / 2. - diff_view::gutter_width()).max(0.)
+    }
+
+    /// How wide the bar marking picked lines is, where lines are picked.
+    fn line_bar(&self, stacked: bool) -> f32 {
+        match stacked && self.worktree_split.is_some() && self.stash_view.is_none() {
             true => 3.,
             false => 0.,
-        };
-        ((width - bar - 1.) / 2. - diff_view::gutter_width()).max(0.)
+        }
     }
 
     /// Notes how far the code can scroll sideways: until the end of its
@@ -140,6 +222,7 @@ impl RepoView {
             false => 0.,
         };
         self.diff_max_x.set(max);
+        self.scroll_room.set((room, code_char_width(window)));
         self.diff_x.set(self.diff_x.get().min(max));
     }
 
@@ -148,7 +231,18 @@ impl RepoView {
     pub(super) fn fit(&self, cols: Option<usize>, part: usize) -> diff_view::Fit {
         match cols {
             Some(cols) => diff_view::Fit::Wrap { cols, part },
-            None => diff_view::Fit::Scroll(self.diff_x.get()),
+            None => {
+                // The characters up to the view's right edge, as scrolled.
+                let (room, char_width) = self.scroll_room.get();
+                let shown = match char_width > 0. && room > 0. {
+                    true => ((self.diff_x.get() + room) / char_width).floor() as usize,
+                    false => usize::MAX,
+                };
+                diff_view::Fit::Scroll {
+                    x: self.diff_x.get(),
+                    shown,
+                }
+            }
         }
     }
 
@@ -239,10 +333,14 @@ impl RepoView {
 
     /// Code colors for a file's diff: one of the all-files view by its index,
     /// or the one-file view's. Worked out once per file and appearance.
+    /// A file's code colors, once made. They are made away from the
+    /// window, a large file's taking seconds, and the diff draws plain till
+    /// they come.
     pub(super) fn diff_colors(
         &self,
         file: Option<usize>,
         theme: &Theme,
+        cx: &mut Context<Self>,
     ) -> Option<Rc<syntax::Colors>> {
         let (path, diff) = match file {
             Some(file) => (
@@ -259,9 +357,28 @@ impl RepoView {
         if let Some(colors) = self.syntax.borrow().get(&key) {
             return Some(colors.clone());
         }
-        let colors = Rc::new(syntax::colors(&path, diff, dark));
-        self.syntax.borrow_mut().insert(key, colors.clone());
-        Some(colors)
+        if !self.syntax_making.borrow_mut().insert(key.clone()) {
+            return None;
+        }
+        let generation = self.syntax_generation.get();
+        let diff = diff.clone();
+        let make = cx
+            .background_executor()
+            .spawn(async move { syntax::colors(&path, &diff, dark) });
+        cx.spawn(async move |this, cx| {
+            let colors = make.await;
+            this.update(cx, |this, cx| {
+                this.syntax_making.borrow_mut().remove(&key);
+                // Made for diffs since replaced: dropped.
+                if this.syntax_generation.get() == generation {
+                    this.syntax.borrow_mut().insert(key, Rc::new(colors));
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+        None
     }
 
     /// A row of the all-files view. Rows can still name files and lines of
@@ -313,7 +430,7 @@ impl RepoView {
             {
                 None
             }
-            Some(Ok(diff)) => Some(diff.rows.len()),
+            Some(Ok(diff)) => Some(self.shown_rows(diff).len()),
             Some(Err(_)) => Some(0),
             None => None,
         };
@@ -578,14 +695,14 @@ impl RepoView {
             }
             &StackItem::Row(file, index, part) => {
                 let fit = self.fit(self.wrap_cols, part);
-                let colors = self.diff_colors(Some(file), theme);
+                let colors = self.diff_colors(Some(file), theme, cx);
                 match &self.stacked_diffs[file] {
                     Ok(diff) if self.worktree_split.is_some() && self.stash_view.is_none() => {
                         // Lines are picked for staging: a bar marks the selection.
                         let selected = matches!(&self.line_selection, Some((f, rows)) if *f == file && rows.contains(&index));
                         let staged = self.worktree_split.is_some_and(|split| file >= split);
                         let group = SharedString::from(format!("line-{file}-{index}-{part}"));
-                        let changed = diff_view::is_change(&diff.rows[index]);
+                        let changed = diff_view::is_change(&self.shown_rows(diff)[index]);
                         let label = if staged { "Unstage Line" } else { "Stage Line" };
                         let hovered = self.hovered_line.get() == Some((file, index));
                         div()
@@ -617,8 +734,14 @@ impl RepoView {
                                     .when(selected, |bar| bar.bg(theme.accent)),
                             )
                             .child(
-                                diff_view::row(&diff.rows[index], theme, colors.as_deref(), fit)
-                                    .flex_1(),
+                                diff_view::row(
+                                    &self.shown_rows(diff)[index],
+                                    theme,
+                                    colors.as_deref(),
+                                    fit,
+                                    self.one_column.get(),
+                                )
+                                .flex_1(),
                             )
                             // A changed line offers its own buttons while the
                             // mouse is over it, drawn over its first line;
@@ -680,8 +803,14 @@ impl RepoView {
                             })
                             .into_any_element()
                     }
-                    Ok(diff) => diff_view::row(&diff.rows[index], theme, colors.as_deref(), fit)
-                        .into_any_element(),
+                    Ok(diff) => diff_view::row(
+                        &self.shown_rows(diff)[index],
+                        theme,
+                        colors.as_deref(),
+                        fit,
+                        self.one_column.get(),
+                    )
+                    .into_any_element(),
                     Err(_) => row().into_any_element(),
                 }
             }
@@ -691,7 +820,7 @@ impl RepoView {
                 // The hunk's first lines on each side, as `@@` headers show them.
                 let lines = match &self.stacked_diffs[file] {
                     Ok(diff) => {
-                        let rows = &diff.rows[start..end];
+                        let rows = &self.shown_rows(diff)[start..end];
                         let first = |side: fn(&wtf_core::DiffRow) -> Option<u32>| {
                             rows.iter()
                                 .find_map(side)
@@ -765,12 +894,13 @@ pub(super) fn stack_items(
     folded_sections: [bool; 2],
     many: bool,
     cols: Option<usize>,
+    one: bool,
 ) -> Vec<StackItem> {
     let mut items = Vec::new();
     // A row, as many times as it has lines when they wrap at `cols`.
     let lines = |file: usize, row: usize| {
         let parts = match (cols, &diffs[file]) {
-            (Some(cols), Ok(diff)) => diff_view::parts(&diff.rows[row], cols),
+            (Some(cols), Ok(diff)) => diff_view::parts(&diff_view::shown(diff, one)[row], cols),
             _ => 1,
         };
         (0..parts).map(move |part| StackItem::Row(file, row, part))
@@ -786,6 +916,10 @@ pub(super) fn stack_items(
     let sections = split;
     if let Some(split) = sections {
         items.extend([StackItem::HeaderPad, StackItem::Section(false, split)]);
+        // An open section with nothing in it says so.
+        if split == 0 && !folded_sections[0] {
+            items.push(StackItem::Note("No unstaged changes".to_string()));
+        }
     }
     for (file, diff) in diffs.iter().enumerate() {
         if sections == Some(file) {
@@ -804,7 +938,7 @@ pub(super) fn stack_items(
             continue;
         }
         let hunks = match diff {
-            Ok(diff) => diff_view::hunks(&diff.rows, CONTEXT_ROWS),
+            Ok(diff) => diff_view::hunks(diff_view::shown(diff, one), CONTEXT_ROWS),
             Err(error) => {
                 items.push(StackItem::Note(error.clone()));
                 continue;

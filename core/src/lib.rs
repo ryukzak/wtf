@@ -17,7 +17,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use attention::{Attention, Scope};
 pub use channels::{add_channel, glob, is_channel, remove_channel};
-pub use console::{LogEntry, log_since};
+pub use console::{CommandKind, LogEntry, log_since};
 pub use git::{
     changed_files, commit, discard, discard_lines, head_message, push, range_commits, reword,
     stage, stage_lines, stash_files, unstage, worktree_status,
@@ -108,7 +108,63 @@ pub struct DiffRow {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileDiff {
     pub language: String,
+    /// Old and new side by side.
     pub rows: Vec<DiffRow>,
+    /// The same in one column: unchanged lines once, with both sides,
+    /// and each run of changes as its old lines, then its new ones.
+    pub unified: Vec<DiffRow>,
+}
+
+impl FileDiff {
+    pub fn new(language: String, rows: Vec<DiffRow>) -> Self {
+        let unified = unify(&rows);
+        Self {
+            language,
+            rows,
+            unified,
+        }
+    }
+}
+
+/// Side-by-side rows in one column, as `git diff` reads: an unchanged row
+/// stays whole; a run of changed rows becomes its old sides, then its new
+/// ones, each a row of one side.
+pub fn unify(rows: &[DiffRow]) -> Vec<DiffRow> {
+    let unchanged = |row: &DiffRow| match (&row.left, &row.right) {
+        (Some(left), Some(right)) => left.changes.is_empty() && right.changes.is_empty(),
+        _ => false,
+    };
+    let mut out = Vec::with_capacity(rows.len());
+    let mut at = 0;
+    while at < rows.len() {
+        if unchanged(&rows[at]) {
+            out.push(rows[at].clone());
+            at += 1;
+            continue;
+        }
+        let end = (at..rows.len())
+            .find(|&k| unchanged(&rows[k]))
+            .unwrap_or(rows.len());
+        let run = &rows[at..end];
+        out.extend(
+            run.iter()
+                .filter_map(|row| row.left.clone())
+                .map(|left| DiffRow {
+                    left: Some(left),
+                    right: None,
+                }),
+        );
+        out.extend(
+            run.iter()
+                .filter_map(|row| row.right.clone())
+                .map(|right| DiffRow {
+                    left: None,
+                    right: Some(right),
+                }),
+        );
+        at = end;
+    }
+    out
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -379,14 +435,131 @@ pub fn file_history(
     })
 }
 
+/// Files the structural diff leaves to the text one: by glob, on the file
+/// name or, with a `/`, the whole path; and past a size, in bytes.
+#[derive(Debug, Clone)]
+pub struct TextOnly {
+    pub patterns: Vec<String>,
+    pub max_bytes: usize,
+}
+
+impl Default for TextOnly {
+    fn default() -> Self {
+        Self {
+            patterns: Vec::new(),
+            max_bytes: usize::MAX,
+        }
+    }
+}
+
+impl TextOnly {
+    /// Whether `path`, with sides of `size` bytes at most, is diffed as text.
+    pub fn takes(&self, path: &str, size: usize) -> bool {
+        let name = path.rsplit('/').next().unwrap_or(path);
+        size > self.max_bytes
+            || self
+                .patterns
+                .iter()
+                .any(|pattern| match pattern.contains('/') {
+                    true => glob(pattern, path),
+                    false => glob(pattern, name),
+                })
+    }
+}
+
 pub fn file_diff(
     repo_path: String,
     file: ChangedFile,
     mode: DiffMode,
+    text_only: &TextOnly,
 ) -> Result<FileDiff, CoreError> {
     let (old, new) = git::read_blobs(&repo_path, &file)?;
+    let mode = match text_only.takes(file.path(), old.len().max(new.len())) {
+        true => DiffMode::Text,
+        false => mode,
+    };
     match mode {
         DiffMode::Structural => difft::diff(file.path(), &old, &new),
         DiffMode::Text => Ok(text::diff(&old, &new)),
+    }
+}
+
+#[cfg(test)]
+mod text_only_tests {
+    use super::TextOnly;
+
+    #[test]
+    fn some_files_are_diffed_as_text() {
+        let rule = TextOnly {
+            patterns: vec!["*.snap".into(), "docs/*.md".into()],
+            max_bytes: 100,
+        };
+        assert!(rule.takes("test/__snapshots__/a.test.ts.snap", 10));
+        assert!(rule.takes("docs/guide.md", 10), "a path pattern");
+        assert!(!rule.takes("src/guide.md", 10));
+        assert!(rule.takes("src/main.rs", 101), "too large");
+        assert!(!rule.takes("src/main.rs", 100));
+    }
+}
+
+#[cfg(test)]
+mod unify_tests {
+    use super::*;
+
+    fn side(n: u32, changed: bool) -> Option<DiffSide> {
+        Some(DiffSide {
+            line_number: n,
+            text: format!("line {n}"),
+            changes: match changed {
+                true => vec![TextRange { start: 0, end: 1 }],
+                false => Vec::new(),
+            },
+        })
+    }
+
+    #[test]
+    fn changes_read_old_lines_then_new_ones() {
+        let rows = vec![
+            DiffRow {
+                left: side(1, false),
+                right: side(1, false),
+            },
+            DiffRow {
+                left: side(2, true),
+                right: side(2, true),
+            },
+            DiffRow {
+                left: side(3, true),
+                right: None,
+            },
+            DiffRow {
+                left: None,
+                right: side(3, true),
+            },
+            DiffRow {
+                left: side(4, false),
+                right: side(4, false),
+            },
+        ];
+        let lines: Vec<(Option<u32>, Option<u32>)> = unify(&rows)
+            .iter()
+            .map(|row| {
+                (
+                    row.left.as_ref().map(|side| side.line_number),
+                    row.right.as_ref().map(|side| side.line_number),
+                )
+            })
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                (Some(1), Some(1)),
+                (Some(2), None),
+                (Some(3), None),
+                (None, Some(2)),
+                (None, Some(3)),
+                (Some(4), Some(4)),
+            ]
+        );
     }
 }

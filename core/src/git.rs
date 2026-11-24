@@ -106,6 +106,12 @@ fn run_with_input(dir: &str, args: &[&str], input: &str) -> Result<String, CoreE
 }
 
 /// Runs git with `input`, if any, on stdin and extra environment variables.
+/// Whether `args` read git config: `config` with a `--get…` option.
+fn reads_config<S: AsRef<OsStr>>(args: &[S]) -> bool {
+    let mut words = args.iter().map(|arg| arg.as_ref().to_string_lossy());
+    words.next().is_some_and(|word| word == "config") && words.any(|word| word.starts_with("--get"))
+}
+
 fn run_with_env<S: AsRef<OsStr>>(
     dir: &str,
     args: &[S],
@@ -145,10 +151,23 @@ fn run_with_env<S: AsRef<OsStr>>(
     };
     if !output.status.success() {
         let mut error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        // `git config --get…` exits with 1 and says nothing when the key
+        // isn't set: an answer, not a failure, so the log shows it as one.
+        // Callers still get an error, which is how they learn it's unset.
+        let unset = error.is_empty() && output.status.code() == Some(1) && reads_config(args);
         if error.is_empty() {
             error = format!("{line} failed with {}", output.status);
         }
-        console::record(dir, line, false, started, error.clone());
+        console::record(
+            dir,
+            line,
+            unset,
+            started,
+            match unset {
+                true => String::new(),
+                false => error.clone(),
+            },
+        );
         return Err(CoreError::new(error));
     }
     console::record(dir, line, true, started, String::new());
@@ -803,6 +822,29 @@ mod shortstat_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unset_config_key_is_no_failure_in_the_log() {
+        let dir = std::env::temp_dir().join(format!("wtf-unset-config-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.to_str().unwrap();
+        run(path, &["init", "--quiet"]).unwrap();
+        let key = "wtf.nothing-here";
+        assert!(run(path, &["config", "--local", "--get-all", key]).is_err());
+        // Something that does fail stays a failure.
+        assert!(run(path, &["config", "--local", "--bogus-option"]).is_err());
+        let log = console::log_since(0);
+        let entry = |text: &str| {
+            log.iter()
+                .rev()
+                .find(|e| e.dir == path && e.command.contains(text))
+                .unwrap()
+        };
+        assert!(entry(key).ok);
+        assert!(entry(key).output.is_empty());
+        assert!(!entry("--bogus-option").ok);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn parses_modified_added_and_renamed() {

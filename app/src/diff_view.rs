@@ -1,5 +1,5 @@
 use gpui::{AnyElement, Div, HighlightStyle, Hsla, StyledText, div, prelude::*, px};
-use wtf_core::{DiffRow, DiffSide};
+use wtf_core::{DiffRow, DiffSide, FileDiff};
 
 use crate::syntax::{Colors, Spans};
 use crate::theme::Theme;
@@ -60,11 +60,11 @@ pub fn gap(theme: &Theme) -> Div {
 }
 
 /// How a diff row's code fits its side: cut at the edge and moved left by
-/// a horizontal scroll, or wrapped at `cols` characters, as line `part` of
-/// the row.
+/// a horizontal scroll, `x`, where the first `shown` characters show; or
+/// wrapped at `cols` characters, as line `part` of the row.
 #[derive(Clone, Copy)]
 pub enum Fit {
-    Scroll(f32),
+    Scroll { x: f32, shown: usize },
     Wrap { cols: usize, part: usize },
 }
 
@@ -99,9 +99,11 @@ pub fn wrap_starts(text: &str, cols: usize) -> Vec<usize> {
     starts
 }
 
-/// The longest line of `rows`, in characters.
-pub fn widest(rows: &[DiffRow]) -> usize {
+/// The longest changed line of `rows`, in characters: how far the code
+/// scrolls sideways, so changes show whole, not long lines around them.
+pub fn widest_changed(rows: &[DiffRow]) -> usize {
     rows.iter()
+        .filter(|row| is_change(row))
         .flat_map(|row| [&row.left, &row.right])
         .flatten()
         .map(|side| side.text.chars().count())
@@ -109,8 +111,20 @@ pub fn widest(rows: &[DiffRow]) -> usize {
         .unwrap_or(0)
 }
 
-/// A diff row, its code colored by `colors` when its file has them.
-pub fn row(row: &DiffRow, theme: &Theme, colors: Option<&Colors>, fit: Fit) -> Div {
+/// A diff's rows as they show: side by side, or in `one` column.
+pub fn shown(diff: &FileDiff, one: bool) -> &[DiffRow] {
+    match one {
+        true => &diff.unified,
+        false => &diff.rows,
+    }
+}
+
+/// A diff row, its code colored by `colors` when its file has them; in
+/// `one` column, a row of the unified rows.
+pub fn row(row: &DiffRow, theme: &Theme, colors: Option<&Colors>, fit: Fit, one: bool) -> Div {
+    if one {
+        return unified_row(row, theme, colors, fit);
+    }
     div()
         .flex()
         .w_full()
@@ -132,6 +146,67 @@ pub fn row(row: &DiffRow, theme: &Theme, colors: Option<&Colors>, fit: Fit) -> D
             theme.inserted_char,
             fit,
         ))
+}
+
+/// A row of one column: an old line, a new one, or one both sides share,
+/// its numbers on the left, old then new, as `git diff` reads.
+fn unified_row(row: &DiffRow, theme: &Theme, colors: Option<&Colors>, fit: Fit) -> Div {
+    let (side, code, line, char, old, new) = match (&row.left, &row.right) {
+        (Some(left), None) => (
+            left,
+            colors.and_then(|colors| colors.left(Some(left))),
+            Some(theme.deleted),
+            theme.deleted_char,
+            Some(left.line_number),
+            None,
+        ),
+        (None, Some(right)) => (
+            right,
+            colors.and_then(|colors| colors.right(Some(right))),
+            Some(theme.inserted),
+            theme.inserted_char,
+            None,
+            Some(right.line_number),
+        ),
+        (Some(left), Some(right)) => (
+            right,
+            colors.and_then(|colors| colors.right(Some(right))),
+            None,
+            theme.inserted_char,
+            Some(left.line_number),
+            Some(right.line_number),
+        ),
+        (None, None) => return div().w_full().h(px(row_height())),
+    };
+    let first = matches!(fit, Fit::Scroll { .. } | Fit::Wrap { part: 0, .. });
+    let number = |n: Option<u32>| {
+        div()
+            .flex_none()
+            .w(px(gutter_width()))
+            .pr(px(8.))
+            .text_right()
+            .text_color(theme.secondary)
+            .when(first, |gutter| gutter.children(n.map(|n| n.to_string())))
+    };
+    // The code as a side of its own, its number left out: both are drawn
+    // here.
+    let cell = side_cell(
+        Some(side),
+        code,
+        theme,
+        line.unwrap_or(theme.background),
+        char,
+        fit,
+        false,
+    );
+    div()
+        .flex()
+        .w_full()
+        .h(px(row_height()))
+        .when_some(line, |row, line| row.bg(line))
+        .child(number(old))
+        .child(number(new))
+        .child(cell)
 }
 
 /// A line's runs: code colors, with changed words marked over them.
@@ -208,15 +283,33 @@ fn side(
     char: Hsla,
     fit: Fit,
 ) -> AnyElement {
+    side_cell(side, code, theme, line, char, fit, true)
+}
+
+/// A side's code, tinted as `line` when changed, after its line number
+/// when `numbered`.
+fn side_cell(
+    side: Option<&DiffSide>,
+    code: Option<&Spans>,
+    theme: &Theme,
+    line: Hsla,
+    char: Hsla,
+    fit: Fit,
+    numbered: bool,
+) -> AnyElement {
     let cell = div().flex().flex_1().min_w_0().h_full().overflow_hidden();
     let Some(side) = side else {
         return cell.bg(theme.filler).into_any_element();
     };
     let changed = !side.changes.is_empty();
+    let cropped = match fit {
+        Fit::Scroll { shown, .. } => side.text.chars().count() > shown,
+        Fit::Wrap { .. } => false,
+    };
     let highlights = highlights(side, code, theme, char);
     // Wrapped, a row shows a piece of its line, the number on the first.
     let (text, highlights, number, shift) = match fit {
-        Fit::Scroll(x) => (side.text.clone(), highlights, true, x),
+        Fit::Scroll { x, .. } => (side.text.clone(), highlights, true, x),
         Fit::Wrap { cols, part } => {
             let at = |n: usize| {
                 side.text
@@ -244,29 +337,56 @@ fn side(
     };
 
     cell.when(changed, |cell| cell.bg(line))
-        .child(
-            div()
-                .flex_none()
-                .w(px(gutter_width()))
-                .pr(px(8.))
-                .text_right()
-                .text_color(theme.secondary)
-                .when(number, |gutter| gutter.child(side.line_number.to_string())),
-        )
+        .when(numbered, |cell| {
+            cell.child(
+                div()
+                    .flex_none()
+                    .w(px(gutter_width()))
+                    .pr(px(8.))
+                    .text_right()
+                    .text_color(theme.secondary)
+                    .when(number, |gutter| gutter.child(side.line_number.to_string())),
+            )
+        })
         // The code alone moves with a horizontal scroll; its number stays.
         .child(
-            div().flex_1().min_w_0().h_full().overflow_hidden().child(
-                div()
-                    .relative()
-                    .left(px(-shift))
-                    .whitespace_nowrap()
-                    .text_color(if changed {
-                        theme.changed_text
-                    } else {
-                        theme.foreground
-                    })
-                    .child(StyledText::new(text).with_highlights(highlights)),
-            ),
+            div()
+                .relative()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .overflow_hidden()
+                .child(
+                    div()
+                        .relative()
+                        .left(px(-shift))
+                        .whitespace_nowrap()
+                        .text_color(if changed {
+                            theme.changed_text
+                        } else {
+                            theme.foreground
+                        })
+                        .child(StyledText::new(text).with_highlights(highlights)),
+                )
+                // A line running on past the edge says so there.
+                .when(cropped, |code| {
+                    code.child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .right_0()
+                            .h_full()
+                            .bg(theme.background)
+                            .child(
+                                div()
+                                    .h_full()
+                                    .px(px(3.))
+                                    .when(changed, |mark| mark.bg(line))
+                                    .text_color(theme.secondary)
+                                    .child("›"),
+                            ),
+                    )
+                }),
         )
         .into_any_element()
 }
@@ -331,7 +451,8 @@ mod tests {
             right: side(""),
         };
         assert_eq!(parts(&empty, 3), 1);
-        assert_eq!(widest(&[row, empty]), 7);
+        // Only changed lines count: `row` is unchanged, `empty` has none.
+        assert_eq!(widest_changed(&[row, empty]), 0);
     }
 
     #[test]

@@ -123,10 +123,7 @@ fn build_file_diff(json: &str, old: &str, new: &str) -> Result<FileDiff, CoreErr
         })
         .collect();
 
-    Ok(FileDiff {
-        language: output.language,
-        rows,
-    })
+    Ok(FileDiff::new(output.language, rows))
 }
 
 fn side(

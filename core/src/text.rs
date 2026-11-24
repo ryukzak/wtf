@@ -4,10 +4,7 @@ use crate::{DiffRow, DiffSide, FileDiff, TextRange};
 
 pub fn diff(old: &[u8], new: &[u8]) -> FileDiff {
     if old.contains(&0) || new.contains(&0) {
-        return FileDiff {
-            language: "Binary".to_string(),
-            rows: Vec::new(),
-        };
+        return FileDiff::new("Binary".to_string(), Vec::new());
     }
     let old = String::from_utf8_lossy(old);
     let new = String::from_utf8_lossy(new);
@@ -69,10 +66,7 @@ pub fn diff(old: &[u8], new: &[u8]) -> FileDiff {
         }
     }
 
-    FileDiff {
-        language: "Text".to_string(),
-        rows,
-    }
+    FileDiff::new("Text".to_string(), rows)
 }
 
 fn trimmed(line: &str) -> &str {

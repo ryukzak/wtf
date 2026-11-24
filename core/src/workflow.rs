@@ -1157,7 +1157,13 @@ mod tests {
             .iter()
             .find(|f| f.new_path.as_deref() == Some("a.txt"))
             .unwrap();
-        let diff = crate::file_diff(fixture.path(), a.clone(), DiffMode::Text).unwrap();
+        let diff = crate::file_diff(
+            fixture.path(),
+            a.clone(),
+            DiffMode::Text,
+            &Default::default(),
+        )
+        .unwrap();
         let added: Vec<&str> = diff
             .rows
             .iter()
@@ -1766,6 +1772,7 @@ mod tests {
             path.clone(),
             status.staged[0].clone(),
             crate::DiffMode::Text,
+            &Default::default(),
         )
         .unwrap();
         assert!(

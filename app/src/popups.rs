@@ -228,7 +228,7 @@ pub fn commands(
             .enumerate()
             .map(|(k, place)| match place.has && branch {
                 true => at(Command::SelectWorktree(k), "Go To", Some(place)),
-                false => at(Command::CheckoutIn(k), "Switch", Some(place)),
+                false => at(Command::CheckoutIn(k), "Checkout", Some(place)),
             })
             .collect::<Vec<_>>()
     };
@@ -736,7 +736,7 @@ mod tests {
         assert_eq!(
             items[..3],
             [
-                (Command::CheckoutIn(0), "Switch · wtf".to_string()),
+                (Command::CheckoutIn(0), "Checkout · wtf".to_string()),
                 (Command::SelectWorktree(1), "Go To · wtf-x".to_string()),
                 (Command::NewWorktree, "New Worktree…".to_string()),
             ]
@@ -758,8 +758,8 @@ mod tests {
         assert_eq!(
             labels[..5],
             [
-                "Switch · wtf",
-                "Switch · wtf-x",
+                "Checkout · wtf",
+                "Checkout · wtf-x",
                 "New Branch…",
                 "New Worktree…",
                 "—",

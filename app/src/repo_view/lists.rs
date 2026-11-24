@@ -98,10 +98,35 @@ impl RepoView {
                 this.line_row(row, &theme, cx)
             }),
         );
+        // The wheel, taken before the list sees it: GPUI's list adds up the
+        // events of a frame and moves by the sum at each, so a wheel's quick
+        // run of them, a trackball's, overshoots. Here each moves once.
+        let state = self.commit_list_state.clone();
+        let view = cx.entity().downgrade();
+        let wheel = gpui::canvas(
+            |_, _, _| {},
+            move |bounds, _, window, _| {
+                window.on_mouse_event(move |event: &gpui::ScrollWheelEvent, phase, _, cx| {
+                    if phase != gpui::DispatchPhase::Capture || !bounds.contains(&event.position) {
+                        return;
+                    }
+                    let delta = event.delta.pixel_delta(px(20.)).y;
+                    let max = state.max_offset_for_scrollbar().height;
+                    let now = -state.scroll_px_offset_for_scrollbar().y;
+                    let next = (now - delta).clamp(px(0.), max);
+                    state.scroll_by(next - now);
+                    cx.stop_propagation();
+                    view.update(cx, |_, cx| cx.notify()).ok();
+                });
+            },
+        )
+        .absolute()
+        .size_full();
         // A press anywhere in it gives the list the keys: ↑ and ↓ go through
         // its commits.
         div()
             .id("commit-history")
+            .relative()
             .size_full()
             .track_focus(&self.commit_list_focus)
             .on_mouse_down(
@@ -109,6 +134,7 @@ impl RepoView {
                 cx.listener(|this, _, window, _| this.commit_list_focus.focus(window)),
             )
             .child(list.size_full())
+            .child(wheel)
     }
 
     /// ↑ and ↓ in the list: the commit above or below the one picked, or
@@ -459,7 +485,15 @@ impl RepoView {
         let age = short_age(node.last_time, now_seconds());
         let (title, waiting) = match self.summaries.get(&bar_summary_key(node)) {
             Some(Some(Ok(summary))) if preferences::summaries() => (summary.header.clone(), false),
-            Some(None) => (String::new(), true),
+            // Asked for again: the old one until the new one comes.
+            Some(None) => (
+                self.replaced_summaries
+                    .get(&bar_summary_key(node))
+                    .filter(|_| preferences::summaries())
+                    .map(|old| old.header.clone())
+                    .unwrap_or_default(),
+                true,
+            ),
             _ => (String::new(), false),
         };
         let title = match title.is_empty() {
@@ -515,6 +549,21 @@ impl RepoView {
         let item = match folded {
             true => item,
             false => guide(item, covered, true, None, theme),
+        };
+        // Its menu is its newest commit's: check it out, branch from it.
+        let menu = node.commits.last().map(|newest| Target::Commit {
+            commit: newest.id.clone(),
+            message: full_message(newest),
+        });
+        let item = match menu {
+            Some(target) => item.on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    this.open_context_menu(target.clone(), event.position, cx);
+                    cx.stop_propagation();
+                }),
+            ),
+            None => item,
         };
         item.on_click(cx.listener(move |this, _, _, cx| {
             match this.selected_nodes == [index] {

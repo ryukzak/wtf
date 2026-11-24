@@ -475,6 +475,133 @@ impl RepoView {
 
     /// The prune list: each stale branch with why, ticked to go, and a button
     /// that deletes the ticked ones.
+    /// A prune dialog section's heading, folding its section on a click.
+    fn prune_header(
+        &self,
+        fold: PruneFold,
+        title: String,
+        count: String,
+        top: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let folded = self.prune_folds.contains(&fold);
+        let kind_level = fold.1.is_none();
+        div()
+            .id(SharedString::from(format!("prune-fold-{fold:?}")))
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .pt(px(match (kind_level, top) {
+                (true, true) => 0.,
+                (true, false) => 10.,
+                (false, _) => 4.,
+            }))
+            .pb(px(2.))
+            .pl(px(if kind_level { 2. } else { 16. }))
+            .pr(px(8.))
+            .text_xs()
+            .cursor_pointer()
+            .when(kind_level, |header| {
+                header
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.foreground)
+            })
+            .when(!kind_level, |header| header.text_color(theme.secondary))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if !this.prune_folds.remove(&fold) {
+                    this.prune_folds.insert(fold);
+                }
+                cx.notify();
+            }))
+            .child(panel_chevron(!folded, theme))
+            .child(div().flex_1().child(title))
+            .child(div().text_color(theme.secondary).child(count))
+            .into_any_element()
+    }
+
+    /// A row of the prune dialog, ticked or not by a click: a worktree by
+    /// its folder with its branch beside it, a branch by its name, a stash
+    /// by what it says with the branch it was made on; why it looks stale,
+    /// or for a stash its place and age, after.
+    fn prune_row(&self, k: usize, now: i64, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let Some(item) = self.prune.as_ref().and_then(|list| list.get(k)) else {
+            return div().into_any_element();
+        };
+        let (name, on) = (&item.name, item.on);
+        let (title, beside, note) = match item.kind {
+            PruneKind::Stash => {
+                let stash = self.graph.stashes.iter().find(|stash| stash.name == *name);
+                match stash {
+                    Some(stash) => (
+                        stash_words(&stash.message),
+                        Some(stash.branch.clone().unwrap_or_else(|| "detached".into())),
+                        format!("{} · {}", name, short_age(stash.time, now)),
+                    ),
+                    None => (name.clone(), None, String::new()),
+                }
+            }
+            kind => {
+                let note = graph_view::stale_note(&self.graph, name).unwrap_or_default();
+                match self
+                    .prune_worktree(name)
+                    .filter(|_| kind == PruneKind::Worktree)
+                {
+                    Some(node) => (
+                        graph_view::worktree_label(node, WorktreeNames::Folder),
+                        Some(name.clone()),
+                        note,
+                    ),
+                    None => (name.clone(), None, note),
+                }
+            }
+        };
+        div()
+            .id(("prune", k))
+            .flex()
+            .items_center()
+            .gap(px(8.))
+            .h(px(26.))
+            .pl(px(20.))
+            .pr(px(8.))
+            .rounded(px(4.))
+            .cursor_pointer()
+            .hover(|row| row.bg(theme.selection.opacity(0.5)))
+            .when(!on, |row| row.text_color(theme.secondary))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if let Some(item) = this.prune.as_mut().and_then(|list| list.get_mut(k)) {
+                    item.on = !item.on;
+                    cx.notify();
+                }
+            }))
+            .child(attention_checkbox(
+                ("prune-check", k),
+                Some(on),
+                true,
+                theme,
+            ))
+            .child(div().min_w_0().truncate().child(title))
+            .children(beside.map(|beside| {
+                div()
+                    .flex_none()
+                    .px(px(5.))
+                    .rounded(px(3.))
+                    .bg(theme.tag_background)
+                    .text_xs()
+                    .child(beside)
+            }))
+            .child(div().flex_1())
+            .child(
+                div()
+                    .flex_none()
+                    .text_xs()
+                    .text_color(theme.secondary)
+                    .italic()
+                    .child(note),
+            )
+            .into_any_element()
+    }
+
     pub(super) fn prune_view(
         &self,
         theme: &Theme,
@@ -483,128 +610,85 @@ impl RepoView {
     ) -> Option<AnyElement> {
         let list = self.prune.as_ref()?;
         let ticked = list.iter().filter(|item| item.on).count();
-        // A heading over each kind where it starts, and under it one over
-        // each status.
-        let heading = |k: usize| {
-            let (kind, status) = (list[k].kind, list[k].status);
-            let new_kind = k == 0 || list[k - 1].kind != kind;
-            let new_status = new_kind || list[k - 1].status != status;
-            let mut headings = Vec::new();
-            if new_kind {
-                let count = list.iter().filter(|item| item.kind == kind).count();
-                let title = match kind {
-                    PruneKind::Worktree => "Worktrees, with their branches",
-                    PruneKind::Branch => "Branches",
-                    PruneKind::Stash => "Stashes",
-                };
-                headings.push(
+        let now = now_seconds();
+        // A heading for each kind, there with none too, and under it one
+        // for each status; each folds with a click, as the attention
+        // panel's do.
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for (n, kind) in [PruneKind::Worktree, PruneKind::Branch, PruneKind::Stash]
+            .into_iter()
+            .enumerate()
+        {
+            let of_kind: Vec<usize> = (0..list.len()).filter(|&k| list[k].kind == kind).collect();
+            let picked = of_kind.iter().filter(|&&k| list[k].on).count();
+            let title = match kind {
+                PruneKind::Worktree => "Worktrees, with their branches",
+                PruneKind::Branch => "Branches",
+                PruneKind::Stash => "Stashes",
+            };
+            let count = match picked {
+                0 => of_kind.len().to_string(),
+                picked => format!("{picked} of {}", of_kind.len()),
+            };
+            rows.push(self.prune_header((kind, None), title.to_string(), count, n == 0, theme, cx));
+            if self.prune_folds.contains(&(kind, None)) {
+                continue;
+            }
+            if of_kind.is_empty() {
+                rows.push(
                     div()
-                        .pt(px(if k == 0 { 0. } else { 10. }))
-                        .pb(px(2.))
-                        .px(px(8.))
+                        .pl(px(20.))
+                        .py(px(2.))
                         .text_xs()
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(theme.foreground)
-                        .child(format!("{title} · {count}"))
+                        .italic()
+                        .text_color(theme.secondary)
+                        .child(match kind {
+                            PruneKind::Worktree => "No stale worktrees",
+                            PruneKind::Branch => "No stale branches",
+                            PruneKind::Stash => "No stashes",
+                        })
                         .into_any_element(),
                 );
+                continue;
             }
-            if new_status {
-                let count = list
+            for status in [
+                PruneStatus::Merged,
+                PruneStatus::Gone,
+                PruneStatus::Idle,
+                PruneStatus::Recent,
+            ] {
+                let of_status: Vec<usize> = of_kind
                     .iter()
-                    .filter(|item| (item.kind, item.status) == (kind, status))
-                    .count();
+                    .copied()
+                    .filter(|&k| list[k].status == status)
+                    .collect();
+                if of_status.is_empty() {
+                    continue;
+                }
                 let title = match status {
                     PruneStatus::Merged => "Merged",
                     PruneStatus::Gone => "Gone from the remote",
                     PruneStatus::Idle => "Idle",
                     PruneStatus::Recent => "Recent",
                 };
-                headings.push(
-                    div()
-                        .pt(px(4.))
-                        .pl(px(16.))
-                        .text_xs()
-                        .text_color(theme.secondary)
-                        .child(format!("{title} · {count}"))
-                        .into_any_element(),
+                rows.push(self.prune_header(
+                    (kind, Some(status)),
+                    title.to_string(),
+                    of_status.len().to_string(),
+                    false,
+                    theme,
+                    cx,
+                ));
+                if self.prune_folds.contains(&(kind, Some(status))) {
+                    continue;
+                }
+                rows.extend(
+                    of_status
+                        .into_iter()
+                        .map(|k| self.prune_row(k, now, theme, cx)),
                 );
             }
-            headings
-        };
-        let now = now_seconds();
-        let rows = list.iter().enumerate().flat_map(|(k, item)| {
-            let (name, on) = (&item.name, item.on);
-            // A worktree by its folder, its branch beside it; a branch by its
-            // name; a stash by its message. Why it looks stale after.
-            let (title, beside, note) = match item.kind {
-                PruneKind::Stash => {
-                    let stash = self.graph.stashes.iter().find(|stash| stash.name == *name);
-                    (
-                        stash.map_or(name.clone(), |stash| stash.message.clone()),
-                        Some(name.clone()),
-                        stash.map_or(String::new(), |stash| short_age(stash.time, now)),
-                    )
-                }
-                kind => {
-                    let note = graph_view::stale_note(&self.graph, name).unwrap_or_default();
-                    match self
-                        .prune_worktree(name)
-                        .filter(|_| kind == PruneKind::Worktree)
-                    {
-                        Some(node) => (
-                            graph_view::worktree_label(node, WorktreeNames::Folder),
-                            Some(name.clone()),
-                            note,
-                        ),
-                        None => (name.clone(), None, note),
-                    }
-                }
-            };
-            let row = div()
-                .id(("prune", k))
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .h(px(26.))
-                .px(px(8.))
-                .rounded(px(4.))
-                .cursor_pointer()
-                .hover(|row| row.bg(theme.selection.opacity(0.5)))
-                .when(!on, |row| row.text_color(theme.secondary))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    if let Some(item) = this.prune.as_mut().and_then(|list| list.get_mut(k)) {
-                        item.on = !item.on;
-                        cx.notify();
-                    }
-                }))
-                .child(attention_checkbox(
-                    ("prune-check", k),
-                    Some(on),
-                    true,
-                    theme,
-                ))
-                .child(div().min_w_0().truncate().child(title))
-                .children(beside.map(|beside| {
-                    div()
-                        .flex_none()
-                        .px(px(5.))
-                        .rounded(px(3.))
-                        .bg(theme.tag_background)
-                        .text_xs()
-                        .child(beside)
-                }))
-                .child(div().flex_1())
-                .child(
-                    div()
-                        .flex_none()
-                        .text_xs()
-                        .text_color(theme.secondary)
-                        .italic()
-                        .child(note),
-                );
-            heading(k).into_iter().chain([row.into_any_element()])
-        });
+        }
         let button = |id: &'static str, label: String| {
             div()
                 .id(id)
@@ -671,13 +755,6 @@ impl RepoView {
                         .overflow_y_scroll()
                         .children(rows),
                 )
-                .when(list.is_empty(), |panel| {
-                    panel.child(
-                        div()
-                            .text_color(theme.secondary)
-                            .child("Nothing looks stale."),
-                    )
-                })
                 .child(
                     div()
                         .flex()
@@ -726,6 +803,12 @@ impl RepoView {
         }
     }
 
+    /// Notes what the palette ran, for the top of its list next time.
+    fn remember_palette_run(&mut self, kind: &str, what: &str) {
+        popups::remember(&mut self.palette_recent, &format!("{kind}\t{what}"));
+        recent::save_list("palette-recent", &self.palette_recent);
+    }
+
     fn remember_open_with(&mut self, command: &str) {
         popups::remember(&mut self.open_with, command);
         recent::save_list("open-with", &self.open_with);
@@ -758,16 +841,38 @@ impl RepoView {
                 .into_iter()
                 .collect();
         }
-        // The last commands run come first, then the app's.
-        let entries: Vec<goto::Entry> = path
+        // The last few run come first, the app's commands and the shell's
+        // alike, as many as Settings ask; then the app's commands, then the
+        // shell's run before, for a search to find.
+        let app = palette::entries(window);
+        let mut top: Vec<goto::Entry> = Vec::new();
+        for run in self
+            .palette_recent
+            .iter()
+            .take(preferences::palette_recent())
+        {
+            match run.split_once('\t') {
+                Some(("app", name)) => {
+                    top.extend(app.iter().find(|entry| entry.label == name).cloned())
+                }
+                Some(("sh", command)) => {
+                    top.extend(path.as_ref().map(|path| goto::shell_entry(command, path)))
+                }
+                _ => {}
+            }
+        }
+        let shown = |entry: &goto::Entry| top.iter().any(|run| run.label == entry.label);
+        let rest_app: Vec<goto::Entry> = app.iter().filter(|e| !shown(e)).cloned().collect();
+        let rest_shell: Vec<goto::Entry> = path
             .iter()
             .flat_map(|path| {
                 self.shell_commands
                     .iter()
                     .map(move |command| goto::shell_entry(command, path))
             })
-            .chain(palette::entries(window))
+            .filter(|entry| !shown(entry))
             .collect();
+        let entries: Vec<goto::Entry> = top.into_iter().chain(rest_app).chain(rest_shell).collect();
         goto::filter(&entries, query).into_iter().cloned().collect()
     }
 
@@ -787,7 +892,8 @@ impl RepoView {
     fn pick_goto(&mut self, entry: goto::Entry, window: &mut Window, cx: &mut Context<Self>) {
         self.close_goto(window, cx);
         if entry.kind == goto::Kind::Command {
-            if let Some((_, action)) = palette::commands().into_iter().nth(entry.node) {
+            if let Some((name, action)) = palette::commands().into_iter().nth(entry.node) {
+                self.remember_palette_run("app", name);
                 window.dispatch_action(action, cx);
             }
             return;
@@ -801,6 +907,7 @@ impl RepoView {
             }
             popups::remember(&mut self.shell_commands, command);
             recent::save_list("commands", &self.shell_commands);
+            self.remember_palette_run("sh", command);
             return;
         }
         match entry.commit {
@@ -1325,7 +1432,7 @@ impl RepoView {
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.run_command(command, window, cx)
                         }))
-                        .child(menu_label(&label, theme)),
+                        .child(menu_label(&label, copy_hint(target, command), theme)),
                 ),
             };
         }
@@ -1640,7 +1747,49 @@ fn dialog_width(width: f32, window: &Window) -> f32 {
 
 /// A menu item's label: its name, red when it deletes, and the worktree it
 /// acts in on the right, in bold when it is the current one.
-fn menu_label(label: &popups::Label, theme: &Theme) -> AnyElement {
+/// What a copy command of the menu copies, as its right side shows it: the
+/// name, the hash, the message's first line or the path, cut short.
+fn copy_hint(target: &Target, command: Command) -> Option<String> {
+    let (name, path, commit, message) = match target {
+        Target::Branch { name, commit, .. } => (Some(name.clone()), None, commit.clone(), None),
+        Target::Commit { commit, message } => (None, None, commit.clone(), Some(message.clone())),
+        Target::Remote {
+            remote,
+            branch,
+            commit,
+        } => (
+            Some(format!("{remote}/{branch}")),
+            None,
+            commit.clone(),
+            None,
+        ),
+        Target::Tag { name, commit } => (Some(name.clone()), None, commit.clone(), None),
+        Target::Stash { name, id } => (Some(name.clone()), None, id.clone(), None),
+        Target::Worktree {
+            path,
+            branch,
+            commit,
+            ..
+        } => (branch.clone(), Some(path.clone()), commit.clone(), None),
+        Target::Group { .. } => return None,
+    };
+    let text = match command {
+        Command::CopyName => name?,
+        // The full hash runs long: its start, and that it goes on.
+        Command::CopyHash => format!("{}…", popups::short_hash(&commit)),
+        Command::CopyShortHash => popups::short_hash(&commit),
+        Command::CopyMessage => message?.lines().next().unwrap_or_default().to_string(),
+        Command::CopyPath => popups::tilde(&path?),
+        _ => return None,
+    };
+    let cut = 36;
+    Some(match text.chars().count() > cut {
+        true => format!("{}…", text.chars().take(cut - 1).collect::<String>()),
+        false => text,
+    })
+}
+
+fn menu_label(label: &popups::Label, hint: Option<String>, theme: &Theme) -> AnyElement {
     let color = if label.danger {
         theme.error
     } else {
@@ -1648,24 +1797,60 @@ fn menu_label(label: &popups::Label, theme: &Theme) -> AnyElement {
     };
     let mut row = div()
         .flex()
+        .items_center()
         .justify_between()
         .gap(px(24.))
         .whitespace_nowrap()
         .child(div().text_color(color).child(label.text.clone()));
+    // What a copy takes, dimmed on the right.
+    if let Some(hint) = hint.filter(|_| label.place.is_none()) {
+        row = row.child(div().text_color(theme.secondary).child(hint));
+    }
+    // A worktree, as the graph's list shows one: its folder on a chip,
+    // filled for the current one.
     if let Some(place) = &label.place {
-        let name = div().child(place.name.clone());
+        let chip = div()
+            .px(px(6.))
+            .rounded(px(4.))
+            .text_xs()
+            .child(format!("⌂ {}", place.name));
         row = row.child(match place.current {
-            true => name
-                .text_color(theme.foreground)
+            true => chip
+                .bg(theme.accent)
+                .text_color(gpui::white())
                 .font_weight(gpui::FontWeight::SEMIBOLD),
-            false => name.text_color(theme.secondary),
+            false => chip.bg(theme.tag_background).text_color(theme.foreground),
         });
     }
     row.into_any_element()
 }
 
+/// A section of the prune dialog that folds: a kind, or a status in it.
+pub(super) type PruneFold = (PruneKind, Option<PruneStatus>);
+
+/// What a stash says, as git words it less its lead: "WIP on main: 1a2b3c
+/// Fix it" reads "Fix it", "On main: try this" reads "try this".
+fn stash_words(message: &str) -> String {
+    let rest = message
+        .strip_prefix("WIP on ")
+        .or_else(|| message.strip_prefix("On "))
+        .and_then(|rest| rest.split_once(": ").map(|(_, rest)| rest));
+    let Some(rest) = rest else {
+        return message.to_string();
+    };
+    // A WIP stash names the commit it was made on first.
+    let words = match message.starts_with("WIP on ") {
+        true => rest.split_once(' ').map_or(rest, |(_, subject)| subject),
+        false => rest,
+    };
+    match message.starts_with("WIP on ") {
+        true => format!("Work on: {words}"),
+        false => words.to_string(),
+    }
+}
+
 /// What a prune dialog row deletes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) enum PruneKind {
     /// A worktree, and then its branch.
     Worktree,
@@ -1674,7 +1859,7 @@ pub(super) enum PruneKind {
 }
 
 /// Why a prune dialog row looks stale, in the order the rows go.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) enum PruneStatus {
     /// A channel has its work: safe to go.
     Merged,
@@ -1702,4 +1887,19 @@ fn stash_index(name: &str) -> usize {
         .trim_end_matches('}')
         .parse()
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod prune_tests {
+    use super::stash_words;
+
+    #[test]
+    fn stashes_read_without_git_s_lead() {
+        assert_eq!(
+            stash_words("WIP on main: 1a2b3c4 Fix the parser"),
+            "Work on: Fix the parser"
+        );
+        assert_eq!(stash_words("On feature/x: try this"), "try this");
+        assert_eq!(stash_words("something else"), "something else");
+    }
 }

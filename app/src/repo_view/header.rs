@@ -395,38 +395,96 @@ impl RepoView {
             option(label, self.diff_mode == mode)
                 .on_click(cx.listener(move |this, _, _, cx| this.set_diff_mode(mode, cx)))
         };
+        // As many of the pairs as the strip has room for, in order; the
+        // rest in a menu under "…".
+        let shown = self.strip_pairs_shown(window);
+        let pairs: [AnyElement; 4] = [
+            // Changes or a snapshot: what the review shows, first.
+            group()
+                .child(option("Diff", !self.snapshot_mode).on_click(
+                    cx.listener(|this, _, window, cx| this.set_snapshot_mode(false, window, cx)),
+                ))
+                .child(option("Tree", self.snapshot_mode).on_click(
+                    cx.listener(|this, _, window, cx| this.set_snapshot_mode(true, window, cx)),
+                ))
+                .into_any_element(),
+            // Old and new side by side, or in one column; a split diff with
+            // too little room shows in one column anyway.
+            group()
+                .child(option("Split", !self.one_column.get()).on_click(
+                    cx.listener(|this, _, window, cx| this.set_unified(false, window, cx)),
+                ))
+                .child(option("Unified", self.one_column.get()).on_click(
+                    cx.listener(|this, _, window, cx| this.set_unified(true, window, cx)),
+                ))
+                .into_any_element(),
+            group()
+                .child(mode("Structural", DiffMode::Structural))
+                .child(mode("Text", DiffMode::Text))
+                .into_any_element(),
+            // Long lines wrap, or run on and scroll sideways.
+            group()
+                .child(option("Wrap", self.wrap_lines).on_click(
+                    cx.listener(|this, _, window, cx| this.set_wrap_lines(true, window, cx)),
+                ))
+                .child(option("No Wrap", !self.wrap_lines).on_click(
+                    cx.listener(|this, _, window, cx| this.set_wrap_lines(false, window, cx)),
+                ))
+                .into_any_element(),
+        ];
+        let more = (shown < STRIP_PAIRS.len()).then(|| {
+            group().child(
+                strip_option("strip-more", false, theme)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.dropdown = Some((Dropdown::Modes(shown), event.position));
+                            cx.notify();
+                        }),
+                    )
+                    .child(vertical_label("…", theme.foreground, window)),
+            )
+        });
         div()
             .flex()
             .flex_col()
             .items_center()
             .gap(px(STRIP_GAP))
-            // Changes or a snapshot: what the review shows, first.
-            .child(
-                group()
-                    .child(option("Changes", !self.snapshot_mode).on_click(
-                        cx.listener(|this, _, window, cx| {
-                            this.set_snapshot_mode(false, window, cx)
-                        }),
-                    ))
-                    .child(option("Snapshot", self.snapshot_mode).on_click(
-                        cx.listener(|this, _, window, cx| this.set_snapshot_mode(true, window, cx)),
-                    )),
-            )
-            .child(
-                group()
-                    .child(mode("Structural", DiffMode::Structural))
-                    .child(mode("Text", DiffMode::Text)),
-            )
-            // Long lines wrap, or run on and scroll sideways.
-            .child(
-                group()
-                    .child(option("Wrap", self.wrap_lines).on_click(
-                        cx.listener(|this, _, window, cx| this.set_wrap_lines(true, window, cx)),
-                    ))
-                    .child(option("No Wrap", !self.wrap_lines).on_click(
-                        cx.listener(|this, _, window, cx| this.set_wrap_lines(false, window, cx)),
-                    )),
-            )
+            .children(pairs.into_iter().take(shown))
+            .children(more)
+    }
+
+    /// How many of the strip's pairs of modes fit in it, with room for the
+    /// "…" that holds the rest when not all do.
+    fn strip_pairs_shown(&self, window: &Window) -> usize {
+        let height = self.strip_height.get();
+        if height <= 0. {
+            return STRIP_PAIRS.len();
+        }
+        let tab = |label: &str| strip_group_height(&[label], 12., window);
+        let fixed = STRIP_GAP
+            + tab("Attention")
+            + STRIP_GAP
+            + tab("Files")
+            + STRIP_GAP
+            + 1.
+            + STRIP_GAP
+            + STRIP_GAP
+            + tab("Terminal")
+            + STRIP_GAP;
+        let more = STRIP_GAP + strip_group_height(&["…"], 0., window);
+        let mut used = fixed;
+        for (k, pair) in STRIP_PAIRS.iter().enumerate() {
+            let next =
+                used + strip_group_height(pair, 0., window) + if k > 0 { STRIP_GAP } else { 0. };
+            let rest = if k + 1 < STRIP_PAIRS.len() { more } else { 0. };
+            if next + rest > height {
+                return k;
+            }
+            used = next;
+        }
+        STRIP_PAIRS.len()
     }
 
     /// The commit header's first line, kept at the top once the rest of it
@@ -593,7 +651,15 @@ impl RepoView {
                     .and_then(|key| self.summaries.get(key).cloned());
                 let on = preferences::summaries();
                 let summarizing = on && matches!(state, Some(None) | None);
-                let summary = self.summary().cloned();
+                let summary = self.summary().cloned().or_else(|| {
+                    summarizing
+                        .then(|| {
+                            key.as_ref()
+                                .and_then(|key| self.replaced_summaries.get(key))
+                        })
+                        .flatten()
+                        .cloned()
+                });
                 let failed = match &state {
                     Some(Some(Err(error))) if on => Some(error.clone()),
                     _ => None,
@@ -849,7 +915,11 @@ impl RepoView {
         if let Some(key) = self.summary_key() {
             // One being written is left to finish.
             if matches!(self.summaries.get(&key), Some(Some(_))) {
-                self.summaries.remove(&key);
+                // The old one stays in view while the new one is written,
+                // so the header keeps its size.
+                if let Some(Some(Ok(old))) = self.summaries.remove(&key) {
+                    self.replaced_summaries.insert(key, old);
+                }
                 self.request_summary(cx);
                 cx.notify();
             }
@@ -1036,19 +1106,16 @@ impl RepoView {
         let count = parts.len();
         // What does not fit goes on to the next line, a fact whole, its
         // dot kept with it.
-        div()
-            .flex()
-            .flex_wrap()
-            .gap_x(px(6.))
-            .min_w_0()
-            .children(parts.into_iter().enumerate().map(move |(k, (_, value))| {
+        div().flex().flex_wrap().gap_x(px(6.)).min_w_0().children(
+            parts.into_iter().enumerate().map(move |(k, (_, value))| {
                 div()
                     .flex()
                     .gap(px(6.))
                     .whitespace_nowrap()
                     .child(value)
                     .when(k + 1 < count, |part| part.child("·"))
-            }))
+            }),
+        )
     }
 
     /// The diff `list` with the commit header scrolling above its first rows,
@@ -1093,7 +1160,14 @@ impl RepoView {
     }
 }
 
-/// The summary bar's height: the header's first line with its padding.
+/// The strip's pairs of modes, top down, by their buttons' names.
+pub(super) const STRIP_PAIRS: [[&str; 2]; 4] = [
+    ["Diff", "Tree"],
+    ["Split", "Unified"],
+    ["Structural", "Text"],
+    ["Wrap", "No Wrap"],
+];
+
 /// How wide the header is before the facts stand on its right, and how
 /// wide they are.
 const WIDE_HEADER: f32 = 900.;
@@ -1127,6 +1201,7 @@ pub(super) fn short_name(name: &str) -> String {
     }
 }
 
+/// The summary bar's height: the header's first line with its padding.
 pub(super) fn summary_bar_height() -> f32 {
     2. * HEADER_PADDING + HEADER_LINE * preferences::ui_size() + 1.
 }

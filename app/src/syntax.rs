@@ -123,9 +123,9 @@ mod tests {
             text: text.to_string(),
             changes: Vec::new(),
         };
-        let diff = FileDiff {
-            language: String::new(),
-            rows: vec![
+        let diff = FileDiff::new(
+            String::new(),
+            vec![
                 DiffRow {
                     left: Some(side(1, "fn main() {")),
                     right: Some(side(1, "fn main() {")),
@@ -135,7 +135,7 @@ mod tests {
                     right: Some(side(2, "    let s = \"hi\";")),
                 },
             ],
-        };
+        );
         let colors = colors("src/main.rs", &diff, false);
         let line = &colors.right[&2];
         assert_eq!(line.last().map(|run| run.0.end), Some(17));

@@ -97,6 +97,7 @@ fn main() {
             KeyBinding::new("cmd-m", Minimize, None),
             KeyBinding::new("cmd-t", NewTab, None),
             KeyBinding::new("cmd-w", CloseTab, None),
+            KeyBinding::new("cmd-shift-t", ReopenClosedTab, None),
             KeyBinding::new("ctrl-shift-t", ReopenClosedTab, None),
             KeyBinding::new("cmd-shift-w", CloseWindow, None),
             KeyBinding::new("ctrl-tab", NextTab, None),

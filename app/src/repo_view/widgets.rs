@@ -107,6 +107,14 @@ pub(super) fn column(width: f32) -> gpui::Div {
     div().flex_none().w(px(width)).h_full()
 }
 
+/// A list that scrolls only up and down: GPUI otherwise turns a wheel
+/// moved only sideways, as a trackball's or a mouse's tilt is, into a
+/// scroll down the list.
+pub(super) fn vertical_only<S: Styled>(mut element: S) -> S {
+    element.style().restrict_scroll_to_axis = Some(true);
+    element
+}
+
 /// A box of the side strip: a panel's button, or a group of modes.
 pub(super) fn strip_group(theme: &Theme) -> gpui::Div {
     div()
@@ -133,6 +141,35 @@ pub(super) fn strip_option(id: &'static str, on: bool, theme: &Theme) -> Statefu
         .cursor_pointer()
         .hover(|option| option.bg(theme.selection.opacity(0.5)))
         .when(on, |option| option.bg(theme.selection))
+}
+
+/// How tall a [`vertical_label`] of `text` draws.
+pub(super) fn vertical_label_length(text: &str, window: &Window) -> f32 {
+    let size = f32::from(window.rem_size()) * 0.8;
+    let run = gpui::TextRun {
+        len: text.len(),
+        font: gpui::font(preferences::ui_font()),
+        color: gpui::black(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let length = window
+        .text_system()
+        .shape_line(text.to_string().into(), px(size), &[run], None)
+        .width;
+    (f32::from(length) + 4.).ceil()
+}
+
+/// How tall a box of the side strip is around buttons labelled `labels`,
+/// each `extra` taller than its label, as [`strip_group`] and
+/// [`strip_option`] lay them out.
+pub(super) fn strip_group_height(labels: &[&str], extra: f32, window: &Window) -> f32 {
+    let options: f32 = labels
+        .iter()
+        .map(|label| vertical_label_length(label, window) + 12. + extra)
+        .sum();
+    options + 2. * labels.len().saturating_sub(1) as f32 + 4. + 2.
 }
 
 /// Text turned to read downwards, for the sidebar strip. GPUI draws text

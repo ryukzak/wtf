@@ -115,7 +115,7 @@ impl RepoView {
             return None;
         }
         let (mut removed, mut added) = (HashSet::new(), HashSet::new());
-        for row in rows.iter().filter_map(|&r| diff.rows.get(r)) {
+        for row in rows.iter().filter_map(|&r| self.shown_rows(diff).get(r)) {
             if let Some(left) = &row.left
                 && (row.right.is_none() || !left.changes.is_empty())
             {

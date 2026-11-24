@@ -28,6 +28,9 @@ pub struct GraphStyle {
     pub hover_line: f32,
     /// How far a rail runs while changing rows.
     pub curve: f32,
+    /// Branches stacked on others step down a row each, as stairs; off,
+    /// they run on along one row.
+    pub stairs: bool,
 }
 
 impl Default for GraphStyle {
@@ -41,6 +44,7 @@ impl Default for GraphStyle {
             line: 2.,
             hover_line: 4.,
             curve: 16.,
+            stairs: true,
         }
     }
 }
@@ -67,11 +71,28 @@ struct Settings {
     /// What the model is told to summarize commits and to write commit
     /// messages; `None` for the built-in prompts.
     summary_prompt: Option<String>,
+    /// Which of the app's commands the terminal prints, by kind.
+    terminal_changes: bool,
+    terminal_reads: bool,
+    terminal_refresh: bool,
+    /// Commands the terminal leaves out whatever their kind, a glob a line.
+    terminal_hidden: Option<String>,
+    /// Files the structural diff leaves to the text one, a glob a line;
+    /// `None` for the built-in list.
+    text_only: Option<String>,
+    /// Files larger than this, in kilobytes, get the text diff; 0 for no
+    /// limit.
+    structural_max_kb: u32,
     message_prompt: Option<String>,
     /// At launch, problems with external programs open the tools window.
     tool_check: bool,
     /// File trees list folders before files; off, the two mix by name.
     folders_first: bool,
+    /// How many commands run lately the palette lists first.
+    palette_recent: u32,
+    /// A side-by-side diff whose sides hold fewer characters than this
+    /// shows in one column; 0 never does.
+    one_column_below: u32,
     graph: GraphStyle,
     /// Minutes between background fetches; 0 for none.
     fetch_minutes: u32,
@@ -128,9 +149,17 @@ impl Default for Settings {
             idle_days: 14,
             summaries: None,
             summary_prompt: None,
+            text_only: None,
+            terminal_changes: true,
+            terminal_reads: false,
+            terminal_refresh: false,
+            terminal_hidden: None,
+            structural_max_kb: 200,
             message_prompt: None,
             tool_check: true,
             folders_first: false,
+            one_column_below: 80,
+            palette_recent: 5,
             graph: GraphStyle::default(),
             fetch_minutes: 5,
             fetch_prune: true,
@@ -380,6 +409,11 @@ impl Knob {
     }
 }
 
+/// Whether branches stacked on others step down a row each in the graph.
+pub fn stacks_as_stairs() -> bool {
+    read().graph.stairs
+}
+
 pub fn summaries() -> bool {
     read().summaries == Some(true)
 }
@@ -398,6 +432,17 @@ pub fn set_summaries(on: bool, cx: &mut App) {
 }
 
 /// Whether file trees list folders before files.
+/// How many commands run lately the command palette lists first.
+pub fn palette_recent() -> usize {
+    read().palette_recent as usize
+}
+
+/// How narrow, in characters, a side of a split diff may get before the
+/// diff shows in one column; 0 for never.
+pub fn one_column_below() -> u32 {
+    read().one_column_below
+}
+
 pub fn folders_first() -> bool {
     read().folders_first
 }
@@ -420,6 +465,56 @@ pub fn summary_prompt() -> String {
         .summary_prompt
         .clone()
         .unwrap_or_else(|| wtf_core::SUMMARY_PROMPT.to_string())
+}
+
+/// The files the structural diff leaves to the text one, built in: those
+/// that are code around data, where its structure tells nothing.
+pub const TEXT_ONLY: &str = "*.snap\n*.lock\npackage-lock.json\n*-lock.yaml\n*.min.js\n*.min.css";
+
+/// Which of the app's commands the terminal prints; with `all`, every one.
+pub fn terminal_shown(all: bool) -> crate::console_view::Shown {
+    let settings = read();
+    crate::console_view::Shown {
+        changes: settings.terminal_changes,
+        reads: settings.terminal_reads,
+        refresh: settings.terminal_refresh,
+        hidden: settings
+            .terminal_hidden
+            .as_deref()
+            .unwrap_or_default()
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect(),
+        all,
+    }
+}
+
+/// The globs of files to diff as text even in structural mode, a line each.
+pub fn text_only() -> String {
+    read()
+        .text_only
+        .clone()
+        .unwrap_or_else(|| TEXT_ONLY.to_string())
+}
+
+/// What leaves a file to the text diff: the globs, and the size in bytes
+/// past which none is diffed by structure.
+pub fn text_only_rule() -> wtf_core::TextOnly {
+    let kb = read().structural_max_kb;
+    wtf_core::TextOnly {
+        patterns: text_only()
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect(),
+        max_bytes: match kb {
+            0 => usize::MAX,
+            kb => kb as usize * 1024,
+        },
+    }
 }
 
 pub fn message_prompt() -> String {
@@ -480,9 +575,25 @@ fn parse(text: &str) -> Settings {
             ("sync_badges", _) => settings.sync_badges = value == "on",
             ("tool_check", _) => settings.tool_check = value == "on",
             ("folders_first", _) => settings.folders_first = value == "on",
+            ("palette_recent", _) => {
+                if let Ok(count) = value.parse() {
+                    settings.palette_recent = count;
+                }
+            }
+            ("one_column_below", _) => {
+                if let Ok(chars) = value.parse() {
+                    settings.one_column_below = chars;
+                }
+            }
             ("pull_option", Some(n)) => settings.pull_option = n as usize,
             ("push_option", Some(n)) => settings.push_option = n as usize,
             ("summary_prompt", _) => settings.summary_prompt = Some(unescape(raw)),
+            ("text_only", _) => settings.text_only = Some(unescape(raw)),
+            ("terminal_hidden", _) => settings.terminal_hidden = Some(unescape(raw)),
+            ("terminal_changes", _) => settings.terminal_changes = value == "on",
+            ("terminal_reads", _) => settings.terminal_reads = value == "on",
+            ("terminal_refresh", _) => settings.terminal_refresh = value == "on",
+            ("structural_max_kb", Some(n)) => settings.structural_max_kb = n as u32,
             ("message_prompt", _) => settings.message_prompt = Some(unescape(raw)),
             ("graph.row_height", Some(n)) => graph.row_height = n,
             ("graph.column", Some(n)) => graph.column = n,
@@ -492,6 +603,7 @@ fn parse(text: &str) -> Settings {
             ("graph.line", Some(n)) => graph.line = n,
             ("graph.hover_line", Some(n)) => graph.hover_line = n,
             ("graph.curve", Some(n)) => graph.curve = n,
+            ("graph.stairs", _) => graph.stairs = value == "on",
             _ => {}
         }
     }
@@ -547,6 +659,8 @@ fn format(settings: &Settings) -> String {
         format!("sync_badges={}", on_off(settings.sync_badges)),
         format!("tool_check={}", on_off(settings.tool_check)),
         format!("folders_first={}", on_off(settings.folders_first)),
+        format!("one_column_below={}", settings.one_column_below),
+        format!("palette_recent={}", settings.palette_recent),
         format!("pull_option={}", settings.pull_option),
         format!("push_option={}", settings.push_option),
         match settings.summaries {
@@ -559,6 +673,18 @@ fn format(settings: &Settings) -> String {
             .as_ref()
             .map_or(String::new(), |p| format!("summary_prompt={}", escape(p))),
         settings
+            .text_only
+            .as_ref()
+            .map_or(String::new(), |p| format!("text_only={}", escape(p))),
+        format!("structural_max_kb={}", settings.structural_max_kb),
+        settings
+            .terminal_hidden
+            .as_ref()
+            .map_or(String::new(), |p| format!("terminal_hidden={}", escape(p))),
+        format!("terminal_changes={}", on_off(settings.terminal_changes)),
+        format!("terminal_reads={}", on_off(settings.terminal_reads)),
+        format!("terminal_refresh={}", on_off(settings.terminal_refresh)),
+        settings
             .message_prompt
             .as_ref()
             .map_or(String::new(), |p| format!("message_prompt={}", escape(p))),
@@ -570,6 +696,7 @@ fn format(settings: &Settings) -> String {
         format!("graph.line={}", g.line),
         format!("graph.hover_line={}", g.hover_line),
         format!("graph.curve={}", g.curve),
+        format!("graph.stairs={}", on_off(g.stairs)),
     ]
     .into_iter()
     .filter(|line| !line.is_empty())
@@ -650,7 +777,12 @@ pub fn open(cx: &mut App) {
                 font_menu: None,
                 font_query: Default::default(),
                 prompts: Default::default(),
-                prompt_focus: [cx.focus_handle(), cx.focus_handle()],
+                prompt_focus: [
+                    cx.focus_handle(),
+                    cx.focus_handle(),
+                    cx.focus_handle(),
+                    cx.focus_handle(),
+                ],
                 dragging: None,
                 tracks: Default::default(),
             }
@@ -671,9 +803,9 @@ pub struct Preferences {
     font_menu: Option<(FontSetting, gpui::Point<gpui::Pixels>)>,
     font_query: Field,
     /// The prompts as edited, each a multi-line field.
-    prompts: [Field; 2],
+    prompts: [Field; 4],
     /// The prompt fields, each with its own focus.
-    prompt_focus: [FocusHandle; 2],
+    prompt_focus: [FocusHandle; 4],
     /// The slider being dragged, and where each slider's track was drawn.
     dragging: Option<Knob>,
     tracks: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<Knob, Bounds<gpui::Pixels>>>>,
@@ -684,6 +816,10 @@ pub struct Preferences {
 enum PromptSetting {
     Summary,
     Message,
+    /// Not a prompt: the files the structural diff leaves to the text one.
+    TextOnly,
+    /// Nor this: the commands the terminal leaves out.
+    HiddenCommands,
 }
 
 impl PromptSetting {
@@ -692,6 +828,8 @@ impl PromptSetting {
         match self {
             PromptSetting::Summary => summary_prompt(),
             PromptSetting::Message => message_prompt(),
+            PromptSetting::TextOnly => text_only(),
+            PromptSetting::HiddenCommands => read().terminal_hidden.clone().unwrap_or_default(),
         }
     }
 
@@ -701,11 +839,15 @@ impl PromptSetting {
         let built_in = match self {
             PromptSetting::Summary => wtf_core::SUMMARY_PROMPT,
             PromptSetting::Message => wtf_core::MESSAGE_PROMPT,
+            PromptSetting::TextOnly => TEXT_ONLY,
+            PromptSetting::HiddenCommands => "",
         };
         let text = text.filter(|text| text != built_in);
         match self {
             PromptSetting::Summary => settings.summary_prompt = text,
             PromptSetting::Message => settings.message_prompt = text,
+            PromptSetting::TextOnly => settings.text_only = text,
+            PromptSetting::HiddenCommands => settings.terminal_hidden = text,
         }
     }
 }
@@ -717,15 +859,17 @@ enum Section {
     Fonts,
     Graph,
     Review,
+    Terminal,
     Remote,
 }
 
 impl Section {
-    const ALL: [Section; 5] = [
+    const ALL: [Section; 6] = [
         Section::Appearance,
         Section::Fonts,
         Section::Graph,
         Section::Review,
+        Section::Terminal,
         Section::Remote,
     ];
 
@@ -735,6 +879,7 @@ impl Section {
             Section::Fonts => "Fonts",
             Section::Graph => "Workflow graph",
             Section::Review => "Review",
+            Section::Terminal => "Terminal",
             Section::Remote => "Remote",
         }
     }
@@ -1152,6 +1297,16 @@ impl Preferences {
         let (label, custom, k) = match setting {
             PromptSetting::Summary => ("Summary prompt", read().summary_prompt.is_some(), 0),
             PromptSetting::Message => ("Commit message prompt", read().message_prompt.is_some(), 1),
+            PromptSetting::TextOnly => (
+                "Text diff for these files, a pattern a line",
+                read().text_only.is_some(),
+                2,
+            ),
+            PromptSetting::HiddenCommands => (
+                "Never show commands matching, a pattern a line, such as git rev-parse*",
+                read().terminal_hidden.is_some(),
+                3,
+            ),
         };
         let focus = &self.prompt_focus[k];
         let focused = focus.is_focused(window);
@@ -1221,7 +1376,9 @@ impl Preferences {
                         theme,
                         match k {
                             0 => |this: &mut Self| Some(&mut this.prompts[0]),
-                            _ => |this: &mut Self| Some(&mut this.prompts[1]),
+                            1 => |this: &mut Self| Some(&mut this.prompts[1]),
+                            2 => |this: &mut Self| Some(&mut this.prompts[2]),
+                            _ => |this: &mut Self| Some(&mut this.prompts[3]),
                         },
                         cx,
                     )),
@@ -1389,9 +1546,14 @@ impl Render for Preferences {
         window.set_rem_size(px(ui_size()));
         // A prompt not being edited shows the one in the settings, which
         // may have been reset.
-        for (k, setting) in [PromptSetting::Summary, PromptSetting::Message]
-            .into_iter()
-            .enumerate()
+        for (k, setting) in [
+            PromptSetting::Summary,
+            PromptSetting::Message,
+            PromptSetting::TextOnly,
+            PromptSetting::HiddenCommands,
+        ]
+        .into_iter()
+        .enumerate()
         {
             let text = setting.text();
             if !self.prompt_focus[k].is_focused(window) && self.prompts[k].text() != text {
@@ -1489,6 +1651,57 @@ impl Render for Preferences {
                     &theme,
                 ))
                 .child(group(
+                    Some("Command palette"),
+                    [row("Commands run lately, first", &theme).child(segmented(
+                        "palette-recent",
+                        &[("None", 0), ("3", 3), ("5", 5), ("10", 10)],
+                        settings.palette_recent,
+                        |count, cx| change(|settings| settings.palette_recent = count, cx),
+                        &theme,
+                    ))],
+                    Some("The app's commands and the shell's alike, newest first."),
+                    &theme,
+                ))
+                .child(group(
+                    Some("Diff"),
+                    [
+                        row("One column when a side is under", &theme).child(segmented(
+                            "one-column-below",
+                            &[
+                                ("Never", 0),
+                                ("60", 60),
+                                ("80", 80),
+                                ("100", 100),
+                                ("120", 120),
+                            ],
+                            settings.one_column_below,
+                            |chars, cx| change(|settings| settings.one_column_below = chars, cx),
+                            &theme,
+                        )),
+                        row("Text diff above", &theme).child(segmented(
+                            "structural-max",
+                            &[
+                                ("100 KB", 100),
+                                ("200 KB", 200),
+                                ("500 KB", 500),
+                                ("1 MB", 1024),
+                                ("Any size", 0),
+                            ],
+                            settings.structural_max_kb,
+                            |kb, cx| change(|settings| settings.structural_max_kb = kb, cx),
+                            &theme,
+                        )),
+                    ],
+                    Some(
+                        "Characters of code. A split diff narrower than this shows old and \
+                         new lines in one column; Split and Unified in the strip choose by hand. \
+                         Larger files, and those below, get the text diff even in Structural \
+                         mode: their structure is slow to find and tells little.",
+                    ),
+                    &theme,
+                ))
+                .child(self.prompt_field(PromptSetting::TextOnly, &theme, window, cx))
+                .child(group(
                     Some("Apple Intelligence"),
                     [
                         row("Commit summaries and messages", &theme).child(switch_for(
@@ -1506,6 +1719,36 @@ impl Render for Preferences {
                 ))
                 .child(self.prompt_field(PromptSetting::Summary, &theme, window, cx))
                 .child(self.prompt_field(PromptSetting::Message, &theme, window, cx)),
+            Section::Terminal => div()
+                .child(group(
+                    Some("Show the app's commands"),
+                    [
+                        row("Changes it makes", &theme).child(switch_for(
+                            "terminal-changes",
+                            settings.terminal_changes,
+                            |s, on| s.terminal_changes = on,
+                        )),
+                        row("Reads for what you look at", &theme).child(switch_for(
+                            "terminal-reads",
+                            settings.terminal_reads,
+                            |s, on| s.terminal_reads = on,
+                        )),
+                        row("Background refresh", &theme).child(switch_for(
+                            "terminal-refresh",
+                            settings.terminal_refresh,
+                            |s, on| s.terminal_refresh = on,
+                        )),
+                    ],
+                    Some(
+                        "Changes stage, commit, check out, stash, push and pull. Reads are \
+                         the diffs, logs and files the screen shows; the refresh keeps the \
+                         graph current. Commands you run show always, and so does any \
+                         command that fails. Show All Commands, in the palette, shows \
+                         everything for a while.",
+                    ),
+                    &theme,
+                ))
+                .child(self.prompt_field(PromptSetting::HiddenCommands, &theme, window, cx)),
             Section::Remote => div().child(group(
                 None,
                 [
@@ -1541,6 +1784,13 @@ impl Render for Preferences {
                         row("Row height", &theme).child(self.slider(Knob::RowHeight, &theme, cx)),
                         row("Node spacing", &theme).child(self.slider(Knob::Column, &theme, cx)),
                         row("Curve length", &theme).child(self.slider(Knob::Curve, &theme, cx)),
+                        row("Stacked branches", &theme).child(segmented(
+                            "graph-stairs",
+                            &[("In a row", false), ("As stairs", true)],
+                            graph.stairs,
+                            |stairs, cx| change(|settings| settings.graph.stairs = stairs, cx),
+                            &theme,
+                        )),
                     ],
                     None,
                     &theme,

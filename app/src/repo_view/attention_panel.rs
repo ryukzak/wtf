@@ -847,6 +847,40 @@ impl RepoView {
                     ));
                 }
             }
+            Dropdown::Modes(shown) => {
+                let checks = [
+                    !self.snapshot_mode,
+                    self.snapshot_mode,
+                    !self.one_column.get(),
+                    self.one_column.get(),
+                    self.diff_mode == DiffMode::Structural,
+                    self.diff_mode == DiffMode::Text,
+                    self.wrap_lines,
+                    !self.wrap_lines,
+                ];
+                for (pair, names) in header::STRIP_PAIRS.iter().enumerate().skip(*shown) {
+                    if pair > *shown {
+                        menu = menu.child(div().my(px(4.)).h(px(1.)).bg(theme.separator));
+                    }
+                    for (k, name) in names.iter().enumerate() {
+                        let at = pair * 2 + k;
+                        menu =
+                            menu.child(item(("mode", at), checks[at], name.to_string()).on_click(
+                                cx.listener(move |this, _, window, cx| {
+                                    this.dropdown = None;
+                                    match at {
+                                        0 | 1 => this.set_snapshot_mode(at == 1, window, cx),
+                                        2 | 3 => this.set_unified(at == 3, window, cx),
+                                        4 => this.set_diff_mode(DiffMode::Structural, cx),
+                                        5 => this.set_diff_mode(DiffMode::Text, cx),
+                                        _ => this.set_wrap_lines(at == 6, window, cx),
+                                    }
+                                    cx.notify();
+                                }),
+                            ));
+                    }
+                }
+            }
         }
         Some(
             deferred(anchored().position(*position).snap_to_window().child(menu))
