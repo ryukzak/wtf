@@ -366,10 +366,15 @@ pub fn layout(graph: &WorkflowGraph, order: WorktreeOrder) -> Layout {
         .collect();
     let lane_count = base + detached.len() + stash_rows.len() + framed_up.len();
     // A worktree off the middle of the main line goes up; off another line,
-    // down. Without the main line's history known, every one goes up.
+    // down, a merged one's too: going up it would cross the main row. Without
+    // the main line's history known, every one goes up.
     let goes_up = |worktree: usize| {
         let commit = graph.nodes[worktree].parents[0];
-        followed[commit] && graph.on_main.get(commit).copied().unwrap_or(true)
+        followed[commit]
+            && graph
+                .on_main
+                .get(commit)
+                .is_none_or(|&on| on && lane_of[commit] == 0)
     };
     let own_lane =
         |worktree: usize| base + detached.iter().position(|&w| w == worktree).unwrap_or(0);
@@ -379,6 +384,19 @@ pub fn layout(graph: &WorkflowGraph, order: WorktreeOrder) -> Layout {
             + stash_rows.len()
             + framed_up.iter().position(|&w| w == worktree).unwrap_or(0)
     };
+    // A worktree off the middle of a line other than the main one steps
+    // down from it, as a stair does: right under it, crossing no other row.
+    step_from.resize(lane_count, None);
+    for (&worktree, lane) in detached
+        .iter()
+        .zip(base..)
+        .chain(framed_up.iter().map(|w| (w, framed_lane(*w))))
+    {
+        let commit = graph.nodes[worktree].parents[0];
+        if !goes_up(worktree) && lane_of[commit] != 0 {
+            step_from[lane] = Some(lane_of[commit]);
+        }
+    }
     // The layout lane whose row a node sits in: a worktree's commit's, or
     // one of its own when detached.
     let lane_row = |i: usize| {
@@ -509,7 +527,10 @@ pub fn layout(graph: &WorkflowGraph, order: WorktreeOrder) -> Layout {
             WorktreeOrder::FirstCommit => first,
         }
     };
+    // Merged branches come first, named or not: their way back to the main
+    // row then crosses no other row.
     let group = |lane: usize| match (worktree_lane[lane], touches_main[lane], named[lane]) {
+        (false, true, _) if returns[lane] => 0,
         (false, true, false) => 0,
         (true, _, _) => 1,
         (false, true, true) => 2,
@@ -2219,6 +2240,39 @@ mod tests {
         let length = |i: usize| layout.nodes[i].1 - layout.nodes[i].0;
         assert_eq!(length(0), 3. * style().bead_spacing);
         assert_eq!(length(1), style().beads as f32 * style().bead_spacing);
+    }
+
+    #[test]
+    fn worktree_on_a_merged_branch_stays_below_the_main_row() {
+        let mut worktree = node(1, &[2], 1, 4);
+        worktree.kind = NodeKind::Uncommitted;
+        worktree.added = 1;
+        let mut merged = node(1, &[0], 1, 2);
+        merged.refs = vec!["merged".to_string()];
+        let mut open = node(2, &[0], 1, 5);
+        open.refs = vec!["open".to_string()];
+        let mut open_worktree = node(2, &[5], 1, 5);
+        open_worktree.kind = NodeKind::Uncommitted;
+        // main: 0 → 1 → 3, merging 2, the branch the worktree is on; 5, an
+        // open branch with a clean worktree, off 0 too.
+        let mut graph = graph(vec![
+            node(0, &[], 1, 0),
+            node(0, &[0], 1, 1),
+            merged,
+            node(0, &[1, 2], 1, 3),
+            worktree,
+            open,
+            open_worktree,
+        ]);
+        graph.main_node = Some(3);
+        graph.on_main = graph.main_history();
+        let layout = layout(&graph, WorktreeOrder::LastCommit);
+        let y = |i: usize| layout.nodes[i].2;
+        // Nothing crosses: the merged branch nearest the main row, its
+        // worktree right under it, the open branch under both.
+        assert!(y(0) < y(2), "the merged branch below the main row");
+        assert!(y(2) < y(4), "the worktree under its branch");
+        assert!(y(4) < y(5), "the open branch under both");
     }
 
     #[test]
