@@ -589,6 +589,7 @@ impl RepoView {
         let Some((query, _, palette)) = &self.goto else {
             return Vec::new();
         };
+        let query = query.text();
         if !*palette {
             let entries = goto::entries(&self.graph, self.worktree_names);
             return goto::filter(&entries, query).into_iter().cloned().collect();
@@ -614,7 +615,7 @@ impl RepoView {
     }
 
     pub(super) fn open_goto(&mut self, palette: bool, window: &mut Window, cx: &mut Context<Self>) {
-        self.goto = Some((String::new(), 0, palette));
+        self.goto = Some((Default::default(), 0, palette));
         self.goto_focus.focus(window);
         cx.notify();
     }
@@ -663,9 +664,9 @@ impl RepoView {
         match keystroke.key.as_str() {
             "escape" => return self.close_goto(window, cx),
             // In the palette, Tab completes a file name in the worktree.
-            "tab" if *palette && !query.trim().is_empty() => {
+            "tab" if *palette && !query.text().trim().is_empty() => {
                 let Some(path) = path else { return };
-                let (completed, matches) = goto::complete(query, |folder| {
+                let (completed, matches) = goto::complete(query.text(), |folder| {
                     std::fs::read_dir(Path::new(&path).join(folder))
                         .into_iter()
                         .flatten()
@@ -677,14 +678,14 @@ impl RepoView {
                         .collect()
                 });
                 // A second Tab with nothing more to add keeps the choices shown.
-                self.completions = match matches.is_empty() && completed == *query {
+                self.completions = match matches.is_empty() && completed == query.text() {
                     true => completions,
                     false => matches,
                 };
-                if completed != *query {
+                if completed != query.text() {
                     *highlighted = 0;
+                    query.edit.set_text(completed);
                 }
-                *query = completed;
             }
             "enter" => {
                 // Holding ⌥ can shorten the list under the highlight.
@@ -709,8 +710,16 @@ impl RepoView {
                 let last = found.min(GOTO_ROWS).saturating_sub(1);
                 *highlighted = (*highlighted).min(last).saturating_sub(1);
             }
-            _ if type_key(query, keystroke, true, cx) => *highlighted = 0,
-            _ => return,
+            // A changed query lists from its best match again.
+            _ => {
+                let before = query.text().to_string();
+                if !query.key(keystroke, cx) {
+                    return;
+                }
+                if query.text() != before {
+                    *highlighted = 0;
+                }
+            }
         }
         cx.stop_propagation();
         cx.notify();
@@ -727,8 +736,23 @@ impl RepoView {
         let (query, highlighted, commands) = self.goto.as_ref()?;
         let found = self.goto_found(window);
         let highlighted = &(*highlighted).min(found.len().saturating_sub(1));
-        let running = *commands && window.modifiers().alt && !query.trim().is_empty();
+        let running = *commands && window.modifiers().alt && !query.text().trim().is_empty();
         let now = now_seconds();
+        let input = query.render(
+            "goto-text",
+            if *commands {
+                "Run a command"
+            } else {
+                "Go to a worktree, branch or commit"
+            },
+            true,
+            true,
+            Vec::new(),
+            &self.goto_focus,
+            theme,
+            |this: &mut Self| this.goto.as_mut().map(|(query, _, _)| query),
+            cx,
+        );
         let rows = found.iter().take(GOTO_ROWS).enumerate().map(|(k, entry)| {
             let (icon, kind) = match entry.kind {
                 goto::Kind::Worktree => ("▣", "worktree · ⌘↩ open with"),
@@ -815,16 +839,7 @@ impl RepoView {
                     .border_color(theme.accent)
                     .whitespace_nowrap()
                     .overflow_hidden()
-                    .child(field_text(
-                        query,
-                        if *commands {
-                            "Run a command"
-                        } else {
-                            "Go to a worktree, branch or commit"
-                        },
-                        true,
-                        theme,
-                    )),
+                    .child(input),
             )
             .children(rows)
             .when(found.is_empty(), |panel| {
@@ -843,7 +858,7 @@ impl RepoView {
                     .rsplit('/')
                     .next()
                     .unwrap_or_default();
-                let hint = match (running, query.trim()) {
+                let hint = match (running, query.text().trim()) {
                     _ if !self.completions.is_empty() => self.completions.join("   "),
                     (true, _) => format!(
                         "↩ runs it in {} · ⇥ completes file names",
@@ -874,7 +889,7 @@ impl RepoView {
     pub(super) fn show_prompt(&mut self, kind: PromptKind, input: String, window: &mut Window) {
         self.prompt = Some(Prompt {
             kind,
-            edit: crate::line_edit::LineEdit::new(input),
+            field: crate::text_field::Field::new(crate::line_edit::LineEdit::new(input)),
         });
         self.prompt_focus.focus(window);
         self.caret_on = true;
@@ -917,7 +932,7 @@ impl RepoView {
         match keystroke.key.as_str() {
             "enter" => self.submit_prompt(window, cx),
             "escape" => self.close_prompt(window, cx),
-            _ if prompt.edit.key(keystroke, cx) => {
+            _ if prompt.field.key(keystroke, cx) => {
                 // The caret stays lit while typing, and blinks from there.
                 self.caret_on = true;
                 self.blink_task = None;
@@ -934,7 +949,7 @@ impl RepoView {
         };
         self.focus.focus(window);
         self.blink_task = None;
-        let input = prompt.edit.text.trim().to_string();
+        let input = prompt.field.text().trim().to_string();
         if input.is_empty() {
             return;
         }
@@ -1184,7 +1199,7 @@ impl RepoView {
         // loose shows at once.
         let hint = match &prompt.kind {
             PromptKind::AddChannel => {
-                let input = prompt.edit.text.trim();
+                let input = prompt.field.text().trim();
                 let names = self.channel_matches(input);
                 let shown: Vec<&str> = names.iter().take(8).map(String::as_str).collect();
                 match (input.is_empty(), names.len()) {
@@ -1227,7 +1242,17 @@ impl RepoView {
                     .font_weight(preferences::code_weight())
                     .whitespace_nowrap()
                     .overflow_hidden()
-                    .children(field_with_caret(&prompt.edit, self.caret_on, theme)),
+                    .child(prompt.field.render(
+                        "prompt-text",
+                        "",
+                        true,
+                        self.caret_on,
+                        Vec::new(),
+                        &self.prompt_focus,
+                        theme,
+                        |this: &mut Self| this.prompt.as_mut().map(|prompt| &mut prompt.field),
+                        cx,
+                    )),
             )
             .child(div().text_xs().text_color(theme.secondary).child(hint))
             // A click anywhere else closes it, as Esc does.
@@ -1436,47 +1461,6 @@ fn dialog_overlay(panel: impl IntoElement, width: f32, top: f32, window: &Window
 
 /// How long the prompt's caret stays lit, and dark.
 const CARET_BLINK: std::time::Duration = std::time::Duration::from_millis(530);
-
-/// A one-line field's text with its selection marked and its caret, lit or
-/// not as it blinks.
-fn field_with_caret(
-    edit: &crate::line_edit::LineEdit,
-    caret_on: bool,
-    theme: &Theme,
-) -> Vec<AnyElement> {
-    let range = edit.selection();
-    let text = &edit.text;
-    // The caret takes no room: a mark drawn over the text, so the text
-    // stays put wherever the caret goes.
-    let caret = div()
-        .flex_none()
-        .relative()
-        .w(px(0.))
-        .h(px(15.))
-        .child(
-            div()
-                .absolute()
-                .left(px(-0.75))
-                .top_0()
-                .w(px(1.5))
-                .h(px(15.))
-                .when(caret_on, |caret| caret.bg(theme.foreground)),
-        )
-        .into_any_element();
-    // Spaces keep their width when a run ends with one.
-    let run = |part: &str| div().flex_none().child(part.replace(' ', "\u{a0}"));
-    let mut parts = vec![run(&text[..range.start]).into_any_element()];
-    let selected = run(&text[range.clone()])
-        .bg(theme.selection)
-        .into_any_element();
-    match (range.is_empty(), edit.caret == range.start) {
-        (true, _) => parts.push(caret),
-        (false, true) => parts.extend([caret, selected]),
-        (false, false) => parts.extend([selected, caret]),
-    }
-    parts.push(run(&text[range.end..]).into_any_element());
-    parts
-}
 
 fn dialog_width(width: f32, window: &Window) -> f32 {
     width.min(f32::from(window.viewport_size().width) - 32.)

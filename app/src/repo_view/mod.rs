@@ -45,7 +45,6 @@ mod trees;
 mod widgets;
 
 use attention_panel::*;
-use commit_box::*;
 use header::*;
 use time::*;
 use trees::*;
@@ -144,7 +143,7 @@ struct Snapshot {
     text_loading: Option<(Revision, String)>,
     /// A worktree's files changed on disk: read them again.
     stale: bool,
-    filter: String,
+    filter: crate::text_field::Field,
     only_changed: bool,
     /// Folders open in the tree: by a click, or on the way to a file opened.
     /// Only a click closes one.
@@ -296,7 +295,7 @@ enum Dropdown {
 /// A small panel asking for one line of text.
 struct Prompt {
     kind: PromptKind,
-    edit: crate::line_edit::LineEdit,
+    field: crate::text_field::Field,
 }
 
 enum PromptKind {
@@ -350,7 +349,7 @@ pub struct RepoView {
     prune_focus: FocusHandle,
     /// The Go To picker or the command palette, when open: the query, the
     /// highlighted result, and whether it lists commands.
-    goto: Option<(String, usize, bool)>,
+    goto: Option<(crate::text_field::Field, usize, bool)>,
     /// The Stash picker, open on a worktree: its path and the highlighted
     /// row, the first one running the stash.
     stash_picker: Option<(String, usize)>,
@@ -376,7 +375,7 @@ pub struct RepoView {
     side_panel: Option<SidePanel>,
     last_panel: SidePanel,
     sidebar_width: f32,
-    attention_search: String,
+    attention_search: crate::text_field::Field,
     attention_search_focus: FocusHandle,
     collapsed_sections: HashSet<Section>,
     dropdown: Option<(Dropdown, Point<Pixels>)>,
@@ -460,7 +459,7 @@ pub struct RepoView {
     message_scroll: ScrollHandle,
     /// A commit message being edited: the commit, the worktree whose latest
     /// commit it is, and the text so far.
-    rewording: Option<(String, String, String)>,
+    rewording: Option<(String, String, crate::text_field::Field)>,
     /// Text picked in a commit's message: the commit, where the pick started
     /// and where it ends, and whether a drag is extending it.
     message_selection: Option<(String, usize, usize)>,
@@ -585,7 +584,7 @@ impl RepoView {
             side_panel: None,
             last_panel: SidePanel::Attention,
             sidebar_width: ATTENTION_PANEL_WIDTH,
-            attention_search: String::new(),
+            attention_search: Default::default(),
             attention_search_focus: cx.focus_handle(),
             collapsed_sections: HashSet::new(),
             dropdown: None,
@@ -2988,7 +2987,7 @@ impl RepoView {
     /// selection changed them; files it deleted are listed too.
     fn snapshot_entries(&self) -> Vec<ChangedFile> {
         let changed = self.changed_paths();
-        let filter = self.snapshot.filter.trim().to_lowercase();
+        let filter = self.snapshot.filter.text().trim().to_lowercase();
         let deleted = changed
             .iter()
             .filter(|(_, status)| status.as_str() == "D")
@@ -3032,7 +3031,7 @@ impl RepoView {
     /// `folders` are the tree's, from [`snapshot_folders`]: worked out once
     /// per drawing, as they take a walk over every file.
     fn snapshot_closed(&self, folders: &HashMap<String, bool>) -> HashSet<String> {
-        if !self.snapshot.filter.trim().is_empty() {
+        if !self.snapshot.filter.text().trim().is_empty() {
             return HashSet::new();
         }
         // Folders open and close by hand only, so stepping through versions
@@ -3183,16 +3182,11 @@ impl RepoView {
                                 let keystroke = &event.keystroke;
                                 match keystroke.key.as_str() {
                                     "escape" => {
-                                        this.snapshot.filter.clear();
+                                        this.snapshot.filter.edit.set_text("");
                                         this.focus.focus(window);
                                     }
                                     "enter" => {}
-                                    _ if type_key(
-                                        &mut this.snapshot.filter,
-                                        keystroke,
-                                        true,
-                                        cx,
-                                    ) => {}
+                                    _ if this.snapshot.filter.key(keystroke, cx) => {}
                                     _ => return,
                                 }
                                 cx.stop_propagation();
@@ -3217,11 +3211,16 @@ impl RepoView {
                             })
                             .overflow_hidden()
                             .whitespace_nowrap()
-                            .child(field_text(
-                                &self.snapshot.filter,
+                            .child(self.snapshot.filter.render(
+                                "snapshot-filter-text",
                                 "Filter files",
                                 focused,
+                                true,
+                                Vec::new(),
+                                &self.snapshot_filter_focus,
                                 theme,
+                                |this: &mut Self| Some(&mut this.snapshot.filter),
+                                cx,
                             )),
                     )
                     .child(
@@ -3400,38 +3399,6 @@ impl RepoView {
     }
 }
 
-/// Types a key into a plain text field: Return breaks the line, unless the
-/// field is `single_line`, Backspace deletes and ⌘V pastes, on one line in a
-/// single-line field. False for keys it leaves alone.
-pub(crate) fn type_key(
-    text: &mut String,
-    keystroke: &gpui::Keystroke,
-    single_line: bool,
-    cx: &gpui::App,
-) -> bool {
-    let modifiers = keystroke.modifiers;
-    match keystroke.key.as_str() {
-        "enter" if !modifiers.platform && !single_line => text.push('\n'),
-        "backspace" => {
-            text.pop();
-        }
-        "v" if modifiers.platform => {
-            if let Some(pasted) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                match single_line {
-                    true => text.push_str(pasted.replace('\n', " ").trim()),
-                    false => text.push_str(&pasted),
-                }
-            }
-        }
-        _ if !modifiers.platform && !modifiers.control => match &keystroke.key_char {
-            Some(typed) if !typed.chars().any(char::is_control) => text.push_str(typed),
-            _ => return false,
-        },
-        _ => return false,
-    }
-    true
-}
-
 #[cfg(test)]
 mod tests {
     use wtf_core::{DiffRow, DiffSide, TextRange};
@@ -3569,16 +3536,17 @@ mod tests {
                 .collect()
         };
         let none = HashSet::new();
+        // Folders and files together by name, as Settings have it at first.
         assert_eq!(
             show(file_tree(&files, None, &none)),
             [
+                "0README.md",
                 "0app/src/",
+                "1main.rs",
                 "1view/",
                 "2a.rs",
-                "1main.rs",
                 "0core/src/lib/x/",
-                "1y.rs",
-                "0README.md"
+                "1y.rs"
             ]
         );
         let folded = HashSet::from(["staged:app/src/".to_string()]);
@@ -3759,72 +3727,5 @@ mod tests {
                 "binary"
             ]
         );
-    }
-
-    #[test]
-    fn edits_text_at_its_cursor() {
-        let key = |keys: &str| {
-            let mut keystroke = gpui::Keystroke::parse(keys).unwrap();
-            if keystroke.key.chars().count() == 1 && !keystroke.modifiers.platform {
-                keystroke.key_char = Some(keystroke.key.clone());
-            }
-            keystroke
-        };
-        let edit = |text: &str, cursor: usize, keys: &str| {
-            let (mut text, mut cursor) = (text.to_string(), cursor);
-            edit_key(&mut text, &mut cursor, &mut None, &key(keys), || {
-                Some("XY".into())
-            });
-            (text, cursor)
-        };
-        assert_eq!(edit("ac", 1, "b"), ("abc".into(), 2));
-        assert_eq!(edit("abc", 1, "backspace"), ("bc".into(), 0));
-        assert_eq!(edit("abc", 1, "delete"), ("ac".into(), 1));
-        assert_eq!(edit("ab", 1, "cmd-v"), ("aXYb".into(), 3));
-        assert_eq!(edit("ab", 1, "enter"), ("a\nb".into(), 2));
-        assert_eq!(edit("привет", 2, "right"), ("привет".into(), 4));
-        assert_eq!(edit("one two", 7, "alt-left"), ("one two".into(), 4));
-        assert_eq!(edit("one two", 0, "alt-right"), ("one two".into(), 3));
-        assert_eq!(edit("one two", 7, "alt-backspace"), ("one ".into(), 4));
-        assert_eq!(edit("a\nbc", 4, "cmd-left"), ("a\nbc".into(), 2));
-        assert_eq!(edit("a\nbc", 2, "cmd-right"), ("a\nbc".into(), 4));
-        assert_eq!(edit("a\nbc", 4, "cmd-backspace"), ("a\n".into(), 2));
-        assert_eq!(edit("abc", 1, "ctrl-t"), ("bac".into(), 2));
-        assert_eq!(edit("abc\nd", 3, "ctrl-t"), ("acb\nd".into(), 3));
-        assert_eq!(edit("a\nb", 2, "ctrl-t"), ("a\nb".into(), 2));
-        assert_eq!(edit("ab\ncd", 1, "ctrl-k"), ("a\ncd".into(), 1));
-        assert_eq!(edit("ab\ncd", 2, "ctrl-k"), ("abcd".into(), 2));
-        assert_eq!(edit("ab\ncd", 4, "ctrl-a"), ("ab\ncd".into(), 3));
-        assert_eq!(edit("ab", 1, "ctrl-o"), ("a\nb".into(), 1));
-    }
-
-    #[test]
-    fn edits_a_selection() {
-        let edit = |text: &str, cursor: usize, anchor: Option<usize>, keys: &str| {
-            let mut keystroke = gpui::Keystroke::parse(keys).unwrap();
-            if keystroke.key.chars().count() == 1 && keystroke.modifiers.number_of_modifiers() == 0
-            {
-                keystroke.key_char = Some(keystroke.key.clone());
-            }
-            let (mut text, mut cursor, mut anchor) = (text.to_string(), cursor, anchor);
-            edit_key(&mut text, &mut cursor, &mut anchor, &keystroke, || None);
-            (text, cursor, anchor)
-        };
-        assert_eq!(
-            edit("abc", 1, None, "shift-right"),
-            ("abc".into(), 2, Some(1))
-        );
-        assert_eq!(
-            edit("abc", 2, Some(1), "shift-left"),
-            ("abc".into(), 1, None)
-        );
-        assert_eq!(edit("abc", 3, Some(1), "left"), ("abc".into(), 1, None));
-        assert_eq!(edit("abc", 1, Some(3), "right"), ("abc".into(), 3, None));
-        assert_eq!(edit("abcd", 3, Some(1), "x"), ("axd".into(), 2, None));
-        assert_eq!(
-            edit("abcd", 1, Some(3), "backspace"),
-            ("ad".into(), 1, None)
-        );
-        assert_eq!(edit("abcd", 3, Some(1), "enter"), ("a\nd".into(), 2, None));
     }
 }

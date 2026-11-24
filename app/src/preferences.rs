@@ -7,8 +7,9 @@ use gpui::{
     TitlebarOptions, Window, WindowBounds, WindowHandle, WindowOptions, div, prelude::*, px, size,
 };
 
-use crate::repo_view::type_key;
+use crate::line_edit::LineEdit;
 use crate::sync;
+use crate::text_field::Field;
 use crate::theme::{Appearance, Theme};
 use crate::workspace::{CloseTab, CloseWindow};
 
@@ -129,7 +130,7 @@ impl Default for Settings {
             summary_prompt: None,
             message_prompt: None,
             tool_check: true,
-            folders_first: true,
+            folders_first: false,
             graph: GraphStyle::default(),
             fetch_minutes: 5,
             fetch_prune: true,
@@ -431,8 +432,6 @@ pub fn message_prompt() -> String {
 /// macOS's interface font, offered as "System".
 const SYSTEM_FONT: &str = ".SystemUIFont";
 
-const ON_OFF: &[(&str, bool)] = &[("On", true), ("Off", false)];
-
 fn on_off(on: bool) -> &'static str {
     if on { "on" } else { "off" }
 }
@@ -639,7 +638,7 @@ pub fn open(cx: &mut App) {
     if bring_forward(existing, cx) {
         return;
     }
-    let options = panel_options("Settings", 600., 480., cx);
+    let options = panel_options("Settings", 680., 540., cx);
     let opened = cx.open_window(options, |window, cx| {
         cx.new(|cx| {
             let focus = cx.focus_handle();
@@ -649,7 +648,8 @@ pub fn open(cx: &mut App) {
                 fonts: installed_fonts(window, cx),
                 section: Section::Appearance,
                 font_menu: None,
-                font_query: String::new(),
+                font_query: Default::default(),
+                prompts: Default::default(),
                 prompt_focus: [cx.focus_handle(), cx.focus_handle()],
                 dragging: None,
                 tracks: Default::default(),
@@ -669,7 +669,9 @@ pub struct Preferences {
     section: Section,
     /// The font dropdown, when open, and where.
     font_menu: Option<(FontSetting, gpui::Point<gpui::Pixels>)>,
-    font_query: String,
+    font_query: Field,
+    /// The prompts as edited, each a multi-line field.
+    prompts: [Field; 2],
     /// The prompt fields, each with its own focus.
     prompt_focus: [FocusHandle; 2],
     /// The slider being dragged, and where each slider's track was drawn.
@@ -764,22 +766,100 @@ fn installed_fonts(window: &Window, cx: &App) -> Vec<(String, bool)> {
         .collect()
 }
 
-/// A row's label width and the gap after it; notes under a row start there.
-const LABEL_WIDTH: f32 = 150.;
-const LABEL_GAP: f32 = 12.;
-
-/// A labeled row of the settings window.
+/// A row of a settings group: its label at the left, and its control, the
+/// child added next, at the right.
 fn row(label: &'static str, theme: &Theme) -> gpui::Div {
     div()
         .flex()
         .items_center()
-        .gap(px(LABEL_GAP))
-        .h(px(26.))
+        .gap(px(12.))
+        .min_h(px(36.))
+        .px(px(12.))
+        .py(px(4.))
         .child(
             div()
-                .w(px(LABEL_WIDTH))
-                .text_color(theme.secondary)
+                .flex_1()
+                .min_w_0()
+                .text_color(theme.foreground)
                 .child(label),
+        )
+}
+
+/// Settings that belong together, as macOS lays them out: a title over a
+/// rounded box, a line between its rows, and a note under it.
+fn group(
+    title: Option<&'static str>,
+    rows: impl IntoIterator<Item = gpui::Div>,
+    note: Option<&'static str>,
+    theme: &Theme,
+) -> gpui::Div {
+    let rows = rows
+        .into_iter()
+        .enumerate()
+        .map(|(k, row)| row.when(k > 0, |row| row.border_t_1().border_color(theme.separator)));
+    div()
+        .flex()
+        .flex_col()
+        .children(title.map(|title| {
+            div()
+                .px(px(12.))
+                .pb(px(6.))
+                .text_xs()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(theme.secondary)
+                .child(title)
+        }))
+        .child(card(theme).children(rows))
+        .children(note.map(|note| {
+            div()
+                .px(px(12.))
+                .pt(px(6.))
+                .text_xs()
+                .text_color(theme.secondary)
+                .child(note)
+        }))
+}
+
+/// The rounded box a group of settings sits in.
+fn card(theme: &Theme) -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .rounded(px(8.))
+        .border_1()
+        .border_color(theme.separator)
+        .bg(theme.background)
+}
+
+/// A switch for a setting that is on or off; a click flips it.
+fn switch(
+    id: &'static str,
+    on: bool,
+    pick: impl Fn(bool, &mut App) + 'static,
+    theme: &Theme,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .flex_none()
+        .flex()
+        .items_center()
+        .w(px(34.))
+        .h(px(20.))
+        .p(px(2.))
+        .rounded_full()
+        .bg(match on {
+            true => theme.accent,
+            false => theme.secondary.opacity(0.35),
+        })
+        .when(on, |track| track.justify_end())
+        .cursor_pointer()
+        .on_click(move |_, _, cx| pick(!on, cx))
+        .child(
+            div()
+                .size(px(16.))
+                .rounded_full()
+                .bg(gpui::white())
+                .shadow_sm(),
         )
 }
 
@@ -892,8 +972,7 @@ fn graph_preview(g: GraphStyle, theme: &Theme) -> impl IntoElement {
     div()
         .w_full()
         .h(px(h))
-        .mb(px(FONT_GROUP_GAP))
-        .rounded(px(6.))
+        .rounded(px(8.))
         .border_1()
         .border_color(theme.separator)
         .bg(theme.graph_background)
@@ -906,24 +985,6 @@ fn graph_preview(g: GraphStyle, theme: &Theme) -> impl IntoElement {
             .w(px(w))
             .h(px(h)),
         )
-}
-
-/// Between the Fonts section's rows, and more between its groups.
-const FONT_ROW_GAP: f32 = 10.;
-const FONT_GROUP_GAP: f32 = 8.;
-
-/// A row with a note under it, kept close to it whatever the section's gap.
-fn with_note(row: gpui::Div) -> gpui::Div {
-    div().flex().flex_col().gap(px(2.)).child(row)
-}
-
-/// A note under a row, lined up with its control.
-fn note(text: &'static str, theme: &Theme) -> gpui::Div {
-    div()
-        .pl(px(LABEL_WIDTH + LABEL_GAP))
-        .text_xs()
-        .text_color(theme.secondary)
-        .child(text)
 }
 
 /// A segmented control: a button per option, the `selected` one lit;
@@ -939,18 +1000,23 @@ fn segmented<T: Copy + PartialEq + 'static>(
         let pick = pick.clone();
         div()
             .id(SharedString::from(format!("{id}-{label}")))
-            .px(px(14.))
-            .py(px(3.))
-            .rounded(px(4.))
-            .when(selected == value, |button| button.bg(theme.selection))
+            .px(px(12.))
+            .py(px(2.))
+            .rounded(px(5.))
+            // The chosen one stands up from the track, as in macOS.
+            .when(selected == value, |button| {
+                button.bg(theme.background).shadow_sm()
+            })
             .cursor_pointer()
             .on_click(move |_, _, cx| pick(value, cx))
             .child(label)
     });
     div()
         .flex()
+        .flex_none()
         .p(px(2.))
-        .rounded(px(6.))
+        .rounded(px(7.))
+        .bg(theme.filler)
         .border_1()
         .border_color(theme.separator)
         .children(buttons)
@@ -1029,7 +1095,13 @@ impl Preferences {
             .items_center()
             .gap(px(10.))
             .child(track)
-            .child(div().whitespace_nowrap().child(knob.label(value)))
+            // Values in one column, so the tracks line up.
+            .child(
+                div()
+                    .w(px(72.))
+                    .whitespace_nowrap()
+                    .child(knob.label(value)),
+            )
     }
 
     /// Sets a slider's number from a pointer's place along its track, in
@@ -1059,9 +1131,9 @@ impl Preferences {
         match keystroke.key.as_str() {
             "escape" => {
                 self.font_menu = None;
-                self.font_query.clear();
+                self.font_query.edit.set_text("");
             }
-            _ if type_key(&mut self.font_query, keystroke, true, cx) => {}
+            _ if self.font_query.key(keystroke, cx) => {}
             _ => return,
         }
         cx.stop_propagation();
@@ -1077,34 +1149,22 @@ impl Preferences {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let (label, text, custom, focus) = match setting {
-            PromptSetting::Summary => (
-                "Summary prompt",
-                summary_prompt(),
-                read().summary_prompt.is_some(),
-                &self.prompt_focus[0],
-            ),
-            PromptSetting::Message => (
-                "Commit message prompt",
-                message_prompt(),
-                read().message_prompt.is_some(),
-                &self.prompt_focus[1],
-            ),
+        let (label, custom, k) = match setting {
+            PromptSetting::Summary => ("Summary prompt", read().summary_prompt.is_some(), 0),
+            PromptSetting::Message => ("Commit message prompt", read().message_prompt.is_some(), 1),
         };
+        let focus = &self.prompt_focus[k];
         let focused = focus.is_focused(window);
-        let caret = if focused { "▏" } else { "" };
-        div()
-            .flex()
-            .flex_col()
+        card(theme)
             .w_full()
             .min_w_0()
-            .gap(px(4.))
-            .mt(px(10.))
+            .gap(px(6.))
+            .p(px(12.))
             .child(
                 div()
                     .flex()
                     .gap(px(8.))
-                    .child(div().text_color(theme.secondary).child(label))
+                    .child(div().child(label))
                     .child(div().flex_1())
                     .when(custom, |row| {
                         row.child(
@@ -1124,13 +1184,18 @@ impl Preferences {
                 div()
                     .id(SharedString::from(format!("{label}-field")))
                     .track_focus(focus)
-                    .on_key_down(cx.listener(move |_, event: &KeyDownEvent, _, cx| {
-                        let mut text = setting.text();
-                        if !type_key(&mut text, &event.keystroke, false, cx) {
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                        let field = &mut this.prompts[k];
+                        let before = field.text().to_string();
+                        if !field.key(&event.keystroke, cx) {
                             return;
                         }
                         cx.stop_propagation();
-                        change(|settings| setting.set(settings, Some(text)), cx);
+                        let text = field.text().to_string();
+                        if text != before {
+                            change(|settings| setting.set(settings, Some(text)), cx);
+                        }
+                        cx.notify();
                     }))
                     .w_full()
                     .min_h(px(64.))
@@ -1146,7 +1211,20 @@ impl Preferences {
                         theme.separator
                     })
                     .text_xs()
-                    .child(format!("{text}{caret}")),
+                    .child(self.prompts[k].render(
+                        SharedString::from(format!("{label}-text")),
+                        "",
+                        focused,
+                        true,
+                        Vec::new(),
+                        focus,
+                        theme,
+                        match k {
+                            0 => |this: &mut Self| Some(&mut this.prompts[0]),
+                            _ => |this: &mut Self| Some(&mut this.prompts[1]),
+                        },
+                        cx,
+                    )),
             )
     }
 
@@ -1182,7 +1260,7 @@ impl Preferences {
                 gpui::MouseButton::Left,
                 cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
                     this.font_menu = Some((setting, event.position));
-                    this.font_query.clear();
+                    this.font_query.edit.set_text("");
                     this.focus.focus(window);
                     cx.notify();
                 }),
@@ -1195,7 +1273,19 @@ impl Preferences {
     /// monospace ones first for code.
     fn font_menu(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         let (setting, position) = self.font_menu?;
-        let query = self.font_query.to_lowercase();
+        let query = self.font_query.text().to_lowercase();
+        // The window keeps the keys while the menu is open, for the filter.
+        let filter = self.font_query.render(
+            "font-filter",
+            "Type to filter fonts",
+            true,
+            true,
+            Vec::new(),
+            &self.focus,
+            theme,
+            |this: &mut Self| Some(&mut this.font_query),
+            cx,
+        );
         let mut fonts: Vec<(String, bool)> = self
             .fonts
             .iter()
@@ -1269,12 +1359,7 @@ impl Preferences {
                     .px(px(8.))
                     .border_b_1()
                     .border_color(theme.separator)
-                    .map(|filter| match self.font_query.is_empty() {
-                        true => filter
-                            .text_color(theme.secondary)
-                            .child("Type to filter fonts"),
-                        false => filter.child(self.font_query.clone()),
-                    }),
+                    .child(filter),
             )
             .child(
                 div()
@@ -1302,184 +1387,208 @@ impl Preferences {
 impl Render for Preferences {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         window.set_rem_size(px(ui_size()));
+        // A prompt not being edited shows the one in the settings, which
+        // may have been reset.
+        for (k, setting) in [PromptSetting::Summary, PromptSetting::Message]
+            .into_iter()
+            .enumerate()
+        {
+            let text = setting.text();
+            if !self.prompt_focus[k].is_focused(window) && self.prompts[k].text() != text {
+                self.prompts[k].edit = LineEdit::multiline(text);
+            }
+        }
         let theme = Theme::for_appearance(window.appearance());
         let settings = read().clone();
         let current = settings.appearance;
         let graph = settings.graph;
 
+        let switch_for = |id: &'static str, on: bool, set: fn(&mut Settings, bool)| {
+            switch(
+                id,
+                on,
+                move |on, cx| change(|settings| set(settings, on), cx),
+                &theme,
+            )
+        };
         let content = match self.section {
-            Section::Appearance => {
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.))
-                    .child(row("Theme", &theme).child(segmented(
-                        "theme",
-                        &[
-                            ("System", Appearance::System),
-                            ("Light", Appearance::Light),
-                            ("Dark", Appearance::Dark),
-                        ],
-                        current,
-                        |appearance: Appearance, cx| {
-                            change(|settings| settings.appearance = appearance, cx)
-                        },
-                        &theme,
-                    )))
-            }
-            // Rows apart, each note by its row, and a little more between the
-            // interface, the code font and the line heights.
-            Section::Fonts => div()
-                .flex()
-                .flex_col()
-                .gap(px(FONT_ROW_GAP))
-                .child(row("Interface font", &theme).child(self.font_button(
-                    FontSetting::Interface,
-                    settings.ui_font.clone(),
+            Section::Appearance => div().child(group(
+                None,
+                [row("Theme", &theme).child(segmented(
+                    "theme",
+                    &[
+                        ("System", Appearance::System),
+                        ("Light", Appearance::Light),
+                        ("Dark", Appearance::Dark),
+                    ],
+                    current,
+                    |appearance: Appearance, cx| {
+                        change(|settings| settings.appearance = appearance, cx)
+                    },
                     &theme,
-                    cx,
-                )))
-                .child(row("Interface size", &theme).child(self.slider(Knob::UiSize, &theme, cx)))
-                .child(
-                    row("Code font", &theme)
-                        .mt(px(FONT_GROUP_GAP))
-                        .child(self.font_button(
+                ))],
+                None,
+                &theme,
+            )),
+            Section::Fonts => div()
+                .child(group(
+                    Some("Interface"),
+                    [
+                        row("Font", &theme).child(self.font_button(
+                            FontSetting::Interface,
+                            settings.ui_font.clone(),
+                            &theme,
+                            cx,
+                        )),
+                        row("Size", &theme).child(self.slider(Knob::UiSize, &theme, cx)),
+                    ],
+                    None,
+                    &theme,
+                ))
+                .child(group(
+                    Some("Code"),
+                    [
+                        row("Font", &theme).child(self.font_button(
                             FontSetting::Code,
                             settings.code_font.clone(),
                             &theme,
                             cx,
                         )),
-                )
-                .child(row("Code size", &theme).child(self.slider(Knob::CodeSize, &theme, cx)))
-                .child(
-                    with_note(row("Code weight", &theme).child(self.slider(
-                        Knob::CodeWeight,
-                        &theme,
-                        cx,
-                    )))
-                    .child(note(
+                        row("Size", &theme).child(self.slider(Knob::CodeSize, &theme, cx)),
+                        row("Weight", &theme).child(self.slider(Knob::CodeWeight, &theme, cx)),
+                    ],
+                    Some(
                         "A font without this weight shows its nearest one; many monospace \
                          fonts have only Regular and Bold.",
-                        &theme,
-                    )),
-                )
-                .child(
-                    row("Code line height", &theme)
-                        .mt(px(FONT_GROUP_GAP))
-                        .child(self.slider(Knob::CodeLine, &theme, cx)),
-                )
-                .child(
-                    with_note(row("Terminal line height", &theme).child(self.slider(
-                        Knob::TerminalLine,
-                        &theme,
-                        cx,
-                    )))
-                    .child(note(
+                    ),
+                    &theme,
+                ))
+                .child(group(
+                    Some("Line height"),
+                    [
+                        row("Code", &theme).child(self.slider(Knob::CodeLine, &theme, cx)),
+                        row("Terminal", &theme).child(self.slider(Knob::TerminalLine, &theme, cx)),
+                    ],
+                    Some(
                         "Times the code size. Diffs read well at 1.5 to 1.7; terminals at \
                          1.15 to 1.25, where box drawing joins up.",
-                        &theme,
-                    )),
-                ),
-            Section::Review => {
-                let on = settings.summaries == Some(true);
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.))
-                    .child(row("File tree", &theme).child(segmented(
+                    ),
+                    &theme,
+                )),
+            Section::Review => div()
+                .child(group(
+                    Some("Files"),
+                    [row("Folders in file trees", &theme).child(segmented(
                         "folders-first",
-                        &[("Folders first", true), ("Mixed", false)],
+                        &[("With files", false), ("First", true)],
                         settings.folders_first,
                         |first, cx| change(|settings| settings.folders_first = first, cx),
                         &theme,
-                    )))
-                    .child(row("Commit summaries", &theme).mt(px(8.)).child(segmented(
-                        "summaries",
-                        ON_OFF,
-                        on,
-                        |on, cx| change(|settings| settings.summaries = Some(on), cx),
-                        &theme,
-                    )))
-                    .child(note(
-                        "Several selected commits are summarized by Apple's on-device \
-                         model, through the fm command. Nothing leaves this Mac.",
-                        &theme,
-                    ))
-                    .child(self.prompt_field(PromptSetting::Summary, &theme, window, cx))
-                    .child(self.prompt_field(PromptSetting::Message, &theme, window, cx))
-            }
-            Section::Remote => {
-                let fetch = row("Fetch in background", &theme).child(self.slider(
-                    Knob::FetchMinutes,
+                    ))],
+                    None,
                     &theme,
-                    cx,
-                ));
-                let switch = |id: &'static str, on: bool, set: fn(&mut Settings, bool)| {
-                    let pick = move |on, cx: &mut App| change(|settings| set(settings, on), cx);
-                    segmented(id, ON_OFF, on, pick, &theme)
-                };
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.))
-                    .child(fetch)
-                    .child(row("Prune on fetch", &theme).child(switch(
+                ))
+                .child(group(
+                    Some("Apple Intelligence"),
+                    [
+                        row("Commit summaries and messages", &theme).child(switch_for(
+                            "summaries",
+                            settings.summaries == Some(true),
+                            |s, on| s.summaries = Some(on),
+                        )),
+                    ],
+                    Some(
+                        "Several selected commits are summarized, and commit messages \
+                         written, by Apple's on-device model, through the fm command. \
+                         Nothing leaves this Mac.",
+                    ),
+                    &theme,
+                ))
+                .child(self.prompt_field(PromptSetting::Summary, &theme, window, cx))
+                .child(self.prompt_field(PromptSetting::Message, &theme, window, cx)),
+            Section::Remote => div().child(group(
+                None,
+                [
+                    row("Fetch in background", &theme).child(self.slider(
+                        Knob::FetchMinutes,
+                        &theme,
+                        cx,
+                    )),
+                    row("Prune on fetch", &theme).child(switch_for(
                         "prune",
                         settings.fetch_prune,
                         |s, on| s.fetch_prune = on,
-                    )))
-                    .child(row("Ahead/behind badges", &theme).child(switch(
+                    )),
+                    row("Ahead/behind badges", &theme).child(switch_for(
                         "badges",
                         settings.sync_badges,
                         |s, on| s.sync_badges = on,
-                    )))
-                    .child(note(
-                        "Fetches every remote. Pruning drops remote branches deleted there, \
-                         so local ones tracking them read as remote gone.",
-                        &theme,
-                    ))
-            }
+                    )),
+                ],
+                Some(
+                    "Fetches every remote. Pruning drops remote branches deleted there, so \
+                     local ones tracking them read as remote gone.",
+                ),
+                &theme,
+            )),
             // A sample graph, drawn as the settings stand, over them in groups:
             // where things go, how commits look, how lines look.
             Section::Graph => div()
-                .flex()
-                .flex_col()
-                .gap(px(FONT_ROW_GAP))
                 .child(graph_preview(graph, &theme))
-                .child(row("Row height", &theme).child(self.slider(Knob::RowHeight, &theme, cx)))
-                .child(row("Node spacing", &theme).child(self.slider(Knob::Column, &theme, cx)))
-                .child(row("Curve length", &theme).child(self.slider(Knob::Curve, &theme, cx)))
-                .child(
-                    row("Dot size", &theme)
-                        .mt(px(FONT_GROUP_GAP))
-                        .child(self.slider(Knob::Dot, &theme, cx)),
-                )
-                .child(row("Bead spacing", &theme).child(self.slider(
-                    Knob::BeadSpacing,
+                .child(group(
+                    Some("Layout"),
+                    [
+                        row("Row height", &theme).child(self.slider(Knob::RowHeight, &theme, cx)),
+                        row("Node spacing", &theme).child(self.slider(Knob::Column, &theme, cx)),
+                        row("Curve length", &theme).child(self.slider(Knob::Curve, &theme, cx)),
+                    ],
+                    None,
                     &theme,
-                    cx,
-                )))
-                .child(row("Beads per node", &theme).child(self.slider(Knob::Beads, &theme, cx)))
-                .child(
-                    row("Line width", &theme)
-                        .mt(px(FONT_GROUP_GAP))
-                        .child(self.slider(Knob::Line, &theme, cx)),
-                )
-                .child(row("Hover line width", &theme).child(self.slider(
-                    Knob::HoverLine,
+                ))
+                .child(group(
+                    Some("Commits"),
+                    [
+                        row("Dot size", &theme).child(self.slider(Knob::Dot, &theme, cx)),
+                        row("Bead spacing", &theme).child(self.slider(
+                            Knob::BeadSpacing,
+                            &theme,
+                            cx,
+                        )),
+                        row("Beads per node", &theme).child(self.slider(Knob::Beads, &theme, cx)),
+                    ],
+                    None,
                     &theme,
-                    cx,
-                )))
+                ))
+                .child(group(
+                    Some("Lines"),
+                    [
+                        row("Width", &theme).child(self.slider(Knob::Line, &theme, cx)),
+                        row("Width on hover", &theme).child(self.slider(
+                            Knob::HoverLine,
+                            &theme,
+                            cx,
+                        )),
+                    ],
+                    None,
+                    &theme,
+                ))
+                .child(group(
+                    Some("Branches"),
+                    [row("Idle after", &theme).child(self.slider(Knob::IdleDays, &theme, cx))],
+                    None,
+                    &theme,
+                ))
                 .child(
-                    row("Branch idle after", &theme)
-                        .mt(px(FONT_GROUP_GAP))
-                        .child(self.slider(Knob::IdleDays, &theme, cx)),
-                )
-                .child(
-                    div().mt(px(8.)).child(
+                    div().flex().justify_end().child(
                         div()
                             .id("graph-defaults")
-                            .text_color(theme.accent)
+                            .px(px(10.))
+                            .py(px(3.))
+                            .rounded(px(5.))
+                            .border_1()
+                            .border_color(theme.separator)
+                            .bg(theme.background)
+                            .hover(|button| button.bg(theme.selection))
                             .cursor_pointer()
                             .on_click(cx.listener(|_, _, _, cx| {
                                 // Everything in this section, idle days too.
@@ -1491,17 +1600,27 @@ impl Render for Preferences {
                                     cx,
                                 )
                             }))
-                            .child("Reset graph to defaults"),
+                            .child("Reset to Defaults"),
                     ),
                 ),
-        };
+        }
+        // Groups apart, as in System Settings.
+        .flex()
+        .flex_col()
+        .gap(px(20.));
         let sections = Section::ALL.map(|section| {
             div()
                 .id(section.title())
                 .px(px(10.))
-                .py(px(4.))
-                .rounded(px(5.))
-                .when(section == self.section, |item| item.bg(theme.selection))
+                .py(px(5.))
+                .rounded(px(6.))
+                .when(section == self.section, |item| {
+                    item.bg(theme.selection)
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                })
+                .when(section != self.section, |item| {
+                    item.hover(|item| item.bg(theme.selection.opacity(0.5)))
+                })
                 .cursor_pointer()
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.section = section;
@@ -1541,20 +1660,30 @@ impl Render for Preferences {
             .on_action(|_: &CloseWindow, window, _| window.remove_window())
             .flex()
             .size_full()
-            .bg(theme.background)
+            .bg(theme.graph_background)
             .text_color(theme.foreground)
             .font_family(ui_font())
             .text_sm()
+            // The sections down the side, and how changes apply under them.
             .child(
                 div()
                     .flex()
                     .flex_col()
                     .gap(px(2.))
-                    .w(px(150.))
+                    .w(px(170.))
                     .p(px(10.))
+                    .bg(theme.filler)
                     .border_r_1()
                     .border_color(theme.separator)
-                    .children(sections),
+                    .children(sections)
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .px(px(10.))
+                            .text_xs()
+                            .text_color(theme.secondary)
+                            .child("Changes apply to every window at once. Esc or ⌘W closes."),
+                    ),
             )
             // The section's settings take the rest of the width, wrapping in
             // it, and scroll when they run longer than the window.
@@ -1566,23 +1695,16 @@ impl Render for Preferences {
                     .flex_1()
                     .min_w_0()
                     .overflow_y_scroll()
-                    .gap(px(4.))
-                    .p(px(20.))
+                    .gap(px(16.))
+                    .px(px(24.))
+                    .py(px(20.))
                     .child(
                         div()
-                            .mb(px(8.))
-                            .text_base()
+                            .text_lg()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .child(self.section.title()),
                     )
-                    .child(content)
-                    .child(div().flex_1())
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.secondary)
-                            .child("Changes apply to every window at once. Esc or ⌘W closes."),
-                    ),
+                    .child(content),
             )
             .children(self.font_menu(&theme, cx))
     }

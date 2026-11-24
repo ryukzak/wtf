@@ -163,12 +163,17 @@ impl RepoView {
             "up" | "down" => self.cursor_line(keystroke.key == "down", modifiers.shift),
             "p" | "n" if ctrl => self.cursor_line(keystroke.key == "n", modifiers.shift),
             _ => {
-                let (mut text, mut cursor) = (self.draft.message.clone(), self.cursor());
-                let mut anchor = self.draft.message_anchor;
+                let mut edit = crate::line_edit::LineEdit {
+                    text: self.draft.message.clone(),
+                    caret: self.cursor(),
+                    anchor: self.draft.message_anchor,
+                    multiline: true,
+                };
                 let paste = || cx.read_from_clipboard().and_then(|item| item.text());
-                if !edit_key(&mut text, &mut cursor, &mut anchor, keystroke, paste) {
+                if !edit.edit(keystroke, paste) {
                     return;
                 }
+                let (text, cursor, anchor) = (edit.text, edit.caret, edit.anchor);
                 if text == self.draft.message {
                     self.draft.message_cursor = Some(cursor);
                     self.draft.message_anchor = anchor;
@@ -310,11 +315,11 @@ impl RepoView {
     fn message_text(&self, focused: bool, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         if self.draft.message.is_empty() {
             self.draft.message_layout.replace(None);
-            let placeholder = match self.draft.writing_message {
+            let placeholder_text = match self.draft.writing_message {
                 true => "",
                 false => "Commit message",
             };
-            return field_text("", placeholder, focused, theme);
+            return placeholder(placeholder_text, focused, theme);
         }
         let range = self.message_selection();
         let highlights = (focused && !range.is_empty()).then(|| {
@@ -681,190 +686,23 @@ impl RepoView {
 /// wide enough for "Amend with 12 files ⌘↩".
 const COMMIT_COLUMN: f32 = 12.5;
 
-/// A text field's content: the text, or a placeholder, with a caret at the
-/// end while it has focus. Over a placeholder the caret is laid on top, so
-/// the placeholder starts where typed text will.
-pub(super) fn field_text(
-    text: &str,
-    placeholder: &str,
-    focused: bool,
-    theme: &Theme,
-) -> AnyElement {
-    if text.is_empty() {
-        return div()
-            .relative()
-            .text_color(theme.secondary)
-            .child(placeholder.to_string())
-            .when(focused, |field| {
-                field.child(
-                    div()
-                        .absolute()
-                        .left(px(-1.))
-                        .top_0()
-                        .bottom_0()
-                        .w(px(1.5))
-                        .bg(theme.accent),
-                )
-            })
-            .into_any_element();
-    }
-    let caret = if focused { "▏" } else { "" };
-    let shown = format!("{text}{caret}");
-    let highlights = focused.then(|| {
-        (
-            text.len()..shown.len(),
-            HighlightStyle {
-                color: Some(theme.accent),
-                ..Default::default()
-            },
-        )
-    });
-    StyledText::new(shown)
-        .with_highlights(highlights)
-        .into_any_element()
-}
-
-/// Edits `text` at its `cursor`, with a selection from `anchor`, by a key:
-/// typing, Return, ⌘V, Backspace and Delete, by a word with ⌥ and to the
-/// line's start with ⌘, over the selection when there is one; ← and → move
-/// by a character, a word with ⌥ or to the line's end with ⌘, as Home and
-/// End do, selecting with ⇧; and the ⌃ keys of macOS text: ⌃A ⌃E ⌃B ⌃F
-/// move, ⌃H ⌃D ⌃K delete, ⌃T transposes and ⌃O opens a line. False for keys
-/// it leaves alone.
-pub(super) fn edit_key(
-    text: &mut String,
-    cursor: &mut usize,
-    anchor: &mut Option<usize>,
-    keystroke: &gpui::Keystroke,
-    paste: impl FnOnce() -> Option<String>,
-) -> bool {
-    let modifiers = keystroke.modifiers;
-    let ctrl = modifiers.control && !modifiers.platform && !modifiers.alt;
-    let at = *cursor;
-    let selected = anchor
-        .filter(|&anchor| anchor <= text.len() && text.is_char_boundary(anchor))
-        .map(|anchor| anchor.min(at)..anchor.max(at))
-        .filter(|range| !range.is_empty());
-    let before = |at: usize| {
-        text[..at]
-            .chars()
-            .next_back()
-            .map_or(0, |c| at - c.len_utf8())
-    };
-    let after = |at: usize| text[at..].chars().next().map_or(at, |c| at + c.len_utf8());
-    let line_start = text[..at].rfind('\n').map_or(0, |i| i + 1);
-    let line_end = text[at..].find('\n').map_or(text.len(), |i| at + i);
-    let word_start = {
-        let trimmed = text[..at].trim_end_matches(char::is_whitespace);
-        trimmed.rfind(char::is_whitespace).map_or(0, |i| {
-            i + trimmed[i..].chars().next().map_or(1, char::len_utf8)
+/// An empty field's placeholder, with the caret laid over its start while
+/// the field has focus, so the placeholder starts where typed text will.
+fn placeholder(text: &str, focused: bool, theme: &Theme) -> AnyElement {
+    div()
+        .relative()
+        .text_color(theme.secondary)
+        .child(text.to_string())
+        .when(focused, |field| {
+            field.child(
+                div()
+                    .absolute()
+                    .left(px(-0.75))
+                    .top_0()
+                    .bottom_0()
+                    .w(px(1.5))
+                    .bg(theme.accent),
+            )
         })
-    };
-    let word_end = {
-        let rest = &text[at..];
-        let skip = rest.len() - rest.trim_start_matches(char::is_whitespace).len();
-        let word = rest[skip..]
-            .find(char::is_whitespace)
-            .unwrap_or(rest.len() - skip);
-        at + skip + word
-    };
-    let key = keystroke.key.as_str();
-    let plain = !modifiers.platform && !modifiers.alt && !modifiers.control;
-    // Moves, selecting from where the cursor was with ⇧.
-    let to = match key {
-        // An arrow collapses a selection to its side.
-        "left" | "right" if plain && !modifiers.shift && selected.is_some() => {
-            let range = selected.clone().unwrap_or(at..at);
-            Some(if key == "left" {
-                range.start
-            } else {
-                range.end
-            })
-        }
-        "left" if modifiers.platform => Some(line_start),
-        "left" if modifiers.alt => Some(word_start),
-        "left" => Some(before(at)),
-        "right" if modifiers.platform => Some(line_end),
-        "right" if modifiers.alt => Some(word_end),
-        "right" => Some(after(at)),
-        "home" => Some(line_start),
-        "end" => Some(line_end),
-        "a" if ctrl => Some(line_start),
-        "e" if ctrl => Some(line_end),
-        "b" if ctrl => Some(before(at)),
-        "f" if ctrl => Some(after(at)),
-        _ => None,
-    };
-    if let Some(to) = to {
-        match modifiers.shift {
-            true => {
-                anchor.get_or_insert(at);
-            }
-            false => *anchor = None,
-        }
-        *cursor = to;
-        if *anchor == Some(to) {
-            *anchor = None;
-        }
-        return true;
-    }
-    // Edits: what goes, and what comes in its place.
-    let here = selected.clone().unwrap_or(at..at);
-    let (range, put) = match key {
-        "backspace" | "delete" if selected.is_some() => (here, String::new()),
-        "h" | "d" if ctrl && selected.is_some() => (here, String::new()),
-        "backspace" => {
-            let from = match (modifiers.platform, modifiers.alt) {
-                (true, _) => line_start,
-                (_, true) => word_start,
-                _ => before(at),
-            };
-            (from..at, String::new())
-        }
-        "h" if ctrl => (before(at)..at, String::new()),
-        "delete" => (
-            at..if modifiers.alt { word_end } else { after(at) },
-            String::new(),
-        ),
-        "d" if ctrl => (at..after(at), String::new()),
-        // To the line's end, or the line break when already there.
-        "k" if ctrl => (
-            at..if at == line_end { after(at) } else { line_end },
-            String::new(),
-        ),
-        // The characters around the cursor change places, the last two at a
-        // line's end, and the cursor goes past them.
-        "t" if ctrl => {
-            let at = if at == line_end {
-                before(at).max(line_start)
-            } else {
-                at
-            };
-            let (from, to) = (before(at), after(at));
-            if at == line_start || to == at {
-                return true;
-            }
-            (from..to, format!("{}{}", &text[at..to], &text[from..at]))
-        }
-        // A line break after the cursor, which stays.
-        "o" if ctrl => {
-            text.insert(at, '\n');
-            *anchor = None;
-            return true;
-        }
-        "enter" if !modifiers.platform => (here, "\n".to_string()),
-        "v" if modifiers.platform => match paste() {
-            Some(pasted) => (here, pasted),
-            None => return false,
-        },
-        _ if !modifiers.platform && !modifiers.control => match &keystroke.key_char {
-            Some(typed) if !typed.chars().any(char::is_control) => (here, typed.clone()),
-            _ => return false,
-        },
-        _ => return false,
-    };
-    text.replace_range(range.clone(), &put);
-    *cursor = range.start + put.len();
-    *anchor = None;
-    true
+        .into_any_element()
 }

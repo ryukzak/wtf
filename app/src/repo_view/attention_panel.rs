@@ -13,7 +13,7 @@ impl RepoView {
     ) -> AnyElement {
         let attention = &self.attention;
         let now = now_seconds();
-        let search = self.attention_search.to_lowercase();
+        let search = self.attention_search.text().to_lowercase();
         let matches = |name: &str| search.is_empty() || name.to_lowercase().contains(&search);
 
         let time_window = match attention.window_days {
@@ -371,12 +371,17 @@ impl RepoView {
                     })
                     .whitespace_nowrap()
                     .overflow_hidden()
-                    .map(|field| match self.attention_search.is_empty() {
-                        true => field
-                            .text_color(theme.secondary)
-                            .child("Filter worktrees, branches, tags"),
-                        false => field.child(self.attention_search.clone()),
-                    }),
+                    .child(self.attention_search.render(
+                        "attention-search-text",
+                        "Filter worktrees, branches, tags",
+                        focused,
+                        true,
+                        Vec::new(),
+                        &self.attention_search_focus,
+                        theme,
+                        |this: &mut Self| Some(&mut this.attention_search),
+                        cx,
+                    )),
             )
             .child(
                 div()
@@ -744,9 +749,9 @@ impl RepoView {
     ) {
         let keystroke = &event.keystroke;
         match keystroke.key.as_str() {
-            "escape" if self.attention_search.is_empty() => self.focus.focus(window),
-            "escape" => self.attention_search.clear(),
-            _ if type_key(&mut self.attention_search, keystroke, true, cx) => {}
+            "escape" if self.attention_search.text().is_empty() => self.focus.focus(window),
+            "escape" => self.attention_search.edit.set_text(""),
+            _ if self.attention_search.key(keystroke, cx) => {}
             _ => return,
         }
         cx.stop_propagation();

@@ -15,6 +15,7 @@ mod session;
 mod sync;
 mod syntax;
 mod terminal_view;
+mod text_field;
 mod theme;
 mod tools;
 mod workspace;
