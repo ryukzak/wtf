@@ -199,7 +199,8 @@ impl RepoView {
             return;
         };
         let message = full_message(commit);
-        self.rewording = Some((commit.id.clone(), path, message));
+        let field = crate::text_field::Field::new(crate::line_edit::LineEdit::multiline(message));
+        self.rewording = Some((commit.id.clone(), path, field));
         self.reword_focus.focus(window);
         cx.notify();
     }
@@ -208,7 +209,7 @@ impl RepoView {
         let Some((commit, path, message)) = self.rewording.take() else {
             return;
         };
-        let message = message.trim().to_string();
+        let message = message.text().trim().to_string();
         if message.is_empty() {
             return;
         }
@@ -235,7 +236,7 @@ impl RepoView {
                 self.rewording = None;
                 self.focus.focus(window);
             }
-            _ if type_key(message, keystroke, false, cx) => {}
+            _ if message.key(keystroke, cx) => {}
             _ => return,
         }
         cx.stop_propagation();
@@ -394,6 +395,16 @@ impl RepoView {
                     .child(mode("Structural", DiffMode::Structural))
                     .child(mode("Text", DiffMode::Text)),
             )
+            // Long lines wrap, or run on and scroll sideways.
+            .child(
+                group()
+                    .child(option("Wrap", self.wrap_lines).on_click(
+                        cx.listener(|this, _, window, cx| this.set_wrap_lines(true, window, cx)),
+                    ))
+                    .child(option("No Wrap", !self.wrap_lines).on_click(
+                        cx.listener(|this, _, window, cx| this.set_wrap_lines(false, window, cx)),
+                    )),
+            )
     }
 
     /// The commit header's first line, kept at the top once the rest of it
@@ -457,7 +468,7 @@ impl RepoView {
                     .rewording
                     .as_ref()
                     .filter(|(id, _, _)| *id == commit.id)
-                    .map(|(_, _, message)| message.as_str());
+                    .map(|(_, _, message)| message);
                 let link = |id: &'static str, label: &'static str| {
                     div()
                         .id(id)
@@ -465,43 +476,52 @@ impl RepoView {
                         .cursor_pointer()
                         .child(label)
                 };
-                // Editing keeps the message's layout: the first line in bold,
-                // the rest below it, so the header does not change height.
+                // Editing keeps the message's look: the first line in bold,
+                // the rest muted.
                 let message = match editing {
                     None => self.selectable_message(commit, theme, cx),
-                    Some(text) => {
+                    Some(field) => {
                         let focused = self.reword_focus.is_focused(window);
-                        let (first, rest) = match text.split_once('\n') {
-                            Some((first, rest)) => {
-                                (first, Some(rest.strip_prefix('\n').unwrap_or(rest)))
-                            }
-                            None => (text, None),
-                        };
-                        let first_line = match rest {
-                            None => field_text(first, "Commit message", focused, theme),
-                            Some(_) => field_text(first, "", false, theme),
-                        };
+                        let text = field.text();
+                        let first = text.find('\n').unwrap_or(text.len());
+                        let styles = vec![
+                            (
+                                0..first,
+                                gpui::HighlightStyle {
+                                    font_weight: Some(gpui::FontWeight::SEMIBOLD),
+                                    ..Default::default()
+                                },
+                            ),
+                            (
+                                first..text.len(),
+                                gpui::HighlightStyle {
+                                    color: Some(theme.secondary),
+                                    ..Default::default()
+                                },
+                            ),
+                        ];
                         div()
                             .id("reword-message")
                             .track_focus(&self.reword_focus)
                             .on_key_down(cx.listener(Self::reword_key))
-                            .flex()
-                            .flex_col()
-                            .gap(px(4.))
-                            .mx(px(-4.))
+                            .mx(px(-5.))
                             .px(px(4.))
                             .rounded(px(4.))
-                            .bg(theme.selection)
-                            .child(
-                                div()
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .child(first_line),
-                            )
-                            .children(rest.map(|rest| {
-                                div()
-                                    .text_color(theme.secondary)
-                                    .child(field_text(rest, "", focused, theme))
-                            }))
+                            .border_1()
+                            .border_color(theme.accent)
+                            .child(field.render(
+                                "reword-text",
+                                "Commit message",
+                                focused,
+                                true,
+                                styles,
+                                &self.reword_focus,
+                                theme,
+                                |this: &mut Self| {
+                                    this.rewording.as_mut().map(|(_, _, field)| field)
+                                },
+                                cx,
+                            ))
                             .into_any_element()
                     }
                 };

@@ -110,6 +110,19 @@ fn pick_user_dir(path: &str, home: &Path) -> Option<PathBuf> {
         .find(|dir| own.contains(dir))
 }
 
+/// Takes the login shell's PATH when the app was not started from a
+/// terminal: started from the Finder, the Dock or `open`, it has only the
+/// system's folders, and git hooks would miss the user's tools.
+pub fn adopt_login_path() {
+    if std::env::var_os("TERM").is_some() {
+        return;
+    }
+    if let Some(path) = login_path() {
+        // SAFETY: called first thing in main, before any other thread starts.
+        unsafe { std::env::set_var("PATH", path) };
+    }
+}
+
 /// The PATH of an interactive login shell, as a terminal gets it: the
 /// user's shell reads its startup files, so folders they add are there.
 fn login_path() -> Option<String> {

@@ -1238,13 +1238,11 @@ pub fn render(
                     .items_center()
                     .justify_center()
                     .cursor_pointer()
-                    .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                        this.click_node(i, event.modifiers().platform, cx)
-                    }))
                     .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                         this.hover_node(i, *hovered, cx)
                     }))
-                    // A commit node's menu acts on its newest commit.
+                    // A commit node's menu, and a double click, act on its
+                    // newest commit.
                     .when_some(node.commits.last().filter(|_| !worktree), |dot, commit| {
                         let target = Target::Commit {
                             commit: commit.id.clone(),
@@ -1254,6 +1252,17 @@ pub fn render(
                             },
                         };
                         dot.on_mouse_down(MouseButton::Right, open_menu(target.clone(), cx))
+                            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                                match event.click_count() {
+                                    2 => this.check_out_here(&target, window, cx),
+                                    _ => this.click_node(i, event.modifiers().platform, cx),
+                                }
+                            }))
+                    })
+                    .when(worktree, |square| {
+                        square.on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                            this.click_node(i, event.modifiers().platform, cx)
+                        }))
                     })
                     .when(worktree, |square| {
                         let target = worktree_target(graph, i);
@@ -1656,13 +1665,16 @@ fn beads(
                 .h(px(HIT))
                 .top(px((style().dot - HIT) / 2.))
                 .cursor_pointer()
-                .on_mouse_down(MouseButton::Right, open_menu(menu, cx))
-                .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                .on_mouse_down(MouseButton::Right, open_menu(menu.clone(), cx))
+                .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                     if event.modifiers().platform {
                         return;
                     }
                     cx.stop_propagation();
-                    this.click_bead(node, commit.clone(), cx)
+                    match event.click_count() {
+                        2 => this.check_out_here(&menu, window, cx),
+                        _ => this.click_bead(node, commit.clone(), cx),
+                    }
                 })),
         );
         row = row.child(
@@ -1725,6 +1737,28 @@ fn bead_count(commits: usize, length: f32) -> usize {
     commits.min(fits).max(2)
 }
 
+/// The node nearest a point at `x`, `y` the way an arrow `key` points, of
+/// nodes as laid out: what lies off to the side counts three times what
+/// lies ahead, so a row or lane is followed before others are reached.
+pub fn nearest(nodes: &[(f32, f32, f32)], x: f32, y: f32, key: &str) -> Option<usize> {
+    nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &(start, end, row))| {
+            let (dx, dy) = ((start + end) / 2. - x, row - y);
+            let (ahead, aside) = match key {
+                "left" => (-dx, dy),
+                "right" => (dx, dy),
+                "up" => (-dy, dx),
+                "down" => (dy, dx),
+                _ => return None,
+            };
+            (ahead > 1.).then_some((i, ahead + 3. * aside.abs()))
+        })
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(i, _)| i)
+}
+
 /// A right-click listener opening `target`'s menu at the mouse.
 fn open_menu(
     target: Target,
@@ -1751,7 +1785,8 @@ fn with_menu(
 
 /// A label with its menu on a right-click only. A left click, when the
 /// label has nothing else to do on one (`select`), selects node `hover`, as
-/// a click on the node does. Hovering it hovers that node too.
+/// a click on the node does, and a double click checks it out in the
+/// current worktree. Hovering it hovers that node too.
 fn menu_label(
     tag: gpui::Div,
     name: &str,
@@ -1767,14 +1802,17 @@ fn menu_label(
         .on_hover(
             cx.listener(move |this, hovered: &bool, _, cx| this.hover_node(hover, *hovered, cx)),
         )
-        .on_mouse_down(MouseButton::Right, open_menu(target, cx))
+        .on_mouse_down(MouseButton::Right, open_menu(target.clone(), cx))
         .when(select, |label| {
-            label
-                .cursor_pointer()
-                .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+            label.cursor_pointer().on_click(cx.listener(
+                move |this, event: &ClickEvent, window, cx| {
                     cx.stop_propagation();
-                    this.click_node(hover, event.modifiers().platform, cx)
-                }))
+                    match event.click_count() {
+                        2 => this.check_out_here(&target, window, cx),
+                        _ => this.click_node(hover, event.modifiers().platform, cx),
+                    }
+                },
+            ))
         })
         .child(tag)
         .into_any_element()
@@ -2015,6 +2053,26 @@ mod tests {
             on_main: graph.main_history(),
             ..graph
         }
+    }
+
+    #[test]
+    fn arrows_go_to_the_nearest_node_that_way() {
+        // Two on the main row, one on a row above, one far off it.
+        let nodes = [
+            (0., 10., 50.),
+            (40., 50., 50.),
+            (20., 30., 20.),
+            (200., 210., 20.),
+        ];
+        assert_eq!(nearest(&nodes, 5., 50., "right"), Some(1), "along the row");
+        assert_eq!(nearest(&nodes, 45., 50., "left"), Some(0));
+        assert_eq!(
+            nearest(&nodes, 5., 50., "up"),
+            Some(2),
+            "the nearer one above"
+        );
+        assert_eq!(nearest(&nodes, 25., 20., "down"), Some(0));
+        assert_eq!(nearest(&nodes, 5., 50., "left"), None, "nothing that way");
     }
 
     #[test]

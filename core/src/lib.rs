@@ -134,10 +134,26 @@ pub use summary::{MESSAGE_PROMPT, SUMMARY_PROMPT, Summary};
 
 /// A commit message for what a worktree has staged, written by the model
 /// from the staged files and a short diff of them.
-pub fn write_commit_message(worktree: &str, prompt: &str) -> Result<String, CoreError> {
+pub fn write_commit_message(
+    worktree: &str,
+    prompt: &str,
+    varied: bool,
+) -> Result<String, CoreError> {
     let stat = git::run(worktree, &["diff", "--cached", "--stat=100"])?;
     let diff = git::run(worktree, &["diff", "--cached", "-U1", "--no-color"])?;
-    summary::commit_message(&format!("Files changed:\n{stat}\nDiff:\n{diff}"), prompt)
+    // The latest subjects show the repository's style; a repository with no
+    // commits yet has none.
+    let subjects = git::run(
+        worktree,
+        &["log", "-n", "5", "--no-merges", "--format=%s", "HEAD"],
+    )
+    .unwrap_or_default();
+    let examples = summary::style_examples(&subjects);
+    summary::commit_message(
+        &format!("Files changed:\n{stat}\nDiff:\n{diff}"),
+        &format!("{examples}{prompt}"),
+        varied,
+    )
 }
 
 /// A summary of commits, newest first, and the changes from `base` to

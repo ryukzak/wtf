@@ -59,8 +59,58 @@ pub fn gap(theme: &Theme) -> Div {
         .child("⋯")
 }
 
+/// How a diff row's code fits its side: cut at the edge and moved left by
+/// a horizontal scroll, or wrapped at `cols` characters, as line `part` of
+/// the row.
+#[derive(Clone, Copy)]
+pub enum Fit {
+    Scroll(f32),
+    Wrap { cols: usize, part: usize },
+}
+
+/// How many lines a row takes wrapped at `cols` characters: as many as its
+/// longer side needs.
+pub fn parts(row: &DiffRow, cols: usize) -> usize {
+    let lines = |side: &Option<DiffSide>| {
+        side.as_ref()
+            .map_or(1, |side| wrap_starts(&side.text, cols).len())
+    };
+    lines(&row.left).max(lines(&row.right))
+}
+
+/// Where each line of `text` starts, in characters, wrapped at `cols`: after
+/// the last space that fits, so words stay whole, or mid-word when one
+/// alone is longer than a line.
+pub fn wrap_starts(text: &str, cols: usize) -> Vec<usize> {
+    let chars: Vec<char> = text.chars().collect();
+    let cols = cols.max(1);
+    let mut starts = vec![0];
+    let mut start = 0;
+    while chars.len() - start > cols {
+        let end = start + cols;
+        // A cut after a space, with more than spaces before it: indentation
+        // alone is no line.
+        let cut = (start + 1..=end).rev().find(|&at| {
+            chars[at - 1].is_whitespace() && chars[start..at].iter().any(|c| !c.is_whitespace())
+        });
+        start = cut.unwrap_or(end);
+        starts.push(start);
+    }
+    starts
+}
+
+/// The longest line of `rows`, in characters.
+pub fn widest(rows: &[DiffRow]) -> usize {
+    rows.iter()
+        .flat_map(|row| [&row.left, &row.right])
+        .flatten()
+        .map(|side| side.text.chars().count())
+        .max()
+        .unwrap_or(0)
+}
+
 /// A diff row, its code colored by `colors` when its file has them.
-pub fn row(row: &DiffRow, theme: &Theme, colors: Option<&Colors>) -> Div {
+pub fn row(row: &DiffRow, theme: &Theme, colors: Option<&Colors>, fit: Fit) -> Div {
     div()
         .flex()
         .w_full()
@@ -71,6 +121,7 @@ pub fn row(row: &DiffRow, theme: &Theme, colors: Option<&Colors>) -> Div {
             theme,
             theme.deleted,
             theme.deleted_char,
+            fit,
         ))
         .child(div().w(px(1.)).h_full().bg(theme.separator))
         .child(side(
@@ -79,6 +130,7 @@ pub fn row(row: &DiffRow, theme: &Theme, colors: Option<&Colors>) -> Div {
             theme,
             theme.inserted,
             theme.inserted_char,
+            fit,
         ))
 }
 
@@ -154,6 +206,7 @@ fn side(
     theme: &Theme,
     line: Hsla,
     char: Hsla,
+    fit: Fit,
 ) -> AnyElement {
     let cell = div().flex().flex_1().min_w_0().h_full().overflow_hidden();
     let Some(side) = side else {
@@ -161,6 +214,34 @@ fn side(
     };
     let changed = !side.changes.is_empty();
     let highlights = highlights(side, code, theme, char);
+    // Wrapped, a row shows a piece of its line, the number on the first.
+    let (text, highlights, number, shift) = match fit {
+        Fit::Scroll(x) => (side.text.clone(), highlights, true, x),
+        Fit::Wrap { cols, part } => {
+            let at = |n: usize| {
+                side.text
+                    .char_indices()
+                    .nth(n)
+                    .map_or(side.text.len(), |(i, _)| i)
+            };
+            let starts = wrap_starts(&side.text, cols);
+            let (start, end) = match starts.get(part) {
+                Some(&from) => (
+                    at(from),
+                    starts.get(part + 1).map_or(side.text.len(), |&to| at(to)),
+                ),
+                None => (side.text.len(), side.text.len()),
+            };
+            let highlights = highlights
+                .into_iter()
+                .filter_map(|(range, style)| {
+                    let (from, to) = (range.start.max(start), range.end.min(end));
+                    (from < to).then(|| (from - start..to - start, style))
+                })
+                .collect();
+            (side.text[start..end].to_string(), highlights, part == 0, 0.)
+        }
+    };
 
     cell.when(changed, |cell| cell.bg(line))
         .child(
@@ -170,17 +251,22 @@ fn side(
                 .pr(px(8.))
                 .text_right()
                 .text_color(theme.secondary)
-                .child(side.line_number.to_string()),
+                .when(number, |gutter| gutter.child(side.line_number.to_string())),
         )
+        // The code alone moves with a horizontal scroll; its number stays.
         .child(
-            div()
-                .whitespace_nowrap()
-                .text_color(if changed {
-                    theme.changed_text
-                } else {
-                    theme.foreground
-                })
-                .child(StyledText::new(side.text.clone()).with_highlights(highlights)),
+            div().flex_1().min_w_0().h_full().overflow_hidden().child(
+                div()
+                    .relative()
+                    .left(px(-shift))
+                    .whitespace_nowrap()
+                    .text_color(if changed {
+                        theme.changed_text
+                    } else {
+                        theme.foreground
+                    })
+                    .child(StyledText::new(text).with_highlights(highlights)),
+            ),
         )
         .into_any_element()
 }
@@ -218,6 +304,34 @@ mod tests {
 
         rows[0] = line(true);
         assert_eq!(hunks(&rows, 2)[..4], [Some(0), Some(1), Some(2), None]);
+    }
+
+    #[test]
+    fn a_row_wraps_as_its_longer_side_needs() {
+        let side = |text: &str| {
+            Some(DiffSide {
+                line_number: 1,
+                text: text.to_string(),
+                changes: Vec::new(),
+            })
+        };
+        let row = DiffRow {
+            left: side("abc"),
+            right: side("абвгдеж"),
+        };
+        assert_eq!(parts(&row, 3), 3, "by characters, not bytes");
+        // Words stay whole; one longer than a line is cut.
+        assert_eq!(wrap_starts("let total = sum", 10), [0, 10]);
+        assert_eq!(wrap_starts("abcdefghij klm", 4), [0, 4, 8, 11]);
+        // Indentation alone does not make a line.
+        assert_eq!(wrap_starts("    abcdefgh", 6), [0, 6]);
+        assert_eq!(parts(&row, 10), 1);
+        let empty = DiffRow {
+            left: None,
+            right: side(""),
+        };
+        assert_eq!(parts(&empty, 3), 1);
+        assert_eq!(widest(&[row, empty]), 7);
     }
 
     #[test]

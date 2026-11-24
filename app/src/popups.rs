@@ -41,6 +41,10 @@ pub enum Target {
         name: String,
         id: String,
     },
+    /// A group of the attention list: local branches, or remote ones.
+    Group {
+        remote: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -100,6 +104,7 @@ pub fn attention_name(target: &Target) -> String {
         Target::Commit { commit, .. } => commit.clone(),
         Target::Remote { remote, branch, .. } => format!("{remote}/{branch}"),
         Target::Tag { name, .. } | Target::Stash { name, .. } => name.clone(),
+        Target::Group { .. } => String::new(),
     }
 }
 
@@ -296,6 +301,14 @@ pub fn commands(
                 vec![danger(Command::DropStash, "Drop…")],
             ])
         }
+        // A group's branches all show, all hide, or follow the filters.
+        Target::Group { .. } => grouped(vec![
+            vec![
+                text(Command::Pin, "Show All in Attention"),
+                text(Command::Hide, "Hide All from Attention"),
+            ],
+            vec![text(Command::FollowFilters, "All Follow Attention Filters")],
+        ]),
         Target::Worktree {
             path,
             branch,

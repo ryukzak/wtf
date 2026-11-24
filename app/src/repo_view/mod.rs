@@ -46,7 +46,6 @@ mod trees;
 mod widgets;
 
 use attention_panel::*;
-use commit_box::*;
 use header::*;
 use time::*;
 use trees::*;
@@ -147,7 +146,7 @@ struct Snapshot {
     stale: bool,
     /// What the search field holds; the lines of text it found, for which
     /// query and state, and the query and state searched now.
-    search: String,
+    search: crate::text_field::Field,
     found: Option<(String, Revision, Vec<wtf_core::Found>)>,
     searching: Option<(String, Revision)>,
     /// A line found and opened: shown marked, scrolled to once read.
@@ -203,8 +202,13 @@ struct CommitDraft {
     /// The message as last laid out, to place the cursor by a click and
     /// move it between lines.
     message_layout: RefCell<Option<gpui::TextLayout>>,
-    /// All of the message is selected, by ⌘A.
-    message_selected: bool,
+    /// The other end of the message's selection, when there is one.
+    message_anchor: Option<usize>,
+    /// A press in the message is dragging out a selection.
+    message_dragging: bool,
+    /// The next message the model writes is a new wording, asked for with
+    /// its mark.
+    rewrite: bool,
     /// Earlier and undone messages, for ⌘Z and ⇧⌘Z, and whether the last
     /// change was a typed letter, which the next one joins.
     message_undo: Vec<String>,
@@ -229,7 +233,8 @@ enum StackItem {
     /// Staged or unstaged files, with how many.
     Section(bool, usize),
     Header(usize),
-    Row(usize, usize),
+    /// A file's diff row, and which of its lines when wrapped.
+    Row(usize, usize, usize),
     /// A hunk of a worktree file: its first row and the row after its last.
     Hunk(usize, usize, usize),
     Gap,
@@ -297,7 +302,7 @@ enum Dropdown {
 /// A small panel asking for one line of text.
 struct Prompt {
     kind: PromptKind,
-    edit: crate::line_edit::LineEdit,
+    field: crate::text_field::Field,
 }
 
 enum PromptKind {
@@ -351,7 +356,7 @@ pub struct RepoView {
     prune_focus: FocusHandle,
     /// The Go To picker or the command palette, when open: the query, the
     /// highlighted result, and whether it lists commands.
-    goto: Option<(String, usize, bool)>,
+    goto: Option<(crate::text_field::Field, usize, bool)>,
     /// The Stash picker, open on a worktree: its path and the highlighted
     /// row, the first one running the stash.
     stash_picker: Option<(String, usize)>,
@@ -377,7 +382,7 @@ pub struct RepoView {
     side_panel: Option<SidePanel>,
     last_panel: SidePanel,
     sidebar_width: f32,
-    attention_search: String,
+    attention_search: crate::text_field::Field,
     attention_search_focus: FocusHandle,
     collapsed_sections: HashSet<Section>,
     dropdown: Option<(Dropdown, Point<Pixels>)>,
@@ -436,6 +441,15 @@ pub struct RepoView {
     diff: Option<FileDiff>,
     selected_file: Option<usize>,
     diff_mode: DiffMode,
+    /// Long diff lines wrap; otherwise they run on and scroll sideways.
+    wrap_lines: bool,
+    /// How far the diff's code is scrolled sideways, and how far it can go.
+    diff_x: Cell<f32>,
+    diff_max_x: Cell<f32>,
+    /// The diff's width when last drawn, and the characters a side then
+    /// holds, which the wrapped all-files view is laid out at.
+    diff_width: Cell<(f32, f32)>,
+    wrap_cols: Option<usize>,
     stacked: Vec<StackItem>,
     stacked_diffs: Vec<Result<FileDiff, String>>,
     /// The files `stacked_diffs` were made from: until a refresh brings
@@ -473,7 +487,7 @@ pub struct RepoView {
     message_scroll: ScrollHandle,
     /// A commit message being edited: the commit, the worktree whose latest
     /// commit it is, and the text so far.
-    rewording: Option<(String, String, String)>,
+    rewording: Option<(String, String, crate::text_field::Field)>,
     /// Text picked in a commit's message: the commit, where the pick started
     /// and where it ends, and whether a drag is extending it.
     message_selection: Option<(String, usize, usize)>,
@@ -606,7 +620,7 @@ impl RepoView {
             side_panel: None,
             last_panel: SidePanel::Attention,
             sidebar_width: sizes.sidebar,
-            attention_search: String::new(),
+            attention_search: Default::default(),
             attention_search_focus: cx.focus_handle(),
             collapsed_sections: HashSet::new(),
             dropdown: None,
@@ -639,6 +653,11 @@ impl RepoView {
             diff: None,
             selected_file: None,
             diff_mode: DiffMode::Text,
+            wrap_lines: false,
+            diff_x: Cell::new(0.),
+            diff_max_x: Cell::new(0.),
+            diff_width: Cell::new((-1., -1.)),
+            wrap_cols: None,
             stacked: Vec::new(),
             stacked_diffs: Vec::new(),
             stacked_files: Vec::new(),
@@ -2020,6 +2039,22 @@ impl RepoView {
                 return self.with_header(placeholder("Loading…", None, theme), theme, window, cx);
             }
             let spacers = self.header_rows();
+            let width = self
+                .stacked_scroll
+                .0
+                .borrow()
+                .base_handle
+                .bounds()
+                .size
+                .width;
+            let widest = self
+                .stacked_diffs
+                .iter()
+                .flatten()
+                .map(|diff| diff_view::widest(&diff.rows))
+                .max()
+                .unwrap_or(0);
+            self.track_widest(widest, f32::from(width), true, window);
             let list = uniform_list(
                 "stacked",
                 spacers + self.stacked.len(),
@@ -2074,6 +2109,7 @@ impl RepoView {
                 .flex()
                 .flex_col()
                 .size_full()
+                .on_scroll_wheel(cx.listener(Self::scroll_diff_sideways))
                 .when(
                     self.worktree_split.is_some() && self.stash_view.is_none(),
                     |pane| pane.child(self.commit_box(theme, window, cx)),
@@ -2104,20 +2140,45 @@ impl RepoView {
         let shown = match &self.diff {
             Some(diff) if !diff.rows.is_empty() => {
                 let spacers = self.header_rows();
+                let width = self.diff_scroll.0.borrow().base_handle.bounds().size.width;
+                let cols = self.wrap_cols_for(f32::from(width), false, window);
+                let widest = diff_view::widest(&diff.rows);
+                self.track_widest(widest, f32::from(width), false, window);
+                // Wrapped, each row takes as many list rows as it has lines.
+                let lines: Rc<Vec<(usize, usize)>> = Rc::new(match cols {
+                    Some(cols) => diff
+                        .rows
+                        .iter()
+                        .enumerate()
+                        .flat_map(|(i, row)| {
+                            (0..diff_view::parts(row, cols)).map(move |part| (i, part))
+                        })
+                        .collect(),
+                    None => (0..diff.rows.len()).map(|i| (i, 0)).collect(),
+                });
+                let count = lines.len();
                 let list = uniform_list(
                     "diff",
-                    spacers + diff.rows.len(),
+                    spacers + count,
                     cx.processor(move |this, range: std::ops::Range<usize>, window, _| {
                         let theme = Theme::for_appearance(window.appearance());
                         let rows = this.diff.as_ref().map_or(&[][..], |diff| &diff.rows);
                         range
                             .filter_map(|index| match index.checked_sub(spacers) {
                                 None => Some(spacer()),
-                                Some(index) => rows.get(index).map(|row| {
-                                    let colors = this.diff_colors(None, &theme);
-                                    diff_view::row(row, &theme, colors.as_deref())
+                                Some(index) => {
+                                    let &(i, part) = lines.get(index)?;
+                                    rows.get(i).map(|row| {
+                                        let colors = this.diff_colors(None, &theme);
+                                        diff_view::row(
+                                            row,
+                                            &theme,
+                                            colors.as_deref(),
+                                            this.fit(cols, part),
+                                        )
                                         .into_any_element()
-                                }),
+                                    })
+                                }
                             })
                             .collect()
                     }),
@@ -2136,6 +2197,7 @@ impl RepoView {
                     .flex()
                     .flex_col()
                     .size_full()
+                    .on_scroll_wheel(cx.listener(Self::scroll_diff_sideways))
                     .child(self.under_header(
                         list.into_any_element(),
                         scroll_y,
@@ -2332,6 +2394,7 @@ impl Render for RepoView {
         self.request_summary(cx);
         self.sync_snapshot(cx);
         self.sync_log(cx);
+        self.sync_wrap(window, cx);
         div()
             .track_focus(&self.focus)
             .on_action(cx.listener(|this, _: &OpenRepository, window, cx| {
@@ -2456,6 +2519,25 @@ impl Render for RepoView {
                 ]
                 .iter()
                 .any(|focus| focus.is_focused(window));
+                // Arrows move about the graph while nothing else has the keys;
+                // ⌥← and ⌥→ through the selected node's commits.
+                let modifiers = keystroke.modifiers;
+                let alt = modifiers.alt && !modifiers.platform && !modifiers.control;
+                let arrow = matches!(keystroke.key.as_str(), "left" | "right" | "up" | "down");
+                if arrow && this.focus.is_focused(window) && this.context_menu.is_none() {
+                    match (
+                        modifiers.modified(),
+                        alt && !modifiers.shift,
+                        keystroke.key.as_str(),
+                    ) {
+                        (false, _, key) => drop(this.step_node(key, cx)),
+                        (_, true, "left") => this.step_commit(false, cx),
+                        (_, true, "right") => this.step_commit(true, cx),
+                        _ => return,
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
                 if keystroke.modifiers.platform && keystroke.key == "a" && !typing {
                     this.message_selection = None;
                     if !this.narrowed.is_empty() {
@@ -3193,17 +3275,12 @@ impl RepoView {
                             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                                 let keystroke = &event.keystroke;
                                 match keystroke.key.as_str() {
-                                    "escape" if this.snapshot.search.is_empty() => {
+                                    "escape" if this.snapshot.search.text().is_empty() => {
                                         this.focus.focus(window);
                                     }
-                                    "escape" => this.snapshot.search.clear(),
+                                    "escape" => this.snapshot.search.edit.set_text(""),
                                     "enter" => {}
-                                    _ if type_key(
-                                        &mut this.snapshot.search,
-                                        keystroke,
-                                        true,
-                                        cx,
-                                    ) => {}
+                                    _ if this.snapshot.search.key(keystroke, cx) => {}
                                     _ => return,
                                 }
                                 this.snapshot.found_line = None;
@@ -3230,7 +3307,17 @@ impl RepoView {
                             })
                             .overflow_hidden()
                             .whitespace_nowrap()
-                            .child(field_text(&self.snapshot.search, "Search", focused, theme)),
+                            .child(self.snapshot.search.render(
+                                "snapshot-search-text",
+                                "Search",
+                                focused,
+                                true,
+                                Vec::new(),
+                                &self.snapshot_search_focus,
+                                theme,
+                                |this: &mut Self| Some(&mut this.snapshot.search),
+                                cx,
+                            )),
                     )
                     .child(
                         div()
@@ -3254,7 +3341,7 @@ impl RepoView {
                             .child("Changed"),
                     ),
             )
-            .child(match self.snapshot.search.trim().is_empty() {
+            .child(match self.snapshot.search.text().trim().is_empty() {
                 true => list.into_any_element(),
                 false => self.search_list(cx),
             })
@@ -3420,41 +3507,6 @@ impl RepoView {
     }
 }
 
-/// The cursor drawn in a text field.
-const CARET: &str = "▏";
-
-/// Types a key into a plain text field: Return breaks the line, unless the
-/// field is `single_line`, Backspace deletes and ⌘V pastes, on one line in a
-/// single-line field. False for keys it leaves alone.
-pub(crate) fn type_key(
-    text: &mut String,
-    keystroke: &gpui::Keystroke,
-    single_line: bool,
-    cx: &gpui::App,
-) -> bool {
-    let modifiers = keystroke.modifiers;
-    match keystroke.key.as_str() {
-        "enter" if !modifiers.platform && !single_line => text.push('\n'),
-        "backspace" => {
-            text.pop();
-        }
-        "v" if modifiers.platform => {
-            if let Some(pasted) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                match single_line {
-                    true => text.push_str(pasted.replace('\n', " ").trim()),
-                    false => text.push_str(&pasted),
-                }
-            }
-        }
-        _ if !modifiers.platform && !modifiers.control => match &keystroke.key_char {
-            Some(typed) if !typed.chars().any(char::is_control) => text.push_str(typed),
-            _ => return false,
-        },
-        _ => return false,
-    }
-    true
-}
-
 #[cfg(test)]
 mod tests {
     use wtf_core::{DiffRow, DiffSide, TextRange};
@@ -3593,16 +3645,17 @@ mod tests {
                 .collect()
         };
         let none = HashSet::new();
+        // Folders and files together by name, as Settings have it at first.
         assert_eq!(
             show(file_tree(&files, None, &none)),
             [
+                "0README.md",
                 "0app/src/",
+                "1main.rs",
                 "1view/",
                 "2a.rs",
-                "1main.rs",
                 "0core/src/lib/x/",
-                "1y.rs",
-                "0README.md"
+                "1y.rs"
             ]
         );
         let folded = HashSet::from(["staged:app/src/".to_string()]);
@@ -3615,15 +3668,21 @@ mod tests {
     #[test]
     fn staging_splits_files_into_sections() {
         let diffs = vec![Ok(diff(&[true])), Ok(diff(&[true])), Ok(diff(&[true]))];
-        let kinds: Vec<String> =
-            stack_items(&diffs, &[true, true, true], Some(2), [false; 2], false)
-                .iter()
-                .map(|item| match item {
-                    StackItem::Section(staged, count) => format!("{staged}:{count}"),
-                    StackItem::Header(file) => format!("H{file}"),
-                    _ => "?".to_string(),
-                })
-                .collect();
+        let kinds: Vec<String> = stack_items(
+            &diffs,
+            &[true, true, true],
+            Some(2),
+            [false; 2],
+            false,
+            None,
+        )
+        .iter()
+        .map(|item| match item {
+            StackItem::Section(staged, count) => format!("{staged}:{count}"),
+            StackItem::Header(file) => format!("H{file}"),
+            _ => "?".to_string(),
+        })
+        .collect();
         assert_eq!(
             kinds,
             [
@@ -3631,28 +3690,35 @@ mod tests {
             ]
         );
 
-        let folded_unstaged: Vec<String> =
-            stack_items(&diffs, &[true, true, true], Some(2), [true, false], false)
+        let folded_unstaged: Vec<String> = stack_items(
+            &diffs,
+            &[true, true, true],
+            Some(2),
+            [true, false],
+            false,
+            None,
+        )
+        .iter()
+        .map(|item| match item {
+            StackItem::Section(staged, count) => format!("{staged}:{count}"),
+            StackItem::Header(file) => format!("H{file}"),
+            _ => "?".to_string(),
+        })
+        .collect();
+        assert_eq!(folded_unstaged, ["?", "false:2", "?", "true:1", "?", "H2"]);
+
+        // Each hunk of a worktree file gets a header before its rows.
+        let open: Vec<String> =
+            stack_items(&diffs[2..], &[false], Some(0), [false; 2], false, None)
                 .iter()
                 .map(|item| match item {
                     StackItem::Section(staged, count) => format!("{staged}:{count}"),
                     StackItem::Header(file) => format!("H{file}"),
+                    StackItem::Hunk(file, start, end) => format!("@{file}:{start}-{end}"),
+                    StackItem::Row(file, row, _) => format!("{file}:{row}"),
                     _ => "?".to_string(),
                 })
                 .collect();
-        assert_eq!(folded_unstaged, ["?", "false:2", "?", "true:1", "?", "H2"]);
-
-        // Each hunk of a worktree file gets a header before its rows.
-        let open: Vec<String> = stack_items(&diffs[2..], &[false], Some(0), [false; 2], false)
-            .iter()
-            .map(|item| match item {
-                StackItem::Section(staged, count) => format!("{staged}:{count}"),
-                StackItem::Header(file) => format!("H{file}"),
-                StackItem::Hunk(file, start, end) => format!("@{file}:{start}-{end}"),
-                StackItem::Row(file, row) => format!("{file}:{row}"),
-                _ => "?".to_string(),
-            })
-            .collect();
         assert_eq!(
             open,
             ["?", "false:0", "?", "true:1", "?", "H0", "@0:0-1", "0:0"]
@@ -3660,7 +3726,7 @@ mod tests {
 
         // Too many files to open at once: a note says why, and every file
         // keeps its header, folded.
-        let many = stack_items(&diffs, &[true; 3], Some(2), [false; 2], true);
+        let many = stack_items(&diffs, &[true; 3], Some(2), [false; 2], true, None);
         assert!(matches!(&many[0], StackItem::Note(note) if note.starts_with("3 files")));
         let headers = many
             .iter()
@@ -3669,7 +3735,7 @@ mod tests {
         assert_eq!(headers, 3);
         assert!(!many.iter().any(|item| matches!(item, StackItem::Row(..))));
 
-        let nothing_staged = stack_items(&diffs[..1], &[true], Some(1), [false; 2], false);
+        let nothing_staged = stack_items(&diffs[..1], &[true], Some(1), [false; 2], false, None);
         assert!(matches!(
             nothing_staged.last(),
             Some(StackItem::Section(true, 0))
@@ -3734,12 +3800,12 @@ mod tests {
             Err("binary".to_string()),
         ];
         let kinds = |folded: &[bool]| -> Vec<String> {
-            stack_items(&diffs, folded, None, [false; 2], false)
+            stack_items(&diffs, folded, None, [false; 2], false, None)
                 .iter()
                 .map(|item| match item {
                     StackItem::Section(staged, count) => format!("S{staged}:{count}"),
                     StackItem::Header(file) => format!("H{file}"),
-                    StackItem::Row(file, row) => format!("{file}:{row}"),
+                    StackItem::Row(file, row, _) => format!("{file}:{row}"),
                     StackItem::Hunk(..) => "@".to_string(),
                     StackItem::Gap => "…".to_string(),
                     StackItem::Note(text) => text.clone(),
@@ -3770,37 +3836,5 @@ mod tests {
                 "binary"
             ]
         );
-    }
-
-    #[test]
-    fn edits_text_at_its_cursor() {
-        let key = |keys: &str| {
-            let mut keystroke = gpui::Keystroke::parse(keys).unwrap();
-            if keystroke.key.chars().count() == 1 && !keystroke.modifiers.platform {
-                keystroke.key_char = Some(keystroke.key.clone());
-            }
-            keystroke
-        };
-        let edit = |text: &str, cursor: usize, keys: &str| {
-            let (mut text, mut cursor) = (text.to_string(), cursor);
-            edit_key(&mut text, &mut cursor, &key(keys), || Some("XY".into()));
-            (text, cursor)
-        };
-        assert_eq!(edit("ac", 1, "b"), ("abc".into(), 2));
-        assert_eq!(edit("abc", 1, "backspace"), ("bc".into(), 0));
-        assert_eq!(edit("abc", 1, "delete"), ("ac".into(), 1));
-        assert_eq!(edit("ab", 1, "cmd-v"), ("aXYb".into(), 3));
-        assert_eq!(edit("ab", 1, "enter"), ("a\nb".into(), 2));
-        assert_eq!(edit("привет", 2, "right"), ("привет".into(), 4));
-        assert_eq!(edit("one two", 7, "alt-left"), ("one two".into(), 4));
-        assert_eq!(edit("one two", 0, "alt-right"), ("one two".into(), 3));
-        assert_eq!(edit("one two", 7, "alt-backspace"), ("one ".into(), 4));
-        assert_eq!(edit("a\nbc", 4, "cmd-left"), ("a\nbc".into(), 2));
-        assert_eq!(edit("a\nbc", 2, "cmd-right"), ("a\nbc".into(), 4));
-        assert_eq!(edit("a\nbc", 4, "cmd-backspace"), ("a\n".into(), 2));
-        // The caret drawn at 1 takes room that is no place in the text.
-        assert_eq!(from_shown(1, 1), 1);
-        assert_eq!(from_shown(2, 1), 1);
-        assert_eq!(from_shown(1 + CARET.len() + 1, 1), 2);
     }
 }

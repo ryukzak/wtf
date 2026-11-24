@@ -82,12 +82,13 @@ impl RepoView {
         }
         self.draft.suggest_key = Some(key);
         self.draft.writing_message = true;
+        let varied = std::mem::take(&mut self.draft.rewrite);
         self.draft.suggest_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(SUGGEST_DELAY).await;
             let prompt = preferences::message_prompt();
             let write = cx
                 .background_executor()
-                .spawn(async move { wtf_core::write_commit_message(&path, &prompt) });
+                .spawn(async move { wtf_core::write_commit_message(&path, &prompt, varied) });
             let written = write.await;
             this.update(cx, |this, cx| {
                 this.draft.writing_message = false;
@@ -117,76 +118,110 @@ impl RepoView {
         cx.notify();
     }
 
+    /// Has the model write the message again, in other words, while it is
+    /// still the model's.
+    fn rewrite_message(&mut self, cx: &mut Context<Self>) {
+        if !self.suggesting() || self.draft.writing_message {
+            return;
+        }
+        self.draft.suggest_key = None;
+        self.draft.rewrite = true;
+        self.suggest_message(cx);
+        cx.notify();
+    }
+
     fn commit_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
         let modifiers = keystroke.modifiers;
+        let ctrl = modifiers.control && !modifiers.platform && !modifiers.alt;
         match keystroke.key.as_str() {
             "enter" if modifiers.platform => self.commit(cx),
             "escape" => self.focus.focus(window),
             "z" if modifiers.platform && modifiers.shift => self.redo_message(),
             "z" if modifiers.platform => self.undo_message(),
-            // The box's text as a whole: ⌘A selects it, ⌘C copies and ⌘X cuts
-            // it.
-            "a" if modifiers.platform => self.draft.message_selected = true,
+            "a" if modifiers.platform => {
+                self.draft.message_anchor = Some(0);
+                self.draft.message_cursor = Some(self.draft.message.len());
+            }
             "c" if modifiers.platform => {
-                cx.write_to_clipboard(ClipboardItem::new_string(self.draft.message.clone()))
+                let range = self.message_selection();
+                if !range.is_empty() {
+                    let copied = self.draft.message[range].to_string();
+                    cx.write_to_clipboard(ClipboardItem::new_string(copied));
+                }
             }
             "x" if modifiers.platform => {
-                cx.write_to_clipboard(ClipboardItem::new_string(self.draft.message.clone()));
-                self.set_message(String::new(), false);
-                self.draft.message_selected = false;
+                let range = self.message_selection();
+                if range.is_empty() {
+                    return;
+                }
+                let mut text = self.draft.message.clone();
+                cx.write_to_clipboard(ClipboardItem::new_string(text[range.clone()].to_string()));
+                text.replace_range(range.clone(), "");
+                self.message_edited(text, range.start, false);
             }
-            "up" | "down" => {
-                self.draft.message_selected = false;
-                self.cursor_line(keystroke.key == "down");
-            }
+            "up" | "down" => self.cursor_line(keystroke.key == "down", modifiers.shift),
+            "p" | "n" if ctrl => self.cursor_line(keystroke.key == "n", modifiers.shift),
             _ => {
-                // Typing, pasting or deleting over a selection replaces it;
-                // moving the cursor drops the selection.
-                let moving = matches!(keystroke.key.as_str(), "left" | "right" | "home" | "end");
-                let replace = self.draft.message_selected && !moving;
-                let (mut text, mut cursor) = match replace {
-                    true => (String::new(), 0),
-                    false => (self.draft.message.clone(), self.cursor()),
+                let mut edit = crate::line_edit::LineEdit {
+                    text: self.draft.message.clone(),
+                    caret: self.cursor(),
+                    anchor: self.draft.message_anchor,
+                    multiline: true,
                 };
                 let paste = || cx.read_from_clipboard().and_then(|item| item.text());
-                let deleting = matches!(keystroke.key.as_str(), "backspace" | "delete");
-                if !(edit_key(&mut text, &mut cursor, keystroke, paste) || deleting && replace) {
+                if !edit.edit(keystroke, paste) {
                     return;
                 }
-                self.draft.message_selected = false;
+                let (text, cursor, anchor) = (edit.text, edit.caret, edit.anchor);
                 if text == self.draft.message {
                     self.draft.message_cursor = Some(cursor);
-                    cx.stop_propagation();
-                    cx.notify();
-                    return;
-                }
-                // The user writes: a message the model is still writing is
-                // dropped.
-                if self.draft.writing_message {
-                    (
-                        self.draft.suggest_task,
-                        self.draft.writing_message,
-                        self.draft.commit_when_written,
-                    ) = (None, false, false);
-                }
-                // Letters typed in a row undo together; anything else is a
-                // step of its own.
-                let letter = keystroke
-                    .key_char
-                    .as_deref()
-                    .is_some_and(|c| c.chars().all(char::is_alphanumeric))
-                    && !modifiers.platform;
-                let at_end = cursor == text.len();
-                self.set_message(text, letter);
-                self.draft.message_cursor = Some(cursor);
-                if at_end {
-                    self.message_scroll.scroll_to_bottom();
+                    self.draft.message_anchor = anchor;
+                } else {
+                    // Letters typed in a row undo together; anything else is
+                    // a step of its own.
+                    let letter = keystroke
+                        .key_char
+                        .as_deref()
+                        .is_some_and(|c| c.chars().all(char::is_alphanumeric))
+                        && !modifiers.platform
+                        && !modifiers.control;
+                    self.message_edited(text, cursor, letter);
                 }
             }
         }
         cx.stop_propagation();
         cx.notify();
+    }
+
+    /// Puts in an edited message with the cursor at `cursor`.
+    fn message_edited(&mut self, text: String, cursor: usize, letter: bool) {
+        // The user writes: a message the model is still writing is dropped.
+        if self.draft.writing_message {
+            (
+                self.draft.suggest_task,
+                self.draft.writing_message,
+                self.draft.commit_when_written,
+            ) = (None, false, false);
+        }
+        let at_end = cursor == text.len();
+        self.set_message(text, letter);
+        self.draft.message_cursor = Some(cursor);
+        if at_end {
+            self.message_scroll.scroll_to_bottom();
+        }
+    }
+
+    /// The selected bytes of the message, in order; empty at the cursor
+    /// when none.
+    fn message_selection(&self) -> std::ops::Range<usize> {
+        let cursor = self.cursor();
+        let anchor = self
+            .draft
+            .message_anchor
+            .filter(|&anchor| self.draft.message.is_char_boundary(anchor))
+            .unwrap_or(cursor);
+        anchor.min(cursor)..anchor.max(cursor)
     }
 
     /// Changes the commit message, keeping what it was to undo; `letter`
@@ -203,6 +238,7 @@ impl RepoView {
         self.draft.message_redo.clear();
         self.draft.message = text;
         self.draft.message_cursor = None;
+        self.draft.message_anchor = None;
     }
 
     /// The commit message's cursor, on a character of the text.
@@ -219,8 +255,9 @@ impl RepoView {
         at
     }
 
-    /// Moves the cursor a line up or down, by where the text lies on screen.
-    fn cursor_line(&mut self, down: bool) {
+    /// Moves the cursor a line up or down, by where the text lies on screen,
+    /// selecting on the way with `select`.
+    fn cursor_line(&mut self, down: bool, select: bool) {
         let Some(layout) = self.draft.message_layout.borrow().clone() else {
             return;
         };
@@ -233,8 +270,23 @@ impl RepoView {
             at.x + px(1.),
             at.y + if down { line * 1.5 } else { -line * 0.5 },
         );
-        let shown = layout.index_for_position(target).unwrap_or_else(|i| i);
-        self.draft.message_cursor = Some(from_shown(shown, cursor));
+        let to = layout.index_for_position(target).unwrap_or_else(|i| i);
+        self.move_message_cursor(to, select);
+    }
+
+    /// Puts the cursor at `to`, selecting from where it was with `select`.
+    fn move_message_cursor(&mut self, to: usize, select: bool) {
+        let cursor = self.cursor();
+        match select {
+            true => {
+                self.draft.message_anchor.get_or_insert(cursor);
+            }
+            false => self.draft.message_anchor = None,
+        }
+        self.draft.message_cursor = Some(to);
+        if self.draft.message_anchor == Some(to) {
+            self.draft.message_anchor = None;
+        }
     }
 
     fn undo_message(&mut self) {
@@ -243,6 +295,7 @@ impl RepoView {
             self.draft.message_redo.push(now);
             self.draft.typing_run = false;
             self.draft.message_cursor = None;
+            self.draft.message_anchor = None;
         }
     }
 
@@ -252,60 +305,97 @@ impl RepoView {
             self.draft.message_undo.push(now);
             self.draft.typing_run = false;
             self.draft.message_cursor = None;
+            self.draft.message_anchor = None;
         }
     }
 
-    /// The commit message with its cursor where it stands; a click places
-    /// the cursor.
+    /// The commit message with its selection and its cursor, drawn over the
+    /// text so it takes no room. A click places the cursor, a drag or a
+    /// ⇧-click selects, and a double click selects a word.
     fn message_text(&self, focused: bool, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         if self.draft.message.is_empty() {
             self.draft.message_layout.replace(None);
-            let placeholder = match self.draft.writing_message {
+            let placeholder_text = match self.draft.writing_message {
                 true => "",
                 false => "Commit message",
             };
-            return field_text("", placeholder, focused, theme);
+            return placeholder(placeholder_text, focused, theme);
         }
-        let cursor = self.cursor();
-        let mut shown = self.draft.message.clone();
-        let mut highlights = Vec::new();
-        if focused {
-            shown.insert_str(cursor, CARET);
-            highlights.push((
-                cursor..cursor + CARET.len(),
+        let range = self.message_selection();
+        let highlights = (focused && !range.is_empty()).then(|| {
+            (
+                range,
                 HighlightStyle {
-                    color: Some(theme.accent),
+                    background_color: Some(theme.selection),
                     ..Default::default()
                 },
-            ));
-        }
-        let text = StyledText::new(shown).with_highlights(highlights);
-        self.draft
-            .message_layout
-            .replace(Some(text.layout().clone()));
+            )
+        });
+        let text = StyledText::new(self.draft.message.clone()).with_highlights(highlights);
+        let layout = text.layout().clone();
+        self.draft.message_layout.replace(Some(layout.clone()));
+        let (cursor, color) = (self.cursor(), theme.accent);
+        let caret = canvas(
+            |_, _, _| (),
+            move |_, _, window, _| {
+                let Some(at) = layout.position_for_index(cursor) else {
+                    return;
+                };
+                let bounds = gpui::Bounds::new(
+                    point(at.x - px(0.75), at.y),
+                    gpui::size(px(1.5), layout.line_height()),
+                );
+                window.paint_quad(gpui::fill(bounds, color));
+            },
+        )
+        .absolute()
+        .size_full();
         div()
             .id("commit-message-text")
+            .relative()
+            .cursor(CursorStyle::IBeam)
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                     let Some(layout) = this.draft.message_layout.borrow().clone() else {
                         return;
                     };
-                    let shown = layout
+                    let at = layout
                         .index_for_position(event.position)
                         .unwrap_or_else(|i| i);
-                    let cursor = this.cursor();
-                    let focused = this.commit_focus.is_focused(window);
-                    this.draft.message_cursor = Some(match focused {
-                        true => from_shown(shown, cursor),
-                        false => shown,
-                    });
-                    this.draft.message_selected = false;
+                    match event.click_count {
+                        1 => this.move_message_cursor(at, event.modifiers.shift),
+                        _ => {
+                            let (start, end) = word_around(&this.draft.message, at);
+                            this.draft.message_anchor = Some(start);
+                            this.draft.message_cursor = Some(end);
+                        }
+                    }
+                    this.draft.message_dragging = event.click_count == 1;
                     this.commit_focus.focus(window);
                     cx.notify();
                 }),
             )
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                if !this.draft.message_dragging || event.pressed_button != Some(MouseButton::Left) {
+                    this.draft.message_dragging = false;
+                    return;
+                }
+                let Some(layout) = this.draft.message_layout.borrow().clone() else {
+                    return;
+                };
+                let at = layout
+                    .index_for_position(event.position)
+                    .unwrap_or_else(|i| i);
+                this.move_message_cursor(at, true);
+                cx.notify();
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.draft.message_dragging = false),
+            )
             .child(text)
+            .when(focused, |text| text.child(caret))
             .into_any_element()
     }
 
@@ -393,7 +483,6 @@ impl RepoView {
                             .on_key_down(cx.listener(Self::commit_key))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.commit_focus.focus(window);
-                                this.draft.message_selected = false;
                                 cx.notify();
                             }))
                             .flex_1()
@@ -417,10 +506,6 @@ impl RepoView {
                             .child(
                                 div()
                                     .when(self.draft.writing_message, |text| text.opacity(0.3))
-                                    // All of it selected, by ⌘A.
-                                    .when(self.draft.message_selected && focused, |text| {
-                                        text.bg(theme.selection).rounded(px(2.))
-                                    })
                                     .child(self.message_text(focused, theme, cx)),
                             ),
                     )
@@ -457,8 +542,8 @@ impl RepoView {
                     // corner that says so on hover.
                     .children(self.suggesting().then(|| {
                         let note = "Written by Apple Intelligence from what is staged; rewritten \
-                                    as staging changes until you edit it. ⌘Z brings back what was \
-                                    there.";
+                                    as staging changes until you edit it. Click ✦ for another \
+                                    wording. ⌘Z brings back what was there.";
                         div()
                             .absolute()
                             .top(px(4.))
@@ -466,9 +551,14 @@ impl RepoView {
                             .group("ai-mark")
                             .child(
                                 div()
+                                    .id("ai-mark")
                                     .text_xs()
                                     .text_color(theme.accent)
-                                    .cursor_default()
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.rewrite_message(cx)
+                                    }))
                                     .child("✦"),
                             )
                             .child(
@@ -596,129 +686,23 @@ impl RepoView {
 /// wide enough for "Amend with 12 files ⌘↩".
 const COMMIT_COLUMN: f32 = 12.5;
 
-/// A text field's content: the text, or a placeholder, with a caret at the
-/// end while it has focus. Over a placeholder the caret is laid on top, so
-/// the placeholder starts where typed text will.
-pub(super) fn field_text(
-    text: &str,
-    placeholder: &str,
-    focused: bool,
-    theme: &Theme,
-) -> AnyElement {
-    if text.is_empty() {
-        return div()
-            .relative()
-            .text_color(theme.secondary)
-            .child(placeholder.to_string())
-            .when(focused, |field| {
-                field.child(
-                    div()
-                        .absolute()
-                        .left(px(-1.))
-                        .top_0()
-                        .bottom_0()
-                        .w(px(1.5))
-                        .bg(theme.accent),
-                )
-            })
-            .into_any_element();
-    }
-    let caret = if focused { "▏" } else { "" };
-    let shown = format!("{text}{caret}");
-    let highlights = focused.then(|| {
-        (
-            text.len()..shown.len(),
-            HighlightStyle {
-                color: Some(theme.accent),
-                ..Default::default()
-            },
-        )
-    });
-    StyledText::new(shown)
-        .with_highlights(highlights)
-        .into_any_element()
-}
-
-/// A place in text shown with the caret at `cursor`, as a place in the text.
-pub(super) fn from_shown(shown: usize, cursor: usize) -> usize {
-    match shown {
-        at if at <= cursor => at,
-        at if at < cursor + CARET.len() => cursor,
-        at => at - CARET.len(),
-    }
-}
-
-/// Edits `text` at its `cursor` by a key: typing, Return, ⌘V, Backspace and
-/// Delete, by a word with ⌥ and to the line's start with ⌘; ← and → move by
-/// a character, a word with ⌥ or to the line's end with ⌘, as Home and End
-/// do. False for keys it leaves alone.
-pub(super) fn edit_key(
-    text: &mut String,
-    cursor: &mut usize,
-    keystroke: &gpui::Keystroke,
-    paste: impl FnOnce() -> Option<String>,
-) -> bool {
-    let modifiers = keystroke.modifiers;
-    let at = *cursor;
-    let before = |at: usize| {
-        text[..at]
-            .chars()
-            .next_back()
-            .map_or(0, |c| at - c.len_utf8())
-    };
-    let after = |at: usize| text[at..].chars().next().map_or(at, |c| at + c.len_utf8());
-    let line_start = text[..at].rfind('\n').map_or(0, |i| i + 1);
-    let line_end = text[at..].find('\n').map_or(text.len(), |i| at + i);
-    let word_start = {
-        let trimmed = text[..at].trim_end_matches(char::is_whitespace);
-        trimmed.rfind(char::is_whitespace).map_or(0, |i| {
-            i + trimmed[i..].chars().next().map_or(1, char::len_utf8)
+/// An empty field's placeholder, with the caret laid over its start while
+/// the field has focus, so the placeholder starts where typed text will.
+fn placeholder(text: &str, focused: bool, theme: &Theme) -> AnyElement {
+    div()
+        .relative()
+        .text_color(theme.secondary)
+        .child(text.to_string())
+        .when(focused, |field| {
+            field.child(
+                div()
+                    .absolute()
+                    .left(px(-0.75))
+                    .top_0()
+                    .bottom_0()
+                    .w(px(1.5))
+                    .bg(theme.accent),
+            )
         })
-    };
-    let word_end = {
-        let rest = &text[at..];
-        let skip = rest.len() - rest.trim_start_matches(char::is_whitespace).len();
-        let word = rest[skip..]
-            .find(char::is_whitespace)
-            .unwrap_or(rest.len() - skip);
-        at + skip + word
-    };
-    let mut insert = |text: &mut String, typed: &str| {
-        text.insert_str(*cursor, typed);
-        *cursor += typed.len();
-    };
-    match keystroke.key.as_str() {
-        "left" if modifiers.platform => *cursor = line_start,
-        "left" if modifiers.alt => *cursor = word_start,
-        "left" => *cursor = before(at),
-        "right" if modifiers.platform => *cursor = line_end,
-        "right" if modifiers.alt => *cursor = word_end,
-        "right" => *cursor = after(at),
-        "home" => *cursor = line_start,
-        "end" => *cursor = line_end,
-        "backspace" => {
-            let from = match (modifiers.platform, modifiers.alt) {
-                (true, _) => line_start,
-                (_, true) => word_start,
-                _ => before(at),
-            };
-            text.replace_range(from..at, "");
-            *cursor = from;
-        }
-        "delete" => {
-            let to = if modifiers.alt { word_end } else { after(at) };
-            text.replace_range(at..to, "");
-        }
-        "enter" if !modifiers.platform => insert(text, "\n"),
-        "v" if modifiers.platform => match paste() {
-            Some(pasted) => insert(text, &pasted),
-            None => return false,
-        },
-        _ if !modifiers.platform && !modifiers.control => match &keystroke.key_char {
-            Some(typed) if !typed.chars().any(char::is_control) => insert(text, typed),
-            _ => return false,
-        },
-        _ => return false,
-    }
-    true
+        .into_any_element()
 }

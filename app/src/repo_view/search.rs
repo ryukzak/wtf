@@ -65,7 +65,7 @@ impl RepoView {
     /// Searches the snapshot's text for what the search field holds, after
     /// a pause in typing, again when the state shown changes.
     pub(super) fn sync_search(&mut self, cx: &mut Context<Self>) {
-        let query = self.snapshot.search.trim().to_string();
+        let query = self.snapshot.search.text().trim().to_string();
         let (Some(repo), Some(revision)) = (self.repo_path.clone(), self.snapshot_revision())
         else {
             return;
@@ -106,7 +106,7 @@ impl RepoView {
     /// The search's rows for what the field holds now; lines found for an
     /// earlier query stay out.
     pub(super) fn current_search_rows(&self) -> Vec<SearchRow> {
-        let query = self.snapshot.search.trim();
+        let query = self.snapshot.search.text().trim();
         let changed = self.changed_paths();
         let only = self.snapshot.only_changed;
         let keep = |path: &str| !only || changed.contains_key(path);

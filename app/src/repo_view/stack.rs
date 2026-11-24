@@ -69,7 +69,106 @@ impl RepoView {
             self.worktree_split,
             self.folded_sections,
             self.many_files(),
+            self.wrap_cols,
         );
+    }
+
+    /// Wraps long diff lines, or lets them run on to scroll sideways.
+    pub(super) fn set_wrap_lines(
+        &mut self,
+        wrap: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.wrap_lines = wrap;
+        self.diff_x.set(0.);
+        self.sync_wrap(window, cx);
+        cx.notify();
+    }
+
+    /// Follows the diff's width as it was last drawn: the wrapped all-files
+    /// view is laid out again for a new one, and a frame more is drawn while
+    /// the width settles, as the first frame has none yet.
+    pub(super) fn sync_wrap(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let width = |scroll: &UniformListScrollHandle| {
+            f32::from(scroll.0.borrow().base_handle.bounds().size.width)
+        };
+        let widths = (width(&self.stacked_scroll), width(&self.diff_scroll));
+        if widths != self.diff_width.get() {
+            self.diff_width.set(widths);
+            cx.on_next_frame(window, |_, _, cx| cx.notify());
+        }
+        let cols = self.wrap_cols_for(widths.0, true, window);
+        if cols != self.wrap_cols {
+            self.wrap_cols = cols;
+            self.restack();
+        }
+    }
+
+    /// The characters a side of the diff holds, in a list `width` wide, when
+    /// lines wrap.
+    pub(super) fn wrap_cols_for(
+        &self,
+        width: f32,
+        stacked: bool,
+        window: &Window,
+    ) -> Option<usize> {
+        if !self.wrap_lines || width <= 0. {
+            return None;
+        }
+        let cols = self.code_width(width, stacked) / code_char_width(window);
+        Some((cols.floor() as usize).max(1))
+    }
+
+    /// The room a side of the diff has for code in a list `width` wide: half
+    /// of it, less the line numbers and, where lines are picked for staging,
+    /// the bar marking them.
+    fn code_width(&self, width: f32, stacked: bool) -> f32 {
+        let bar = match stacked && self.worktree_split.is_some() && self.stash_view.is_none() {
+            true => 3.,
+            false => 0.,
+        };
+        ((width - bar - 1.) / 2. - diff_view::gutter_width()).max(0.)
+    }
+
+    /// Notes how far the code can scroll sideways: until the end of its
+    /// longest line, `widest` characters, shows.
+    pub(super) fn track_widest(&self, widest: usize, width: f32, stacked: bool, window: &Window) {
+        let room = self.code_width(width, stacked);
+        let max = match width > 0. {
+            true => (widest as f32 * code_char_width(window) - room + 8.).max(0.),
+            false => 0.,
+        };
+        self.diff_max_x.set(max);
+        self.diff_x.set(self.diff_x.get().min(max));
+    }
+
+    /// How a row's code fits: wrapped at `cols`, as its line `part`, or
+    /// scrolled sideways as far as the diff is.
+    pub(super) fn fit(&self, cols: Option<usize>, part: usize) -> diff_view::Fit {
+        match cols {
+            Some(cols) => diff_view::Fit::Wrap { cols, part },
+            None => diff_view::Fit::Scroll(self.diff_x.get()),
+        }
+    }
+
+    /// A sideways scroll, or ⇧ with a wheel, moves the diff's code while its
+    /// lines run on.
+    pub(super) fn scroll_diff_sideways(
+        &mut self,
+        event: &gpui::ScrollWheelEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.wrap_lines {
+            return;
+        }
+        let dx = f32::from(event.delta.pixel_delta(px(diff_view::row_height())).x);
+        let x = (self.diff_x.get() - dx).clamp(0., self.diff_max_x.get());
+        if x != self.diff_x.get() {
+            self.diff_x.set(x);
+            cx.notify();
+        }
     }
 
     fn toggle_section(&mut self, staged: bool, cx: &mut Context<Self>) {
@@ -220,7 +319,7 @@ impl RepoView {
         };
         match *item {
             StackItem::Header(file) => rows(file).is_some(),
-            StackItem::Row(file, index) => rows(file).is_some_and(|n| index < n),
+            StackItem::Row(file, index, _) => rows(file).is_some_and(|n| index < n),
             StackItem::Hunk(file, _, end) => rows(file).is_some_and(|n| end <= n),
             _ => true,
         }
@@ -351,7 +450,14 @@ impl RepoView {
                     .worktree_split
                     .map(|split| index >= split)
                     .filter(|_| self.stash_view.is_none());
-                let path = file.path().to_string();
+                // A renamed file goes by both its names, so the old one goes
+                // as the new one comes.
+                let paths: Vec<String> = file
+                    .old_path
+                    .iter()
+                    .chain(&file.new_path)
+                    .cloned()
+                    .collect();
                 div()
                     .w_full()
                     .h(px(2. * diff_view::row_height()))
@@ -378,13 +484,20 @@ impl RepoView {
                                 false => file.status.clone(),
                             }),
                     )
+                    // A renamed file: its old name, then the new one.
+                    .children(
+                        file.old_path
+                            .as_ref()
+                            .filter(|_| old_name(file).is_some())
+                            .map(|old| div().text_color(theme.secondary).child(format!("{old} →"))),
+                    )
                     .child(
                         div()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .child(file.path().to_string()),
                     )
                     .when(file.submodule, |header| {
-                        let open = path.clone();
+                        let open = file.path().to_string();
                         header.child(
                             button(SharedString::from(format!("open-sub-{index}")), "Open")
                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -457,25 +570,26 @@ impl RepoView {
                                 button(SharedString::from(format!("stage-{index}")), label)
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         cx.stop_propagation();
-                                        this.stage(staged, vec![path.clone()], cx)
+                                        this.stage(staged, paths.clone(), cx)
                                     })),
                             )
                     }))
                     .into_any_element()
             }
-            &StackItem::Row(file, index) => {
+            &StackItem::Row(file, index, part) => {
+                let fit = self.fit(self.wrap_cols, part);
                 let colors = self.diff_colors(Some(file), theme);
                 match &self.stacked_diffs[file] {
                     Ok(diff) if self.worktree_split.is_some() && self.stash_view.is_none() => {
                         // Lines are picked for staging: a bar marks the selection.
                         let selected = matches!(&self.line_selection, Some((f, rows)) if *f == file && rows.contains(&index));
                         let staged = self.worktree_split.is_some_and(|split| file >= split);
-                        let group = SharedString::from(format!("line-{file}-{index}"));
+                        let group = SharedString::from(format!("line-{file}-{index}-{part}"));
                         let changed = diff_view::is_change(&diff.rows[index]);
                         let label = if staged { "Unstage Line" } else { "Stage Line" };
                         let hovered = self.hovered_line.get() == Some((file, index));
                         div()
-                            .id(("line", file * 100_000 + index))
+                            .id(group.clone())
                             .group(group.clone())
                             .relative()
                             .flex()
@@ -492,9 +606,24 @@ impl RepoView {
                                 }
                                 cx.notify();
                             }))
+                            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                                this.select_line(file, index, event.modifiers(), cx)
+                            }))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .w(px(3.))
+                                    .h_full()
+                                    .when(selected, |bar| bar.bg(theme.accent)),
+                            )
+                            .child(
+                                diff_view::row(&diff.rows[index], theme, colors.as_deref(), fit)
+                                    .flex_1(),
+                            )
                             // A changed line offers its own buttons while the
-                            // mouse is over it; other lines carry nothing.
-                            .when(changed && hovered, |line| {
+                            // mouse is over it, drawn over its first line;
+                            // other lines carry nothing.
+                            .when(changed && hovered && part == 0, |line| {
                                 line.child(
                                     div()
                                         .absolute()
@@ -502,6 +631,11 @@ impl RepoView {
                                         .right(px(8.))
                                         .flex()
                                         .gap(px(6.))
+                                        // Solid under the buttons, whose hover
+                                        // tint is see-through, so the line's
+                                        // text never shows through them.
+                                        .rounded(px(4.))
+                                        .bg(theme.background)
                                         .when(!staged, |buttons| {
                                             buttons.child(
                                                 button(
@@ -544,23 +678,9 @@ impl RepoView {
                                         ),
                                 )
                             })
-                            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                                this.select_line(file, index, event.modifiers(), cx)
-                            }))
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .w(px(3.))
-                                    .h_full()
-                                    .when(selected, |bar| bar.bg(theme.accent)),
-                            )
-                            .child(
-                                diff_view::row(&diff.rows[index], theme, colors.as_deref())
-                                    .flex_1(),
-                            )
                             .into_any_element()
                     }
-                    Ok(diff) => diff_view::row(&diff.rows[index], theme, colors.as_deref())
+                    Ok(diff) => diff_view::row(&diff.rows[index], theme, colors.as_deref(), fit)
                         .into_any_element(),
                     Err(_) => row().into_any_element(),
                 }
@@ -644,8 +764,17 @@ pub(super) fn stack_items(
     split: Option<usize>,
     folded_sections: [bool; 2],
     many: bool,
+    cols: Option<usize>,
 ) -> Vec<StackItem> {
     let mut items = Vec::new();
+    // A row, as many times as it has lines when they wrap at `cols`.
+    let lines = |file: usize, row: usize| {
+        let parts = match (cols, &diffs[file]) {
+            (Some(cols), Ok(diff)) => diff_view::parts(&diff.rows[row], cols),
+            _ => 1,
+        };
+        (0..parts).map(move |part| StackItem::Row(file, row, part))
+    };
     // Why every file is folded, when there are too many to open at once.
     if many {
         items.push(StackItem::Note(format!(
@@ -685,21 +814,31 @@ pub(super) fn stack_items(
             items.push(StackItem::Note("No visible changes".to_string()));
         }
         if split.is_none() {
-            items.extend(hunks.into_iter().map(|row| match row {
-                Some(row) => StackItem::Row(file, row),
-                None => StackItem::Gap,
-            }));
+            for row in hunks {
+                match row {
+                    Some(row) => items.extend(lines(file, row)),
+                    None => items.push(StackItem::Gap),
+                }
+            }
             continue;
         }
         // A worktree file's hunks each get a header to stage them by.
         for hunk in hunks.split(Option::is_none).filter(|hunk| !hunk.is_empty()) {
             let rows: Vec<usize> = hunk.iter().flatten().copied().collect();
             items.push(StackItem::Hunk(file, rows[0], rows[rows.len() - 1] + 1));
-            items.extend(rows.into_iter().map(|row| StackItem::Row(file, row)));
+            items.extend(rows.into_iter().flat_map(|row| lines(file, row)));
         }
     }
     if sections.is_some_and(|split| split >= diffs.len()) {
         items.extend([StackItem::HeaderPad, StackItem::Section(true, 0)]);
     }
     items
+}
+
+/// The width of a character of code, in its monospaced font.
+fn code_char_width(window: &Window) -> f32 {
+    let text = window.text_system();
+    let font = text.resolve_font(&gpui::font(preferences::code_font()));
+    text.advance(font, px(preferences::code_size()), 'm')
+        .map_or(preferences::code_size() * 0.6, |size| f32::from(size.width))
 }

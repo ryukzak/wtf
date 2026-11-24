@@ -15,6 +15,12 @@ macOS only; needs Rust and Git. Structural diffs need [difftastic](https://difft
     scripts/build.sh
     open build/wtf.app --args /path/to/repo
 
+To install, build and copy the app to `/Applications`, replacing an installed copy:
+
+    scripts/install.sh
+
+Or into another folder, such as `~/Applications`: `scripts/install.sh ~/Applications`.
+
 Or, during development: `cargo run -p wtf -- /path/to/repo`.
 
 To open repositories from a terminal, choose **wtf › Install 'wtf' Command…**; then `wtf .` opens the one you are in. It goes in `~/.local/bin`, `~/bin` or `~/.bin` when your shell's PATH has one, otherwise in `/usr/local/bin`, which asks for your password.

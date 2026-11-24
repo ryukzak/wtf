@@ -7,8 +7,12 @@ use crate::{Attention, Commit, CoreError, Revision};
 
 /// Untracked files larger than this are not counted in diff sizes.
 const MAX_COUNTED_FILE: u64 = 1 << 20;
-/// At most this many commits show for a branch alone on its line.
+/// At most this many commits show before the oldest fork point, those in
+/// the attention window.
 const RECENT_COMMITS: usize = 50;
+/// At least this many commits show before the oldest fork point, however
+/// old, so a small repository shows whole.
+const MIN_CONTEXT: usize = 20;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum NodeKind {
@@ -204,12 +208,10 @@ pub fn build(
             octopus_base(repo_path, &tips)?
         }
     };
-    // When every tip sits on one line, as in a repository without branches,
-    // the fork point is a tip; the line's recent commits still make a node.
-    let base = match tips.iter().any(|tip| tip.id == base) {
-        true => recent_base(repo_path, &base, attention, now)?,
-        false => base,
-    };
+    // Some of the main line before the oldest fork point shows too: its
+    // recent commits, and a few more however old. When every tip sits on
+    // one line, as in a repository without branches, they are all there is.
+    let base = recent_base(repo_path, &base, attention, now)?;
     // Scrolling back asks for `history` more commits on the main line.
     let base = match history {
         0 => base,
@@ -550,17 +552,25 @@ fn recent_base(
     attention: &Attention,
     now: i64,
 ) -> Result<String, CoreError> {
-    let mut args = vec![
-        "rev-list".to_string(),
-        "--first-parent".to_string(),
-        format!("--max-count={RECENT_COMMITS}"),
-    ];
-    if let Some(since) = attention.since(now) {
-        args.push(format!("--since=@{since}"));
-    }
-    args.push(tip.to_string());
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let listed = git::run(repo_path, &args)?;
+    let line = |since: Option<i64>, count: usize| {
+        let mut args = vec![
+            "rev-list".to_string(),
+            "--first-parent".to_string(),
+            format!("--max-count={count}"),
+        ];
+        args.extend(since.map(|since| format!("--since=@{since}")));
+        args.push(tip.to_string());
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        git::run(repo_path, &args)
+    };
+    // The attention window's commits, or the few always shown when it holds
+    // fewer.
+    let recent = line(attention.since(now), RECENT_COMMITS)?;
+    let few = line(None, MIN_CONTEXT)?;
+    let listed = match recent.lines().count() < few.lines().count() {
+        true => few,
+        false => recent,
+    };
     let oldest = listed.lines().last().unwrap_or(tip);
     // `^@` names the parents, none for the root, without failing.
     let parents = git::run(repo_path, &["rev-parse", &format!("{oldest}^@")])?;
@@ -1093,14 +1103,18 @@ mod tests {
         let fixture = forked();
         let graph = fixture.graph();
 
+        // Before the fork, the main line shows to its first commit.
         let history = &graph.nodes[0];
         assert_eq!(history.kind, NodeKind::History);
-        assert_eq!(summaries(history), vec!["c2"]);
+        assert_eq!(summaries(history), vec!["c1"]);
 
         let (feature_ix, feature) = node(&graph, "feature");
         assert_eq!(feature.kind, NodeKind::Commits);
         assert_eq!(summaries(feature), vec!["f1", "f2"]);
-        assert_eq!(feature.parents, vec![0]);
+        // The fork point, c2, ends the run before it.
+        let fork = &graph.nodes[feature.parents[0]];
+        assert_eq!(summaries(fork), vec!["c2"]);
+        assert_eq!(fork.parents, vec![0]);
 
         // The main worktree is on master, so master ends in its uncommitted node.
         let (_, worktree) = node(&graph, "master");
@@ -1165,7 +1179,7 @@ mod tests {
         assert_eq!(tip, feature.tip);
         let commits = crate::range_commits(&fixture.path(), base.as_deref(), &tip).unwrap();
         let summaries: Vec<&str> = commits.iter().map(|c| c.summary.as_str()).collect();
-        assert_eq!(summaries, vec!["f2", "f1", "c2"]);
+        assert_eq!(summaries, vec!["f2", "f1", "c2", "c1"]);
 
         assert_eq!(graph.range(&[feature_ix, main_ix]), None);
     }
@@ -1249,17 +1263,20 @@ mod tests {
     #[test]
     fn scrolling_back_brings_older_commits() {
         let fixture = Fixture::new();
-        for n in 1..=5 {
+        for n in 1..=60 {
             fixture.commit(".", "a.txt", &format!("{n}\n"), &format!("c{n}"));
         }
         fixture.git(".", &["checkout", "-q", "-b", "feature", "HEAD~1"]);
         fixture.commit(".", "b.txt", "x\n", "f1");
         fixture.git(".", &["checkout", "-q", "master"]);
         let graph = fixture.graph();
-        assert_eq!(graph.older, 3, "c1..c3 lie before the fork at c4");
+        assert_eq!(
+            graph.older, 8,
+            "50 recent commits show from the fork at c59; c1..c8 lie before c9"
+        );
         let more = crate::workflow_graph(&fixture.path(), &Attention::default(), true, 2).unwrap();
-        assert_eq!(more.older, 1);
-        let all = crate::workflow_graph(&fixture.path(), &Attention::default(), true, 10).unwrap();
+        assert_eq!(more.older, 6);
+        let all = crate::workflow_graph(&fixture.path(), &Attention::default(), true, 100).unwrap();
         assert_eq!(all.older, 0);
     }
 
@@ -1662,6 +1679,62 @@ mod tests {
         assert!(!pages.shown);
         assert!(pages.unrelated);
         assert!(graph.nodes.iter().any(|node| node.refs == ["feature"]));
+    }
+
+    #[test]
+    fn a_file_moved_on_disk_is_a_rename() {
+        let fixture = Fixture::new();
+        fixture.commit(".", "old.txt", "one\ntwo\nthree\n", "c1");
+        let path = fixture.path();
+        std::fs::rename(
+            std::path::Path::new(&path).join("old.txt"),
+            std::path::Path::new(&path).join("new.txt"),
+        )
+        .unwrap();
+        fixture.write(".", "other.txt", "x\n");
+        let index = fixture.git(".", &["ls-files", "--stage"]);
+
+        let status = crate::worktree_status(&path).unwrap();
+        let mut found: Vec<(String, Option<String>, Option<String>)> = status
+            .unstaged
+            .iter()
+            .map(|file| {
+                (
+                    file.status.clone(),
+                    file.old_path.clone(),
+                    file.new_path.clone(),
+                )
+            })
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                ("A".into(), None, Some("other.txt".into())),
+                ("R".into(), Some("old.txt".into()), Some("new.txt".into())),
+            ]
+        );
+        assert_eq!(
+            fixture.git(".", &["ls-files", "--stage"]),
+            index,
+            "index untouched"
+        );
+
+        // Staged by both names, it is a staged rename; discarded, it moves back.
+        crate::stage(&path, &["old.txt".into(), "new.txt".into()]).unwrap();
+        let status = crate::worktree_status(&path).unwrap();
+        assert_eq!(status.staged.len(), 1);
+        assert_eq!(status.staged[0].status, "R");
+        crate::unstage(&path, &["old.txt".into(), "new.txt".into()]).unwrap();
+        let renamed = crate::worktree_status(&path)
+            .unwrap()
+            .unstaged
+            .into_iter()
+            .find(|file| file.status == "R")
+            .unwrap();
+        crate::discard(&path, &[renamed]).unwrap();
+        let root = std::path::Path::new(&path);
+        assert!(root.join("old.txt").exists() && !root.join("new.txt").exists());
     }
 
     #[test]
