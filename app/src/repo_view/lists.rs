@@ -186,16 +186,9 @@ impl RepoView {
                     continue;
                 }
             }
-            // A merge folds what it brought in under it: folded, unless
-            // the selection is there.
+            // A merge folds what it brought in under it, open at first.
             let side = sides.get(&index);
-            let side_covered =
-                side.is_some_and(|side| side.iter().any(|node| self.selected_nodes.contains(node)));
-            let side_folded = self
-                .folds
-                .get(&side_key(node))
-                .copied()
-                .unwrap_or(!side_covered);
+            let side_folded = self.folds.get(&side_key(node)).copied().unwrap_or(false);
             rows.extend((0..node.commits.len()).rev().map(|at| LineRow::Commit {
                 node: index,
                 at,
@@ -205,8 +198,9 @@ impl RepoView {
                 merged: (at == 0 && side.is_some()).then_some(side_folded),
             }));
             if let Some(side) = side.filter(|_| !side_folded) {
+                // A selected merge's diff holds what it merged.
                 for &branch in side {
-                    let covered = self.selected_nodes.contains(&branch);
+                    let covered = covered || self.selected_nodes.contains(&branch);
                     rows.extend(
                         (0..nodes[branch].commits.len())
                             .rev()
@@ -327,7 +321,18 @@ impl RepoView {
                         item.pl(px(LIST_INDENT + SIDE_INDENT - if covered { 4. } else { 0. }))
                     }
                     (false, false) if merged.is_some() => indented(item, covered),
-                    (false, true) => guide(indented(item, covered), covered, false, at == 0, theme),
+                    (false, true) => guide(
+                        indented(item, covered),
+                        covered,
+                        false,
+                        // A merge's own chevron ends the line above it.
+                        match (at == 0, merged.is_some()) {
+                            (true, true) => Some(LIST_ITEM_HEIGHT - 6.),
+                            (true, false) => Some(8.),
+                            _ => None,
+                        },
+                        theme,
+                    ),
                     (false, false) => item,
                 };
                 let fold = merged.map(|folded| {
@@ -431,7 +436,7 @@ impl RepoView {
         };
         let item = match folded {
             true => item,
-            false => guide(item, covered, true, false, theme),
+            false => guide(item, covered, true, None, theme),
         };
         item.on_click(cx.listener(move |this, _, _, cx| {
             match this.selected_nodes == [index] {
@@ -546,6 +551,7 @@ impl RepoView {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let merge = fold.is_some();
         let detail = match &fold {
             Some((_, _, count)) => format!("{} · +{count} merged", commit_detail(commit, now)),
             None => commit_detail(commit, now),
@@ -588,6 +594,15 @@ impl RepoView {
                     .items_center()
                     .min_w_0()
                     .children(chevron_mark)
+                    .when(merge, |line| {
+                        line.child(
+                            div()
+                                .flex_none()
+                                .mr(px(4.))
+                                .text_color(theme.secondary)
+                                .child("⑂"),
+                        )
+                    })
                     .child(
                         div()
                             .flex_1()
@@ -891,7 +906,7 @@ fn guide(
     item: Stateful<gpui::Div>,
     covered: bool,
     header: bool,
-    last: bool,
+    end: Option<f32>,
     theme: &Theme,
 ) -> Stateful<gpui::Div> {
     // A selected bar has its blue edge to show where it ends.
@@ -900,7 +915,8 @@ fn guide(
     }
     let left = LIST_INDENT - 9.;
     let top = if header { 26. } else { 0. };
-    let bottom = if last { 8. } else { 0. };
+    // On the last row, how far short of its bottom the line stops.
+    let bottom = end.unwrap_or(0.);
     item.relative().child(
         div()
             .absolute()

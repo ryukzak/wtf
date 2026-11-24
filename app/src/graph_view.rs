@@ -1055,7 +1055,10 @@ pub fn render(
     let xs: Vec<(f32, f32)> = layout.nodes.iter().map(|node| (node.0, node.1)).collect();
     for (i, node) in graph.nodes.iter().enumerate() {
         let (start, end, y) = layout.nodes[i];
-        let is_selected = selected.contains(&i);
+        // A commit picked in the list can sit off the selected nodes, on a
+        // branch a selected merge brought in: its node shows it as picked.
+        let is_selected = selected.contains(&i)
+            || (!picked.is_empty() && node.commits.iter().any(|c| picked.contains(&c.id)));
         let color = color(node);
         let worktree = node.kind == NodeKind::Uncommitted;
         let dirty = (node.added, node.removed) != (0, 0);
