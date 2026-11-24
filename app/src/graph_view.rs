@@ -436,6 +436,8 @@ pub fn layout(graph: &WorkflowGraph, order: WorktreeOrder) -> Layout {
     // branches first, then branches with names; other lanes come after.
     let mut touches_main = vec![false; lane_count];
     let mut named = vec![false; lane_count];
+    // Lanes that come back into the main lane, merged.
+    let mut returns = vec![false; lane_count];
     for (i, node) in graph.nodes.iter().enumerate() {
         if node.kind == NodeKind::Uncommitted {
             match detached.contains(&i) {
@@ -453,7 +455,10 @@ pub fn layout(graph: &WorkflowGraph, order: WorktreeOrder) -> Layout {
         for &p in &node.parents {
             match (lane_of[i], lane_of[p]) {
                 (0, 0) => {}
-                (0, lane) => touches_main[lane] = true,
+                (0, lane) => {
+                    touches_main[lane] = true;
+                    returns[lane] = true;
+                }
                 (lane, 0) => touches_main[lane] = true,
                 _ => {}
             }
@@ -510,6 +515,27 @@ pub fn layout(graph: &WorkflowGraph, order: WorktreeOrder) -> Layout {
         (false, true, true) => 2,
         (false, false, _) => 3,
     };
+    // A lane's name, by the refs at its newest node, to keep lanes the rest
+    // can't tell apart in a set order.
+    let mut names: Vec<Option<(i64, &str)>> = vec![None; lane_count];
+    for (i, node) in graph.nodes.iter().enumerate() {
+        if node.kind == NodeKind::Uncommitted {
+            continue;
+        }
+        if let Some(name) = node.refs.first() {
+            let lane = lane_of[i];
+            if names[lane].is_none_or(|(time, _)| node.last_time > time) {
+                names[lane] = Some((node.last_time, name.as_str()));
+            }
+        }
+    }
+    // Lanes alike in all else: the latest work first, then by name.
+    let tie = |a: usize, b: usize| {
+        let last = |lane: usize| times[lane].map_or(0, |(_, last)| last);
+        last(b)
+            .cmp(&last(a))
+            .then_with(|| names[a].map(|(_, n)| n).cmp(&names[b].map(|(_, n)| n)))
+    };
     lanes.sort_by(|&(a, a_span), &(b, b_span)| {
         group(a)
             .cmp(&group(b))
@@ -524,12 +550,17 @@ pub fn layout(graph: &WorkflowGraph, order: WorktreeOrder) -> Layout {
                 // Off the main row and back: the one that ends first nearest
                 // it, so a lane inside another's run crosses it neither going
                 // out nor coming back.
-                (0 | 2, _) => a_span
+                (0 | 2, _) if returns[a] || returns[b] => a_span
                     .1
                     .total_cmp(&b_span.1)
                     .then_with(|| a_span.0.total_cmp(&b_span.0)),
+                // Off it for good: where it ends crosses nothing. One that
+                // starts further left goes further down, its way down
+                // passing no row above.
+                (0 | 2, _) => b_span.0.total_cmp(&a_span.0),
                 _ => a_span.0.total_cmp(&b_span.0),
             })
+            .then_with(|| tie(a, b))
     });
 
     // Each lane takes the first row with a free stretch for it; a stair,
