@@ -736,21 +736,38 @@ pub fn repository_path(path: &str) -> String {
 }
 
 /// Opens paths the system hands the app, such as folders dropped on its Dock
-/// icon: in the front window, or in a new one when there is none.
+/// icon: in the window that has it open already, else in the front window,
+/// or in a new one when there is none. The window comes to the front, on
+/// whichever Space it is.
 pub fn open_paths(paths: Vec<String>, cx: &mut App) {
     let roots: Vec<String> = paths.iter().map(|path| repository_path(path)).collect();
     let front = cx.active_window().or_else(|| cx.windows().first().copied());
-    let opened = front.is_some_and(|window| {
-        window
-            .update(cx, |_, window, cx| {
-                for path in &roots {
-                    window.dispatch_action(Box::new(OpenPath { path: path.clone() }), cx);
-                }
+    let mut missing = Vec::new();
+    for path in roots {
+        let showing = cx.windows().into_iter().find(|window| {
+            window.downcast::<Workspace>().is_some_and(|workspace| {
+                workspace.read(cx).is_ok_and(|workspace| {
+                    workspace
+                        .tabs
+                        .iter()
+                        .any(|tab| tab.read(cx).repo_path() == Some(path.as_str()))
+                })
             })
-            .is_ok()
-    });
-    if !opened {
-        open_window(roots, cx);
+        });
+        let opened = showing.or(front).is_some_and(|window| {
+            window
+                .update(cx, |_, window, cx| {
+                    window.dispatch_action(Box::new(OpenPath { path: path.clone() }), cx);
+                    window.activate_window();
+                })
+                .is_ok()
+        });
+        if !opened {
+            missing.push(path);
+        }
+    }
+    if !missing.is_empty() {
+        open_window(missing, cx);
     }
 }
 
