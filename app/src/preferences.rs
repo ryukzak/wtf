@@ -795,65 +795,8 @@ fn file() -> PathBuf {
 
 /// Applies the saved preferences; missing or unreadable ones keep defaults.
 pub fn load() {
-    let text = fs::read_to_string(file()).unwrap_or_default();
-    let settings = parse(&text);
+    let settings = parse(&fs::read_to_string(file()).unwrap_or_default());
     *SETTINGS.write().unwrap_or_else(|error| error.into_inner()) = settings;
-    // Settings once the app's, now every project's: set ones go to the
-    // global git config, where it has none, and leave the file.
-    let moved = moved_settings(&text);
-    for (key, values) in &moved {
-        let config = wtf_core::ConfigScope::Global;
-        if wtf_core::project_values(config, key).is_empty() {
-            let values: Vec<&str> = values.iter().map(String::as_str).collect();
-            wtf_core::set_project_values(config, key, &values).ok();
-        }
-    }
-    if !moved.is_empty() {
-        save();
-    }
-}
-
-/// Settings the file kept that projects keep now, with their keys in git
-/// config: those set to other than the built-in values. Pull options are
-/// git's own now, and prune too: those are left to git config.
-fn moved_settings(text: &str) -> Vec<(&'static str, Vec<String>)> {
-    let changed = |value: &str, default: &str| {
-        (value.trim() != default).then(|| vec![value.trim().to_string()])
-    };
-    text.lines()
-        .filter_map(|line| line.split_once('='))
-        .filter_map(|(key, value)| match key.trim() {
-            "summary_prompt" => Some(("wtf.summaryTemplate", vec![unescape(value)])),
-            "message_prompt" => Some(("wtf.messageTemplate", vec![unescape(value)])),
-            "text_only" => Some((
-                "wtf.textDiff",
-                unescape(value)
-                    .lines()
-                    .map(str::trim)
-                    .filter(|line| !line.is_empty())
-                    .map(str::to_string)
-                    .collect(),
-            )),
-            "idle_days" => Some((
-                "wtf.idleDays",
-                changed(value, &DEFAULT_IDLE_DAYS.to_string())?,
-            )),
-            "fetch_minutes" => Some((
-                "wtf.fetchMinutes",
-                changed(value, &DEFAULT_FETCH_MINUTES.to_string())?,
-            )),
-            "structural_max_kb" => Some((
-                "wtf.textDiffAboveKb",
-                changed(value, &DEFAULT_TEXT_DIFF_ABOVE.to_string())?,
-            )),
-            "push_option" => {
-                let option = crate::sync::PUSH.get(value.trim().parse::<usize>().ok()?)?;
-                let label = crate::sync::label(true, option);
-                Some(("wtf.push", changed(&label, "push")?))
-            }
-            _ => None,
-        })
-        .collect()
 }
 
 /// Reads `key=value` lines; unknown keys and bad values keep defaults.
@@ -3099,23 +3042,6 @@ mod tests {
         };
         let text = format(&settings);
         assert_eq!(parse(&text), settings);
-    }
-
-    #[test]
-    fn settings_projects_keep_now_leave_the_file() {
-        let text =
-            "idle_days=14\nsummary_prompt=One\\ntwo\ntext_only=*.lock\\n*.snap\nidle_days=30\n";
-        assert_eq!(
-            moved_settings(text),
-            [
-                ("wtf.summaryTemplate", vec!["One\ntwo".to_string()]),
-                (
-                    "wtf.textDiff",
-                    vec!["*.lock".to_string(), "*.snap".to_string()]
-                ),
-                ("wtf.idleDays", vec!["30".to_string()]),
-            ]
-        );
     }
 
     #[test]

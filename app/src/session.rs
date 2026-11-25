@@ -70,7 +70,7 @@ pub fn placed(bounds: Option<WindowBounds>, cx: &App) -> Option<WindowBounds> {
 
 /// A line a window: its active tab, where it was as `@x,y,w,h,state` with
 /// state 0 windowed, 1 maximized, 2 full screen, then its repositories,
-/// tab-separated. Lines without the place, from before, still read.
+/// tab-separated. A window with no place known leaves it out.
 fn format(windows: &[Saved]) -> String {
     windows
         .iter()
