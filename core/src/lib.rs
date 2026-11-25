@@ -4,6 +4,7 @@ mod console;
 mod difft;
 mod git;
 mod patch;
+mod project;
 mod submodule;
 mod summary;
 mod text;
@@ -16,12 +17,13 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use attention::{Attention, Scope};
-pub use channels::{add_channel, glob, is_channel, remove_channel};
+pub use channels::{add_channel, channel_patterns, glob, is_channel, remove_channel};
 pub use console::{CommandKind, LogEntry, log_since};
 pub use git::{
     changed_files, commit, discard, discard_lines, head_message, push, range_commits, reword,
     stage, stage_lines, stash_files, unstage, worktree_status,
 };
+pub use project::{ConfigScope, project_value, project_values, set_project_values};
 pub use tools::{ToolCheck, check_tools};
 pub use workflow::{Branch, GraphNode, NodeKind, WorkflowGraph};
 
@@ -187,30 +189,37 @@ pub fn workflow_graph(
     console::as_refresh(|| workflow::build(repo_path, attention, combine, history, now))
 }
 
-pub use summary::{MESSAGE_PROMPT, SUMMARY_PROMPT, Summary};
+pub use summary::{MESSAGE_PROMPT, Request, SUMMARY_PROMPT, Sent, Summary, last_sent};
 
 /// A commit message for what a worktree has staged, written by the model
 /// from the staged files and a short diff of them.
 pub fn write_commit_message(
     worktree: &str,
-    prompt: &str,
+    template: &str,
     varied: bool,
 ) -> Result<String, CoreError> {
-    let stat = git::run(worktree, &["diff", "--cached", "--stat=100"])?;
-    let diff = git::run(worktree, &["diff", "--cached", "-U1", "--no-color"])?;
-    // The latest subjects show the repository's style; a repository with no
-    // commits yet has none.
-    let subjects = git::run(
-        worktree,
-        &["log", "-n", "5", "--no-merges", "--format=%s", "HEAD"],
+    let (instructions, input) = summary::render(template, |name, count| match name {
+        "files" => {
+            Some(git::run(worktree, &["diff", "--cached", "--stat=100"]).unwrap_or_default())
+        }
+        "diff" => {
+            Some(git::run(worktree, &["diff", "--cached", "-U1", "--no-color"]).unwrap_or_default())
+        }
+        "examples" => Some(summary::style_examples(&subjects(worktree, "HEAD", count))),
+        _ => None,
+    });
+    summary::commit_message(&instructions, &input, varied)
+}
+
+/// The subjects of the latest `count` commits at `rev`, examples of the
+/// repository's style; a repository with no commits yet has none.
+fn subjects(dir: &str, rev: &str, count: Option<usize>) -> String {
+    let count = count.unwrap_or(summary::EXAMPLES).to_string();
+    git::run(
+        dir,
+        &["log", "-n", &count, "--no-merges", "--format=%s", rev],
     )
-    .unwrap_or_default();
-    let examples = summary::style_examples(&subjects);
-    summary::commit_message(
-        &format!("Files changed:\n{stat}\nDiff:\n{diff}"),
-        &format!("{examples}{prompt}"),
-        varied,
-    )
+    .unwrap_or_default()
 }
 
 /// How many files changed from `base` to `tip`, and lines added and
@@ -230,10 +239,16 @@ pub fn summarize_commits(
     commits: &[Commit],
     base: Option<&str>,
     tip: &Revision,
-    prompt: &str,
+    template: &str,
 ) -> Result<Summary, CoreError> {
-    let files = git::diff_stat(repo_path, base, tip)?;
-    summary::summarize(commits, &files, prompt)
+    let (instructions, input) = summary::render(template, |name, count| match name {
+        "commits" => Some(summary::commits_text(commits)),
+        "files" => Some(git::diff_stat(repo_path, base, tip).unwrap_or_default()),
+        "diff" => Some(git::diff_text(repo_path, base, tip).unwrap_or_default()),
+        "examples" => Some(summary::style_examples(&subjects(repo_path, "HEAD", count))),
+        _ => None,
+    });
+    summary::summarize(&instructions, &input)
 }
 
 /// A stash: its name as git lists it, its commit, the commit it was made
@@ -272,10 +287,10 @@ pub struct WorktreeStatus {
 
 /// Fetches every remote of a repository. A background fetch is logged as
 /// a refresh command, hidden with them.
-pub fn fetch(repo: &str, prune: bool, background: bool) -> Result<(), CoreError> {
+pub fn fetch(repo: &str, background: bool) -> Result<(), CoreError> {
     match background {
-        true => console::as_refresh(|| git::fetch(repo, prune)),
-        false => git::fetch(repo, prune),
+        true => console::as_refresh(|| git::fetch(repo)),
+        false => git::fetch(repo),
     }
 }
 

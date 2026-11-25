@@ -339,7 +339,6 @@ impl RepoView {
                 );
             }
         }
-        body = body.child(self.channels_view(theme, cx));
 
         let focused = self.attention_search_focus.is_focused(window);
         let content = div()
@@ -398,104 +397,6 @@ impl RepoView {
             )
             .child(body);
         content.into_any_element()
-    }
-
-    /// The Channels group: the branches finished work goes to. The main
-    /// branch always, then the repository's patterns, each with how many
-    /// branches it names; one adds or goes from here, kept in git config.
-    fn channels_view(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
-        let section = Section::Channels;
-        let collapsed = self.collapsed_sections.contains(&section);
-        let patterns = self.graph.channels.clone();
-        let row = |id: SharedString| {
-            div()
-                .id(id)
-                .flex()
-                .items_center()
-                .gap(px(6.))
-                .h(px(FILE_ROW_HEIGHT))
-                .pl(px(8. + 14.))
-                .pr(px(8.))
-                .whitespace_nowrap()
-        };
-        let mut group = div().flex().flex_col().child(
-            div()
-                .id(("attention-section", section as usize))
-                .flex()
-                .items_center()
-                .gap(px(6.))
-                .h(px(FILE_ROW_HEIGHT))
-                .mt(px(6.))
-                .pl(px(8.))
-                .pr(px(8.))
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .cursor_pointer()
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    if !this.collapsed_sections.remove(&section) {
-                        this.collapsed_sections.insert(section);
-                    }
-                    cx.notify();
-                }))
-                .child(panel_chevron(!collapsed, theme))
-                .child(div().flex_1().child("CHANNELS"))
-                .child(
-                    div()
-                        .text_color(theme.secondary)
-                        .child((patterns.len() + 1).to_string()),
-                ),
-        );
-        if collapsed {
-            return group;
-        }
-        group = group.child(
-            row("channel-main".into())
-                .child(div().flex_1().truncate().child(self.graph.main.clone()))
-                .child(div().text_color(theme.secondary).child("default")),
-        );
-        for pattern in patterns {
-            let count = self.channel_matches(&pattern).len();
-            let remove = pattern.clone();
-            group = group.child(
-                row(SharedString::from(format!("channel-{pattern}")))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .font_family(preferences::code_font())
-                            .child(pattern.clone()),
-                    )
-                    .child(div().text_color(theme.secondary).child(match count {
-                        1 => "1 branch".to_string(),
-                        n => format!("{n} branches"),
-                    }))
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("channel-remove-{pattern}")))
-                            .px(px(3.))
-                            .rounded(px(3.))
-                            .text_color(theme.secondary)
-                            .cursor_pointer()
-                            .hover(|button| button.bg(theme.selection))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.remove_channel(&remove, cx)
-                            }))
-                            .child("✕"),
-                    ),
-            );
-        }
-        group.child(
-            row("channel-add".into())
-                .text_color(theme.accent)
-                .cursor_pointer()
-                .hover(|row| row.bg(theme.selection))
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.show_prompt(PromptKind::AddChannel, String::new(), window);
-                    cx.notify();
-                }))
-                .child("+ Add pattern…"),
-        )
     }
 
     /// A branch in the sidebar tree, `name` short for it under its folder,
@@ -636,7 +537,7 @@ impl RepoView {
                 Section::Worktrees => branch.worktree,
                 Section::Local => !branch.worktree && !branch.remote,
                 Section::Remote => branch.remote,
-                Section::Tags | Section::Stashes | Section::Channels => false,
+                Section::Tags | Section::Stashes => false,
             })
             .collect()
     }
@@ -738,7 +639,6 @@ impl RepoView {
                 Section::Remote => attention.remotes = !attention.remotes,
                 Section::Tags => attention.tags = !attention.tags,
                 Section::Stashes => attention.stashes = !attention.stashes,
-                Section::Channels => {}
             },
             cx,
         );

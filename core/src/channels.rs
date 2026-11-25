@@ -8,10 +8,11 @@ use crate::{CoreError, git};
 
 const KEY: &str = "wtf.channel";
 
-/// The repository's channel patterns, in the order they were added.
+/// The channel patterns `repo_path` goes by: the global ones, then its
+/// own, in the order they were added.
 pub fn channel_patterns(repo_path: &str) -> Vec<String> {
     // Without any, git exits with an error: none is no error here.
-    git::run(repo_path, &["config", "--local", "--get-all", KEY])
+    git::run(repo_path, &["config", "--get-all", KEY])
         .map(|text| {
             text.lines()
                 .map(str::trim)

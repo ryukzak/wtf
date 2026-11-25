@@ -386,7 +386,11 @@ impl RepoView {
         // A stash goes by its branch: merged or gone, its work is likely in;
         // else by its age.
         let now = now_seconds();
-        let idle = i64::from(preferences::idle_days()) * 86_400;
+        let idle = i64::from(
+            self.graph
+                .idle_days
+                .unwrap_or(preferences::DEFAULT_IDLE_DAYS),
+        ) * 86_400;
         items.extend(self.graph.stashes.iter().map(|stash| {
             let status = match stash.branch.as_deref().map(status_of) {
                 Some(status @ (PruneStatus::Merged | PruneStatus::Gone)) => status,
@@ -760,6 +764,16 @@ impl RepoView {
                         .flex()
                         .justify_end()
                         .gap(px(8.))
+                        // What counts as merged: the repository's channels.
+                        .child(button("prune-channels", "Channels…".to_string()).on_click(
+                            cx.listener(|this, _, window, cx| {
+                                this.close_prune(window, cx);
+                                if let Some(repo) = this.repo_path.clone() {
+                                    preferences::open_channels(repo, cx);
+                                }
+                            }),
+                        ))
+                        .child(div().flex_1())
                         .child(button("prune-cancel", "Cancel".to_string()).on_click(
                             cx.listener(|this, _, window, cx| this.close_prune(window, cx)),
                         ))
@@ -1246,7 +1260,6 @@ impl RepoView {
             PromptKind::WorktreeFor(branch) => {
                 self.run_in_terminal(popups::add_worktree(&repo, &input, &branch), window, cx);
             }
-            PromptKind::AddChannel => self.add_channel(&input, cx),
             PromptKind::NewBranch {
                 commit,
                 worktree: false,
@@ -1470,34 +1483,8 @@ impl RepoView {
                 "New worktree at {} on a new branch named",
                 popups::short_hash(commit)
             ),
-            PromptKind::AddChannel => {
-                "Channel branches: a name, or a pattern such as v[0-9][0-9][0-9][0-9]".to_string()
-            }
         };
-        // A pattern shows what it would name before it is added, so one too
-        // loose shows at once.
-        let hint = match &prompt.kind {
-            PromptKind::AddChannel => {
-                let input = prompt.field.text().trim();
-                let names = self.channel_matches(input);
-                let shown: Vec<&str> = names.iter().take(8).map(String::as_str).collect();
-                match (input.is_empty(), names.len()) {
-                    (true, _) => "* matches any run of characters, ? one, [0-9] one of a set. \
-                                  Enter to add · Esc to cancel"
-                        .to_string(),
-                    (false, 0) => {
-                        "Matches no branch yet · Enter to add · Esc to cancel".to_string()
-                    }
-                    (false, n) => format!(
-                        "Matches {n} branch{}: {}{} · Enter to add",
-                        if n == 1 { "" } else { "es" },
-                        shown.join(", "),
-                        if n > shown.len() { ", …" } else { "" }
-                    ),
-                }
-            }
-            _ => "Enter to run in the terminal · Esc to cancel".to_string(),
-        };
+        let hint = "Enter to run in the terminal · Esc to cancel";
         let panel = div()
             .flex()
             .flex_col()

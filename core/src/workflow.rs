@@ -78,9 +78,12 @@ pub struct WorkflowGraph {
     pub main_worktree: Option<String>,
     /// Which nodes the main branch's history holds, by node.
     pub on_main: Vec<bool>,
-    /// The repository's channel patterns, as its git config keeps them;
-    /// the main branch is a channel besides.
+    /// The channel patterns, as git config keeps them, global and the
+    /// repository's own; the main branch is a channel besides.
     pub channels: Vec<String>,
+    /// Days without a commit after which a branch is idle, when git config
+    /// sets them.
+    pub idle_days: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -473,6 +476,7 @@ pub fn build(
         tags,
         stashes,
         channels,
+        idle_days: crate::project::idle_days(repo_path),
     };
     graph.on_main = graph.main_history();
     Ok(graph)

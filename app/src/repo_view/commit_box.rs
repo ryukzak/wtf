@@ -83,9 +83,10 @@ impl RepoView {
         self.draft.suggest_key = Some(key);
         self.draft.writing_message = true;
         let varied = std::mem::take(&mut self.draft.rewrite);
+        let repo = self.repo_path.clone().unwrap_or_else(|| path.clone());
         self.draft.suggest_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(SUGGEST_DELAY).await;
-            let prompt = preferences::message_prompt();
+            let prompt = preferences::message_template(&repo);
             let write = cx
                 .background_executor()
                 .spawn(async move { wtf_core::write_commit_message(&path, &prompt, varied) });

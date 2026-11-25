@@ -26,14 +26,11 @@ pub fn run<S: AsRef<OsStr>>(dir: &str, args: &[S]) -> Result<String, CoreError> 
     run_with_env(dir, args, None, &[])
 }
 
-/// Fetches every remote, dropping remote branches deleted there when
-/// `prune`. Git asks no password: with no terminal to answer it, a fetch
-/// that needs one fails rather than waits.
-pub fn fetch(repo: &str, prune: bool) -> Result<(), CoreError> {
-    let mut args = vec!["fetch", "--all", "--quiet"];
-    if prune {
-        args.push("--prune");
-    }
+/// Fetches every remote, dropping remote branches deleted there as git's
+/// `fetch.prune` says. Git asks no password: with no terminal to answer
+/// it, a fetch that needs one fails rather than waits.
+pub fn fetch(repo: &str) -> Result<(), CoreError> {
+    let args = ["fetch", "--all", "--quiet"];
     run_with_env(repo, &args, None, &[("GIT_TERMINAL_PROMPT", "0")]).map(|_| ())
 }
 
@@ -590,6 +587,17 @@ pub fn diff_stat(repo_path: &str, base: Option<&str>, tip: &Revision) -> Result<
     };
     let (dir, rev) = locate(repo_path, tip);
     run(dir, &["diff", "--stat=100", &base, rev])
+}
+
+/// The changes from `base` (`None` is the empty tree) to `tip`, with a line
+/// of context.
+pub fn diff_text(repo_path: &str, base: Option<&str>, tip: &Revision) -> Result<String, CoreError> {
+    let base = match base {
+        Some(base) => base.to_string(),
+        None => empty_tree(repo_path)?,
+    };
+    let (dir, rev) = locate(repo_path, tip);
+    run(dir, &["diff", "-U1", "--no-color", &base, rev])
 }
 
 /// How many files changed from `base` (`None` is the empty tree) to `tip`,

@@ -66,7 +66,9 @@ fn main() {
         // run finds out whether this Mac can summarize commits.
         tools::check_at_launch(cx);
         cx.on_action(|_: &Quit, cx| cx.quit());
-        cx.on_action(|_: &OpenSettings, cx| preferences::open(cx));
+        // Once the window the keys went to is done with them, so its tabs can
+        // be read for the repository in front.
+        cx.on_action(|_: &OpenSettings, cx| cx.defer(preferences::open));
         cx.on_action(|_: &About, cx| about::open(cx));
         cx.on_action(|_: &CheckTools, cx| tools::open(cx));
         cx.on_action(|_: &InstallCommand, cx| cli::install(cx));

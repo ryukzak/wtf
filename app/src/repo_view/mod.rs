@@ -289,7 +289,6 @@ enum Section {
     Remote,
     Tags,
     Stashes,
-    Channels,
 }
 
 /// A dropdown of the attention sidebar.
@@ -318,8 +317,6 @@ enum PromptKind {
     NewBranch { commit: String, worktree: bool },
     /// The branch of a new worktree for a stash, at the commit it was made on.
     StashWorktree { stash: String, base: String },
-    /// A glob pattern naming channel branches.
-    AddChannel,
 }
 
 /// Code colors are cached by path, appearance and all-files entry.
@@ -328,7 +325,13 @@ type ColorKey = (String, bool, Option<usize>);
 /// What a graph's layout depends on besides the graph: the worktree order,
 /// the graph's look, the settings that change label widths, and the hour,
 /// as branches' idle days grow.
-type LayoutKey = (WorktreeOrder, preferences::GraphStyle, u32, bool, i64);
+type LayoutKey = (
+    WorktreeOrder,
+    preferences::GraphStyle,
+    Option<u32>,
+    bool,
+    i64,
+);
 
 pub struct RepoView {
     /// Keeps menu actions reaching the view when nothing else has focus.
@@ -923,10 +926,13 @@ impl RepoView {
         }));
     }
 
-    /// Fetches in the background as often as Settings ask, first when the
-    /// repository opens.
+    /// Fetches in the background as often as the project's settings ask,
+    /// first when the repository opens.
     fn fetch_when_due(&mut self, cx: &mut Context<Self>) {
-        let minutes = preferences::fetch_minutes();
+        let Some(repo) = self.repo_path.as_deref() else {
+            return;
+        };
+        let minutes = preferences::fetch_minutes(repo);
         if minutes == 0 || self.fetch_task.is_some() {
             return;
         }
@@ -939,18 +945,15 @@ impl RepoView {
     }
 
     /// Fetches every remote, then rebuilds the graph to show what came.
+    /// Git's own `fetch.prune` says whether it drops deleted branches.
     fn fetch(&mut self, background: bool, cx: &mut Context<Self>) {
-        self.fetch_with(background, preferences::fetch_prune(), cx);
-    }
-
-    fn fetch_with(&mut self, background: bool, prune: bool, cx: &mut Context<Self>) {
         // A fetch under way already brings what another would.
         let Some(path) = self.repo_path.clone().filter(|_| self.fetch_task.is_none()) else {
             return;
         };
         let load = cx
             .background_executor()
-            .spawn(async move { wtf_core::fetch(&path, prune, background) });
+            .spawn(async move { wtf_core::fetch(&path, background) });
         self.fetch_task = Some(cx.spawn(async move |this, cx| {
             let result = load.await;
             this.update(cx, |this, cx| {
@@ -1100,11 +1103,11 @@ impl RepoView {
 
     /// Adds a channel pattern to the repository's git config, then shows
     /// what it makes of the branches.
-    pub(super) fn add_channel(&mut self, pattern: &str, cx: &mut Context<Self>) {
+    pub fn add_channel(&mut self, pattern: &str, cx: &mut Context<Self>) {
         self.change_channels(|repo| wtf_core::add_channel(repo, pattern), cx);
     }
 
-    pub(super) fn remove_channel(&mut self, pattern: &str, cx: &mut Context<Self>) {
+    pub fn remove_channel(&mut self, pattern: &str, cx: &mut Context<Self>) {
         self.change_channels(|repo| wtf_core::remove_channel(repo, pattern), cx);
     }
 
@@ -1123,9 +1126,38 @@ impl RepoView {
         cx.notify();
     }
 
+    /// Reads the repository again, as after its settings change.
+    pub fn reload(&mut self, cx: &mut Context<Self>) {
+        self.start_refresh(cx);
+    }
+
+    /// The main branch, always a channel, and the channel patterns it goes
+    /// by, global ones and its own.
+    pub fn channels(&self) -> (&str, &[String]) {
+        (&self.graph.main, &self.graph.channels)
+    }
+
+    /// What a channel pattern being typed would name, so one too loose
+    /// shows before it is added.
+    pub fn channel_hint(&self, input: &str) -> String {
+        let input = input.trim();
+        let names = self.channel_matches(input);
+        let shown: Vec<&str> = names.iter().take(8).map(String::as_str).collect();
+        match (input.is_empty(), names.len()) {
+            (true, _) => "* matches any run of characters, ? one, [0-9] one of a set.".to_string(),
+            (false, 0) => "Matches no branch yet · Enter to add".to_string(),
+            (false, n) => format!(
+                "Matches {n} branch{}: {}{} · Enter to add",
+                if n == 1 { "" } else { "es" },
+                shown.join(", "),
+                if n > shown.len() { ", …" } else { "" }
+            ),
+        }
+    }
+
     /// The branches a channel pattern names, each once, without its remote:
     /// `v2410` for `origin/v2410` and a local `v2410` alike.
-    pub(super) fn channel_matches(&self, pattern: &str) -> Vec<String> {
+    pub fn channel_matches(&self, pattern: &str) -> Vec<String> {
         let mut names: Vec<String> = self
             .graph
             .branches
@@ -1896,7 +1928,7 @@ impl RepoView {
         };
         self.is_loading_diff = !refresh;
         let (file, mode) = (file.clone(), self.diff_mode);
-        let text_only = preferences::text_only_rule();
+        let text_only = preferences::text_only_rule(&repo_path);
         let load = cx
             .background_executor()
             .spawn(async move { wtf_core::file_diff(repo_path, file, mode, &text_only) });

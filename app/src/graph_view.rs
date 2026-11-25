@@ -235,22 +235,20 @@ pub fn layout(graph: &WorkflowGraph, order: WorktreeOrder) -> Layout {
     // layout's other lanes come after them.
     let (lane_of, mut step_from) = stair_lanes(graph);
     let base = step_from.len();
-    // With stairs, a branch growing off another branch, not the main line,
-    // goes below it too, however its lane came about: a stack reads down.
-    if crate::preferences::stacks_as_stairs() {
-        for (i, node) in graph.nodes.iter().enumerate() {
-            let lane = lane_of[i];
-            let Some(&p) = node.parents.first() else {
-                continue;
-            };
-            let first = node.kind != NodeKind::Uncommitted
-                && lane_of[p] != lane
-                && lane_of[p] != 0
-                && step_from[lane].is_none()
-                && !graph.nodes[p].channel;
-            if first {
-                step_from[lane] = Some(lane_of[p]);
-            }
+    // A branch growing off another branch, not the main line, goes below
+    // it too, however its lane came about: a stack reads down.
+    for (i, node) in graph.nodes.iter().enumerate() {
+        let lane = lane_of[i];
+        let Some(&p) = node.parents.first() else {
+            continue;
+        };
+        let first = node.kind != NodeKind::Uncommitted
+            && lane_of[p] != lane
+            && lane_of[p] != 0
+            && step_from[lane].is_none()
+            && !graph.nodes[p].channel;
+        if first {
+            step_from[lane] = Some(lane_of[p]);
         }
     }
 
@@ -858,7 +856,15 @@ pub fn stale_note(graph: &WorkflowGraph, name: &str) -> Option<String> {
     let mut reasons = branch.stale.clone();
     let days = (crate::repo_view::now_seconds() - branch.time) / 86_400;
     let live = branch.busy || branch.remote || branch.name == graph.main;
-    if !live && branch.time > 0 && days >= i64::from(crate::preferences::idle_days()) {
+    if !live
+        && branch.time > 0
+        && days
+            >= i64::from(
+                graph
+                    .idle_days
+                    .unwrap_or(crate::preferences::DEFAULT_IDLE_DAYS),
+            )
+    {
         reasons.push(format!("idle {days}d"));
     }
     (!reasons.is_empty()).then(|| reasons.join(" · "))
@@ -928,12 +934,11 @@ const QUIET_AFTER: i64 = 86_400;
 const RELEASE_BEADS: usize = 2;
 
 /// Whether node `i` steps down from its parent `p`, a branch stacked on
-/// another: it carries `p`'s lane on, `p` ends a named branch, and stacks
-/// are laid out as stairs. The main line and release lines never step.
+/// another: it carries `p`'s lane on, and `p` ends a named branch. The
+/// main line and release lines never step.
 fn steps_down(graph: &WorkflowGraph, p: usize, i: usize) -> bool {
     let (parent, node) = (&graph.nodes[p], &graph.nodes[i]);
-    crate::preferences::stacks_as_stairs()
-        && node.kind != NodeKind::Uncommitted
+    node.kind != NodeKind::Uncommitted
         && parent.lane == node.lane
         && node.lane != 0
         && !parent.channel
@@ -2188,6 +2193,7 @@ mod tests {
             main_worktree: None,
             on_main: Vec::new(),
             channels: Vec::new(),
+            idle_days: None,
         };
         WorkflowGraph {
             on_main: graph.main_history(),
@@ -2414,18 +2420,14 @@ mod tests {
             })
             .collect();
         let rows = layout_rows(&graph, WorktreeOrder::ForkPoint);
-        if crate::preferences::stacks_as_stairs() {
-            assert!(
-                rows[1] < rows[2] && rows[2] < rows[3],
-                "each a row lower: {rows:?}"
-            );
-        }
+        assert!(
+            rows[1] < rows[2] && rows[2] < rows[3],
+            "each a row lower: {rows:?}"
+        );
         let (lanes, from) = stair_lanes(&graph);
         assert_eq!(lanes[1], 1);
-        if crate::preferences::stacks_as_stairs() {
-            assert_eq!(from[lanes[2]], Some(1));
-            assert_eq!(from[lanes[3]], Some(lanes[2]));
-        }
+        assert_eq!(from[lanes[2]], Some(1));
+        assert_eq!(from[lanes[3]], Some(lanes[2]));
     }
 
     #[test]

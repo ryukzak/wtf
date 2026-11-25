@@ -8,7 +8,6 @@ use gpui::{
 };
 
 use crate::line_edit::LineEdit;
-use crate::sync;
 use crate::text_field::Field;
 use crate::theme::{Appearance, Theme};
 use crate::workspace::{CloseTab, CloseWindow};
@@ -28,9 +27,6 @@ pub struct GraphStyle {
     pub hover_line: f32,
     /// How far a rail runs while changing rows.
     pub curve: f32,
-    /// Branches stacked on others step down a row each, as stairs; off,
-    /// they run on along one row.
-    pub stairs: bool,
 }
 
 impl Default for GraphStyle {
@@ -44,7 +40,6 @@ impl Default for GraphStyle {
             line: 2.,
             hover_line: 4.,
             curve: 16.,
-            stairs: true,
         }
     }
 }
@@ -63,27 +58,15 @@ struct Settings {
     terminal_line: f32,
     /// The interface's rem size; text and controls scale with it.
     ui_size: f32,
-    /// Days without a commit after which a branch reads as idle.
-    idle_days: u32,
     /// Summarize several commits with Apple's on-device model; `None` until
     /// the first run finds out whether this Mac has it.
     summaries: Option<bool>,
-    /// What the model is told to summarize commits and to write commit
-    /// messages; `None` for the built-in prompts.
-    summary_prompt: Option<String>,
     /// Which of the app's commands the terminal prints, by kind.
     terminal_changes: bool,
     terminal_reads: bool,
     terminal_refresh: bool,
     /// Commands the terminal leaves out whatever their kind, a glob a line.
     terminal_hidden: Option<String>,
-    /// Files the structural diff leaves to the text one, a glob a line;
-    /// `None` for the built-in list.
-    text_only: Option<String>,
-    /// Files larger than this, in kilobytes, get the text diff; 0 for no
-    /// limit.
-    structural_max_kb: u32,
-    message_prompt: Option<String>,
     /// At launch, problems with external programs open the tools window.
     tool_check: bool,
     /// File trees list folders before files; off, the two mix by name.
@@ -94,15 +77,8 @@ struct Settings {
     /// shows in one column; 0 never does.
     one_column_below: u32,
     graph: GraphStyle,
-    /// Minutes between background fetches; 0 for none.
-    fetch_minutes: u32,
-    /// Fetches drop remote branches deleted on the remote.
-    fetch_prune: bool,
     /// Labels show how far a branch is ahead of and behind its upstream.
     sync_badges: bool,
-    /// What the Pull and Push buttons run, as places in their option lists.
-    pull_option: usize,
-    push_option: usize,
 }
 
 impl Settings {
@@ -116,13 +92,6 @@ impl Settings {
         // up only near 1.2.
         self.code_line = ((self.code_line * 10.).round() / 10.).clamp(1.3, 2.);
         self.terminal_line = ((self.terminal_line * 20.).round() / 20.).clamp(1., 1.6);
-        self.idle_days = self.idle_days.clamp(1, 365);
-        // A choice gone from the list, such as the fetches Pull once offered,
-        // goes back to the default rather than to whatever took its place.
-        if self.pull_option >= sync::PULL.len() {
-            self.pull_option = Settings::default().pull_option;
-        }
-        self.push_option = self.push_option.min(sync::PUSH.len() - 1);
         let graph = &mut self.graph;
         graph.row_height = graph.row_height.clamp(16., 48.);
         graph.column = graph.column.clamp(32., 160.);
@@ -146,26 +115,17 @@ impl Default for Settings {
             code_line: 1.6,
             terminal_line: 1.35,
             ui_size: 16.,
-            idle_days: 14,
             summaries: None,
-            summary_prompt: None,
-            text_only: None,
             terminal_changes: true,
             terminal_reads: false,
             terminal_refresh: false,
             terminal_hidden: None,
-            structural_max_kb: 200,
-            message_prompt: None,
             tool_check: true,
             folders_first: false,
             one_column_below: 80,
             palette_recent: 5,
             graph: GraphStyle::default(),
-            fetch_minutes: 5,
-            fetch_prune: true,
             sync_badges: true,
-            pull_option: 1,
-            push_option: 0,
         }
     }
 }
@@ -227,40 +187,30 @@ pub fn ui_size() -> f32 {
     read().ui_size
 }
 
-pub fn idle_days() -> u32 {
-    read().idle_days
-}
-
-pub fn fetch_minutes() -> u32 {
-    read().fetch_minutes
-}
-
-pub fn fetch_prune() -> bool {
-    read().fetch_prune
+/// Minutes between background fetches of `repo`; 0 for none.
+pub fn fetch_minutes(repo: &str) -> u32 {
+    ProjectSetting::FetchMinutes
+        .value(&Scope::Repo(repo.to_string()))
+        .parse()
+        .unwrap_or(DEFAULT_FETCH_MINUTES)
 }
 
 pub fn sync_badges() -> bool {
     read().sync_badges
 }
 
-/// The option the Pull (`false`) or Push (`true`) button runs.
-pub fn sync_option(push: bool) -> usize {
-    let settings = read();
-    match push {
-        true => settings.push_option,
-        false => settings.pull_option,
-    }
-}
-
-/// Makes an option what the Pull or Push button runs.
-pub fn set_sync_option(push: bool, option: usize, cx: &mut App) {
-    change(
-        |settings| match push {
-            true => settings.push_option = option,
-            false => settings.pull_option = option,
-        },
-        cx,
-    );
+/// The option the Pull (`false`) or Push (`true`) button runs in `repo`.
+pub fn sync_option(push: bool, repo: &str) -> usize {
+    let setting = match push {
+        true => ProjectSetting::Push,
+        false => ProjectSetting::Pull,
+    };
+    let options = crate::sync::options(push);
+    setting
+        .value(&Scope::Repo(repo.to_string()))
+        .parse()
+        .unwrap_or(0)
+        .min(options.len() - 1)
 }
 
 /// The background fetch intervals offered, in minutes; 0 is off.
@@ -331,7 +281,7 @@ impl Knob {
             Knob::CodeWeight => s.code_weight,
             Knob::CodeLine => s.code_line,
             Knob::TerminalLine => s.terminal_line,
-            Knob::FetchMinutes => s.fetch_minutes as f32,
+            Knob::FetchMinutes => DEFAULT_FETCH_MINUTES as f32,
             Knob::RowHeight => s.graph.row_height,
             Knob::Column => s.graph.column,
             Knob::Curve => s.graph.curve,
@@ -340,7 +290,8 @@ impl Knob {
             Knob::Beads => s.graph.beads as f32,
             Knob::Line => s.graph.line,
             Knob::HoverLine => s.graph.hover_line,
-            Knob::IdleDays => s.idle_days as f32,
+            // A project's, read where the slider shows it.
+            Knob::IdleDays => DEFAULT_IDLE_DAYS as f32,
         }
     }
 
@@ -351,7 +302,7 @@ impl Knob {
             Knob::CodeWeight => s.code_weight = value,
             Knob::CodeLine => s.code_line = value,
             Knob::TerminalLine => s.terminal_line = value,
-            Knob::FetchMinutes => s.fetch_minutes = value as u32,
+            Knob::FetchMinutes => {}
             Knob::RowHeight => s.graph.row_height = value,
             Knob::Column => s.graph.column = value,
             Knob::Curve => s.graph.curve = value,
@@ -360,7 +311,7 @@ impl Knob {
             Knob::Beads => s.graph.beads = value as usize,
             Knob::Line => s.graph.line = value,
             Knob::HoverLine => s.graph.hover_line = value,
-            Knob::IdleDays => s.idle_days = value as u32,
+            Knob::IdleDays => {}
         }
     }
 
@@ -409,11 +360,6 @@ impl Knob {
     }
 }
 
-/// Whether branches stacked on others step down a row each in the graph.
-pub fn stacks_as_stairs() -> bool {
-    read().graph.stairs
-}
-
 pub fn summaries() -> bool {
     read().summaries == Some(true)
 }
@@ -460,13 +406,6 @@ pub fn appearance() -> Appearance {
     read().appearance
 }
 
-pub fn summary_prompt() -> String {
-    read()
-        .summary_prompt
-        .clone()
-        .unwrap_or_else(|| wtf_core::SUMMARY_PROMPT.to_string())
-}
-
 /// The files the structural diff leaves to the text one, built in: those
 /// that are code around data, where its structure tells nothing.
 pub const TEXT_ONLY: &str = "*.snap\n*.lock\npackage-lock.json\n*-lock.yaml\n*.min.js\n*.min.css";
@@ -491,20 +430,17 @@ pub fn terminal_shown(all: bool) -> crate::console_view::Shown {
     }
 }
 
-/// The globs of files to diff as text even in structural mode, a line each.
-pub fn text_only() -> String {
-    read()
-        .text_only
-        .clone()
-        .unwrap_or_else(|| TEXT_ONLY.to_string())
-}
-
-/// What leaves a file to the text diff: the globs, and the size in bytes
-/// past which none is diffed by structure.
-pub fn text_only_rule() -> wtf_core::TextOnly {
-    let kb = read().structural_max_kb;
+/// What leaves a file of `repo` to the text diff: the project's globs,
+/// and the size in bytes past which none is diffed by structure.
+pub fn text_only_rule(repo: &str) -> wtf_core::TextOnly {
+    let scope = Scope::Repo(repo.to_string());
+    let kb: usize = ProjectSetting::TextDiffAbove
+        .value(&scope)
+        .parse()
+        .unwrap_or(DEFAULT_TEXT_DIFF_ABOVE);
     wtf_core::TextOnly {
-        patterns: text_only()
+        patterns: ProjectSetting::TextDiff
+            .value(&scope)
             .lines()
             .map(str::trim)
             .filter(|line| !line.is_empty())
@@ -512,16 +448,332 @@ pub fn text_only_rule() -> wtf_core::TextOnly {
             .collect(),
         max_bytes: match kb {
             0 => usize::MAX,
-            kb => kb as usize * 1024,
+            kb => kb * 1024,
         },
     }
 }
 
-pub fn message_prompt() -> String {
-    read()
-        .message_prompt
-        .clone()
-        .unwrap_or_else(|| wtf_core::MESSAGE_PROMPT.to_string())
+/// Days without a commit after which a branch reads as idle, unless git
+/// config says otherwise.
+pub const DEFAULT_IDLE_DAYS: u32 = 14;
+
+/// Minutes between background fetches, unless git config says otherwise.
+const DEFAULT_FETCH_MINUTES: u32 = 5;
+
+/// Files larger than this, in kilobytes, get the text diff, unless git
+/// config says otherwise; 0 for no limit.
+const DEFAULT_TEXT_DIFF_ABOVE: usize = 200;
+
+/// What the model is told to summarize commits of `repo`.
+pub fn summary_template(repo: &str) -> String {
+    ProjectSetting::Summary.value(&Scope::Repo(repo.to_string()))
+}
+
+/// What the model is told to write a commit message in `repo`.
+pub fn message_template(repo: &str) -> String {
+    ProjectSetting::Message.value(&Scope::Repo(repo.to_string()))
+}
+
+/// A project, as Settings show its settings: every repository's, kept in
+/// the global git config, or one repository's own, kept in its config.
+#[derive(Clone, PartialEq, Debug)]
+enum Scope {
+    Global,
+    Repo(String),
+}
+
+impl Scope {
+    fn config(&self) -> wtf_core::ConfigScope<'_> {
+        match self {
+            Scope::Global => wtf_core::ConfigScope::Global,
+            Scope::Repo(repo) => wtf_core::ConfigScope::Repo(repo),
+        }
+    }
+
+    /// Where it is cached: the repository, or nothing for global.
+    fn key(&self) -> &str {
+        match self {
+            Scope::Global => "",
+            Scope::Repo(repo) => repo,
+        }
+    }
+
+    /// The project it goes by where it has nothing of its own.
+    fn outer(&self) -> Option<Scope> {
+        match self {
+            Scope::Global => None,
+            Scope::Repo(_) => Some(Scope::Global),
+        }
+    }
+}
+
+/// What a project keeps of its own, a line a value where there are several;
+/// read from git config once, then as Settings change it.
+#[derive(Clone, Default)]
+struct Own {
+    summary: Option<String>,
+    message: Option<String>,
+    text_diff: Option<String>,
+    text_diff_above: Option<String>,
+    idle_days: Option<String>,
+    fetch_minutes: Option<String>,
+    prune: Option<String>,
+    /// The Pull and Push buttons' options, as places in their lists.
+    pull: Option<String>,
+    push: Option<String>,
+    /// Who commits are by.
+    name: Option<String>,
+    email: Option<String>,
+    channels: Vec<String>,
+}
+
+static OWN: LazyLock<RwLock<std::collections::HashMap<String, Own>>> =
+    LazyLock::new(Default::default);
+
+fn own(scope: &Scope) -> Own {
+    if let Some(own) = OWN
+        .read()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(scope.key())
+    {
+        return own.clone();
+    }
+    let config = scope.config();
+    let lines = |key: &str| {
+        let values = wtf_core::project_values(config, key);
+        (!values.is_empty()).then(|| values.join("\n"))
+    };
+    let value = |setting: ProjectSetting| wtf_core::project_value(config, setting.key());
+    let push = value(ProjectSetting::Push).and_then(|label| {
+        let options = crate::sync::options(true);
+        let at = options
+            .iter()
+            .position(|option| crate::sync::label(true, option) == label)?;
+        Some(at.to_string())
+    });
+    let own = Own {
+        summary: value(ProjectSetting::Summary),
+        message: value(ProjectSetting::Message),
+        text_diff: lines(ProjectSetting::TextDiff.key()),
+        text_diff_above: value(ProjectSetting::TextDiffAbove),
+        idle_days: value(ProjectSetting::IdleDays),
+        fetch_minutes: value(ProjectSetting::FetchMinutes),
+        prune: value(ProjectSetting::Prune).map(|on| git_bool(&on).to_string()),
+        pull: pull_option(config).map(|at| at.to_string()),
+        push,
+        name: value(ProjectSetting::Name),
+        email: value(ProjectSetting::Email),
+        channels: wtf_core::project_values(config, "wtf.channel"),
+    };
+    OWN.write()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(scope.key().to_string(), own.clone());
+    own
+}
+
+/// A boolean as git config writes it.
+fn git_bool(value: &str) -> bool {
+    matches!(
+        value.trim().to_lowercase().as_str(),
+        "true" | "yes" | "on" | "1"
+    )
+}
+
+/// The Pull option git's own settings at `config` choose, when they choose
+/// one: `pull.rebase`, with `rebase.autoStash`, or `pull.ff`.
+fn pull_option(config: wtf_core::ConfigScope) -> Option<usize> {
+    let value = |key| wtf_core::project_value(config, key);
+    let rebase = value("pull.rebase");
+    let autostash = value("rebase.autoStash").is_some_and(|on| git_bool(&on));
+    match (rebase.as_deref().map(git_bool), value("pull.ff").as_deref()) {
+        (Some(true), _) if autostash => Some(3),
+        (Some(true), _) => Some(2),
+        (_, Some("only")) => Some(1),
+        (Some(false), _) | (_, Some(_)) => Some(0),
+        (None, None) => None,
+    }
+}
+
+/// Sets git's own settings at `config` for a Pull option, or with `None`
+/// drops them.
+fn set_pull_option(
+    config: wtf_core::ConfigScope,
+    option: Option<usize>,
+) -> Result<(), wtf_core::CoreError> {
+    let keys: &[(&str, &str)] = match option {
+        None => &[],
+        Some(0) => &[("pull.rebase", "false")],
+        Some(1) => &[("pull.ff", "only")],
+        Some(2) => &[("pull.rebase", "true")],
+        Some(_) => &[("pull.rebase", "true"), ("rebase.autoStash", "true")],
+    };
+    for key in ["pull.rebase", "pull.ff", "rebase.autoStash"] {
+        let value = keys
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, value)| *value);
+        wtf_core::set_project_values(config, key, value.as_slice())?;
+    }
+    Ok(())
+}
+
+/// Reads a project's settings from git config again when next asked.
+fn forget(scope: &Scope) {
+    OWN.write()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(scope.key());
+}
+
+/// Repositories' tabs to show a change of `scope`'s settings: its own, or
+/// every one for global ones.
+fn reload_tabs(scope: &Scope, cx: &mut App) {
+    for view in crate::workspace::repo_views(cx) {
+        let shown = view.read(cx).repo_path().map(str::to_string);
+        if *scope == Scope::Global || shown.as_deref() == Some(scope.key()) {
+            view.update(cx, |view, cx| view.reload(cx));
+        }
+    }
+}
+
+/// The global channel patterns, for every repository.
+fn global_channels() -> Vec<String> {
+    own(&Scope::Global).channels
+}
+
+fn set_global_channels(patterns: &[String], cx: &mut App) {
+    let patterns: Vec<&str> = patterns.iter().map(String::as_str).collect();
+    if let Err(error) =
+        wtf_core::set_project_values(wtf_core::ConfigScope::Global, "wtf.channel", &patterns)
+    {
+        eprintln!("wtf: {error}");
+    }
+    forget(&Scope::Global);
+    reload_tabs(&Scope::Global, cx);
+    cx.refresh_windows();
+}
+
+/// A setting of a project's, as Settings show it.
+#[derive(Clone, Copy, PartialEq)]
+enum ProjectSetting {
+    Summary,
+    Message,
+    TextDiff,
+    TextDiffAbove,
+    IdleDays,
+    FetchMinutes,
+    Prune,
+    Pull,
+    Push,
+    Name,
+    Email,
+}
+
+impl ProjectSetting {
+    /// Its name in git config: wtf's own, or git's. Pull is kept as git's
+    /// `pull.rebase`, `pull.ff` and `rebase.autoStash` together.
+    fn key(self) -> &'static str {
+        match self {
+            ProjectSetting::Summary => "wtf.summaryTemplate",
+            ProjectSetting::Message => "wtf.messageTemplate",
+            ProjectSetting::TextDiff => "wtf.textDiff",
+            ProjectSetting::TextDiffAbove => "wtf.textDiffAboveKb",
+            ProjectSetting::IdleDays => "wtf.idleDays",
+            ProjectSetting::FetchMinutes => "wtf.fetchMinutes",
+            ProjectSetting::Prune => "fetch.prune",
+            ProjectSetting::Pull => "pull.rebase",
+            ProjectSetting::Push => "wtf.push",
+            ProjectSetting::Name => "user.name",
+            ProjectSetting::Email => "user.email",
+        }
+    }
+
+    /// What it is without any project's own.
+    fn built_in(self) -> String {
+        match self {
+            ProjectSetting::Summary => wtf_core::SUMMARY_PROMPT.to_string(),
+            ProjectSetting::Message => wtf_core::MESSAGE_PROMPT.to_string(),
+            ProjectSetting::TextDiff => TEXT_ONLY.to_string(),
+            ProjectSetting::TextDiffAbove => DEFAULT_TEXT_DIFF_ABOVE.to_string(),
+            ProjectSetting::IdleDays => DEFAULT_IDLE_DAYS.to_string(),
+            ProjectSetting::FetchMinutes => DEFAULT_FETCH_MINUTES.to_string(),
+            // As git has them: no pruning; Pull fast-forwards only, where
+            // git's own default would merge.
+            ProjectSetting::Prune => "false".to_string(),
+            ProjectSetting::Pull => "1".to_string(),
+            ProjectSetting::Push => "0".to_string(),
+            // Git has none: commits fail until one is set.
+            ProjectSetting::Name | ProjectSetting::Email => String::new(),
+        }
+    }
+
+    /// The project's own value, if it has one.
+    fn own(self, scope: &Scope) -> Option<String> {
+        let own = own(scope);
+        match self {
+            ProjectSetting::Summary => own.summary,
+            ProjectSetting::Message => own.message,
+            ProjectSetting::TextDiff => own.text_diff,
+            ProjectSetting::TextDiffAbove => own.text_diff_above,
+            ProjectSetting::IdleDays => own.idle_days,
+            ProjectSetting::FetchMinutes => own.fetch_minutes,
+            ProjectSetting::Prune => own.prune,
+            ProjectSetting::Pull => own.pull,
+            ProjectSetting::Push => own.push,
+            ProjectSetting::Name => own.name,
+            ProjectSetting::Email => own.email,
+        }
+    }
+
+    /// What the project goes by without its own: the global value, or the
+    /// built-in one.
+    fn inherited(self, scope: &Scope) -> String {
+        scope
+            .outer()
+            .map_or_else(|| self.built_in(), |outer| self.value(&outer))
+    }
+
+    /// What the project goes by.
+    fn value(self, scope: &Scope) -> String {
+        self.own(scope).unwrap_or_else(|| self.inherited(scope))
+    }
+
+    /// Sets the project's own value, or with `None`, as typing the
+    /// inherited one back does, goes by that again.
+    fn set(self, scope: &Scope, text: Option<String>, cx: &mut App) {
+        let text = text
+            .filter(|text| *text != self.inherited(scope))
+            .filter(|text| !text.trim().is_empty() || !self.built_in().is_empty());
+        let push_label = text
+            .as_deref()
+            .and_then(|at| crate::sync::PUSH.get(at.parse::<usize>().ok()?))
+            .map(|option| crate::sync::label(true, option));
+        let values: Vec<&str> = match (&text, self) {
+            (None, _) => Vec::new(),
+            (Some(text), ProjectSetting::TextDiff) => text
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .collect(),
+            (Some(_), ProjectSetting::Push) => push_label.as_deref().into_iter().collect(),
+            (Some(text), _) => vec![text.as_str()],
+        };
+        let written = match self {
+            ProjectSetting::Pull => set_pull_option(
+                scope.config(),
+                text.as_deref().and_then(|at| at.parse().ok()),
+            ),
+            _ => wtf_core::set_project_values(scope.config(), self.key(), &values),
+        };
+        if let Err(error) = written {
+            eprintln!("wtf: {error}");
+        }
+        forget(scope);
+        // The graph reads idle days as it refreshes.
+        if self == ProjectSetting::IdleDays {
+            reload_tabs(scope, cx);
+        }
+        cx.refresh_windows();
+    }
 }
 
 /// macOS's interface font, offered as "System".
@@ -537,8 +789,65 @@ fn file() -> PathBuf {
 
 /// Applies the saved preferences; missing or unreadable ones keep defaults.
 pub fn load() {
-    let settings = parse(&fs::read_to_string(file()).unwrap_or_default());
+    let text = fs::read_to_string(file()).unwrap_or_default();
+    let settings = parse(&text);
     *SETTINGS.write().unwrap_or_else(|error| error.into_inner()) = settings;
+    // Settings once the app's, now every project's: set ones go to the
+    // global git config, where it has none, and leave the file.
+    let moved = moved_settings(&text);
+    for (key, values) in &moved {
+        let config = wtf_core::ConfigScope::Global;
+        if wtf_core::project_values(config, key).is_empty() {
+            let values: Vec<&str> = values.iter().map(String::as_str).collect();
+            wtf_core::set_project_values(config, key, &values).ok();
+        }
+    }
+    if !moved.is_empty() {
+        save();
+    }
+}
+
+/// Settings the file kept that projects keep now, with their keys in git
+/// config: those set to other than the built-in values. Pull options are
+/// git's own now, and prune too: those are left to git config.
+fn moved_settings(text: &str) -> Vec<(&'static str, Vec<String>)> {
+    let changed = |value: &str, default: &str| {
+        (value.trim() != default).then(|| vec![value.trim().to_string()])
+    };
+    text.lines()
+        .filter_map(|line| line.split_once('='))
+        .filter_map(|(key, value)| match key.trim() {
+            "summary_prompt" => Some(("wtf.summaryTemplate", vec![unescape(value)])),
+            "message_prompt" => Some(("wtf.messageTemplate", vec![unescape(value)])),
+            "text_only" => Some((
+                "wtf.textDiff",
+                unescape(value)
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+            )),
+            "idle_days" => Some((
+                "wtf.idleDays",
+                changed(value, &DEFAULT_IDLE_DAYS.to_string())?,
+            )),
+            "fetch_minutes" => Some((
+                "wtf.fetchMinutes",
+                changed(value, &DEFAULT_FETCH_MINUTES.to_string())?,
+            )),
+            "structural_max_kb" => Some((
+                "wtf.textDiffAboveKb",
+                changed(value, &DEFAULT_TEXT_DIFF_ABOVE.to_string())?,
+            )),
+            "push_option" => {
+                let option = crate::sync::PUSH.get(value.trim().parse::<usize>().ok()?)?;
+                let label = crate::sync::label(true, option);
+                Some(("wtf.push", changed(&label, "push")?))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// Reads `key=value` lines; unknown keys and bad values keep defaults.
@@ -568,10 +877,7 @@ fn parse(text: &str) -> Settings {
             ("code_line", Some(n)) => settings.code_line = n,
             ("terminal_line", Some(n)) => settings.terminal_line = n,
             ("ui_size", Some(n)) => settings.ui_size = n,
-            ("idle_days", Some(n)) => settings.idle_days = n as u32,
             ("summaries", _) => settings.summaries = Some(value == "on"),
-            ("fetch_minutes", Some(n)) => settings.fetch_minutes = n as u32,
-            ("fetch_prune", _) => settings.fetch_prune = value == "on",
             ("sync_badges", _) => settings.sync_badges = value == "on",
             ("tool_check", _) => settings.tool_check = value == "on",
             ("folders_first", _) => settings.folders_first = value == "on",
@@ -585,16 +891,10 @@ fn parse(text: &str) -> Settings {
                     settings.one_column_below = chars;
                 }
             }
-            ("pull_option", Some(n)) => settings.pull_option = n as usize,
-            ("push_option", Some(n)) => settings.push_option = n as usize,
-            ("summary_prompt", _) => settings.summary_prompt = Some(unescape(raw)),
-            ("text_only", _) => settings.text_only = Some(unescape(raw)),
             ("terminal_hidden", _) => settings.terminal_hidden = Some(unescape(raw)),
             ("terminal_changes", _) => settings.terminal_changes = value == "on",
             ("terminal_reads", _) => settings.terminal_reads = value == "on",
             ("terminal_refresh", _) => settings.terminal_refresh = value == "on",
-            ("structural_max_kb", Some(n)) => settings.structural_max_kb = n as u32,
-            ("message_prompt", _) => settings.message_prompt = Some(unescape(raw)),
             ("graph.row_height", Some(n)) => graph.row_height = n,
             ("graph.column", Some(n)) => graph.column = n,
             ("graph.bead_spacing", Some(n)) => graph.bead_spacing = n,
@@ -603,7 +903,6 @@ fn parse(text: &str) -> Settings {
             ("graph.line", Some(n)) => graph.line = n,
             ("graph.hover_line", Some(n)) => graph.hover_line = n,
             ("graph.curve", Some(n)) => graph.curve = n,
-            ("graph.stairs", _) => graph.stairs = value == "on",
             _ => {}
         }
     }
@@ -653,30 +952,16 @@ fn format(settings: &Settings) -> String {
         format!("code_line={}", settings.code_line),
         format!("terminal_line={}", settings.terminal_line),
         format!("ui_size={}", settings.ui_size),
-        format!("idle_days={}", settings.idle_days),
-        format!("fetch_minutes={}", settings.fetch_minutes),
-        format!("fetch_prune={}", on_off(settings.fetch_prune)),
         format!("sync_badges={}", on_off(settings.sync_badges)),
         format!("tool_check={}", on_off(settings.tool_check)),
         format!("folders_first={}", on_off(settings.folders_first)),
         format!("one_column_below={}", settings.one_column_below),
         format!("palette_recent={}", settings.palette_recent),
-        format!("pull_option={}", settings.pull_option),
-        format!("push_option={}", settings.push_option),
         match settings.summaries {
             Some(true) => "summaries=on".to_string(),
             Some(false) => "summaries=off".to_string(),
             None => String::new(),
         },
-        settings
-            .summary_prompt
-            .as_ref()
-            .map_or(String::new(), |p| format!("summary_prompt={}", escape(p))),
-        settings
-            .text_only
-            .as_ref()
-            .map_or(String::new(), |p| format!("text_only={}", escape(p))),
-        format!("structural_max_kb={}", settings.structural_max_kb),
         settings
             .terminal_hidden
             .as_ref()
@@ -684,10 +969,6 @@ fn format(settings: &Settings) -> String {
         format!("terminal_changes={}", on_off(settings.terminal_changes)),
         format!("terminal_reads={}", on_off(settings.terminal_reads)),
         format!("terminal_refresh={}", on_off(settings.terminal_refresh)),
-        settings
-            .message_prompt
-            .as_ref()
-            .map_or(String::new(), |p| format!("message_prompt={}", escape(p))),
         format!("graph.row_height={}", g.row_height),
         format!("graph.column={}", g.column),
         format!("graph.bead_spacing={}", g.bead_spacing),
@@ -696,7 +977,6 @@ fn format(settings: &Settings) -> String {
         format!("graph.line={}", g.line),
         format!("graph.hover_line={}", g.hover_line),
         format!("graph.curve={}", g.curve),
-        format!("graph.stairs={}", on_off(g.stairs)),
     ]
     .into_iter()
     .filter(|line| !line.is_empty())
@@ -759,39 +1039,92 @@ pub fn panel_options(title: &'static str, width: f32, height: f32, cx: &App) -> 
 }
 
 pub fn open(cx: &mut App) {
+    // The repository in front, for its own settings; with Settings in
+    // front, the one they show stays.
+    let front = crate::workspace::front_repo(cx);
     let existing = cx
         .try_global::<PreferencesWindow>()
         .and_then(|window| window.0);
+    if let (Some(window), Some(repo)) = (existing, front.clone()) {
+        window
+            .update(cx, |preferences, _, cx| {
+                let scope = Scope::Repo(repo);
+                if preferences.scope != scope {
+                    preferences.pick(scope, cx);
+                    cx.notify();
+                }
+            })
+            .ok();
+    }
     if bring_forward(existing, cx) {
         return;
     }
+    let scope = front
+        .or_else(|| {
+            crate::workspace::repo_views(cx)
+                .first()
+                .and_then(|view| view.read(cx).repo_path().map(str::to_string))
+        })
+        .map_or(Scope::Global, Scope::Repo);
     let options = panel_options("Settings", 680., 540., cx);
     let opened = cx.open_window(options, |window, cx| {
         cx.new(|cx| {
             let focus = cx.focus_handle();
             focus.focus(window);
-            Preferences {
+            let mut preferences = Preferences {
                 focus,
                 fonts: installed_fonts(window, cx),
                 section: Section::Appearance,
                 font_menu: None,
                 font_query: Default::default(),
-                prompts: Default::default(),
-                prompt_focus: [
-                    cx.focus_handle(),
-                    cx.focus_handle(),
-                    cx.focus_handle(),
-                    cx.focus_handle(),
-                ],
+                prompts: vec![Field::default(); PROJECT_FIELDS + 5],
+                prompt_focus: (0..PROJECT_FIELDS + 5).map(|_| cx.focus_handle()).collect(),
                 dragging: None,
                 tracks: Default::default(),
-            }
+                scope: Scope::Global,
+                project_menu: None,
+                watching: None,
+                channel_input: Field::default(),
+                channel_focus: cx.focus_handle(),
+                showing_sent: None,
+            };
+            preferences.pick(scope, cx);
+            preferences
         })
     });
     if let Ok(handle) = opened {
         cx.set_global(PreferencesWindow(Some(handle)));
     }
 }
+
+/// Opens Settings at `repo`'s branch settings, its channels among them,
+/// once the window asking is done, so its tabs can be read.
+pub fn open_channels(repo: String, cx: &mut App) {
+    cx.defer(move |cx| {
+        open(cx);
+        let Some(handle) = cx
+            .try_global::<PreferencesWindow>()
+            .and_then(|window| window.0)
+        else {
+            return;
+        };
+        handle
+            .update(cx, |preferences, _, cx| {
+                preferences.section = Section::Branches;
+                preferences.pick(Scope::Repo(repo), cx);
+                cx.notify();
+            })
+            .ok();
+    });
+}
+
+/// The field of the commands the terminal never shows.
+const HIDDEN_FIELD: usize = 0;
+
+/// Where the fields of a project's settings start, after the app's: the
+/// text diff files, the summary and commit message templates, then the
+/// author's name and email, each a line.
+const PROJECT_FIELDS: usize = 1;
 
 pub struct Preferences {
     focus: FocusHandle,
@@ -802,57 +1135,30 @@ pub struct Preferences {
     /// The font dropdown, when open, and where.
     font_menu: Option<(FontSetting, gpui::Point<gpui::Pixels>)>,
     font_query: Field,
-    /// The prompts as edited, each a multi-line field.
-    prompts: [Field; 4],
+    /// The prompts as edited, each a multi-line field: the app's, then from
+    /// `PROJECT_FIELDS` the repository's.
+    prompts: Vec<Field>,
     /// The prompt fields, each with its own focus.
-    prompt_focus: [FocusHandle; 4],
+    prompt_focus: Vec<FocusHandle>,
     /// The slider being dragged, and where each slider's track was drawn.
     dragging: Option<Knob>,
     tracks: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<Knob, Bounds<gpui::Pixels>>>>,
+    /// The project whose settings show: global, or a repository open in a
+    /// tab.
+    scope: Scope,
+    /// The list of projects to pick one from, when open, and where.
+    project_menu: Option<gpui::Point<gpui::Pixels>>,
+    /// The repository's tab, followed so its channels show as they change.
+    watching: Option<gpui::Subscription>,
+    /// A channel pattern being typed.
+    channel_input: Field,
+    channel_focus: FocusHandle,
+    /// The request whose last sending shows under its template.
+    showing_sent: Option<wtf_core::Request>,
 }
 
-/// Which prompt a field edits.
-#[derive(Clone, Copy, PartialEq)]
-enum PromptSetting {
-    Summary,
-    Message,
-    /// Not a prompt: the files the structural diff leaves to the text one.
-    TextOnly,
-    /// Nor this: the commands the terminal leaves out.
-    HiddenCommands,
-}
-
-impl PromptSetting {
-    /// The prompt as the model is told it.
-    fn text(self) -> String {
-        match self {
-            PromptSetting::Summary => summary_prompt(),
-            PromptSetting::Message => message_prompt(),
-            PromptSetting::TextOnly => text_only(),
-            PromptSetting::HiddenCommands => read().terminal_hidden.clone().unwrap_or_default(),
-        }
-    }
-
-    /// Sets a custom prompt, or with `None` goes back to the built-in one,
-    /// as typing the built-in text back does.
-    fn set(self, settings: &mut Settings, text: Option<String>) {
-        let built_in = match self {
-            PromptSetting::Summary => wtf_core::SUMMARY_PROMPT,
-            PromptSetting::Message => wtf_core::MESSAGE_PROMPT,
-            PromptSetting::TextOnly => TEXT_ONLY,
-            PromptSetting::HiddenCommands => "",
-        };
-        let text = text.filter(|text| text != built_in);
-        match self {
-            PromptSetting::Summary => settings.summary_prompt = text,
-            PromptSetting::Message => settings.message_prompt = text,
-            PromptSetting::TextOnly => settings.text_only = text,
-            PromptSetting::HiddenCommands => settings.terminal_hidden = text,
-        }
-    }
-}
-
-/// The settings window's sections, in sidebar order.
+/// The settings window's sections, in sidebar order: the app's, then a
+/// repository's own.
 #[derive(Clone, Copy, PartialEq)]
 enum Section {
     Appearance,
@@ -860,17 +1166,28 @@ enum Section {
     Graph,
     Review,
     Terminal,
-    Remote,
+    Author,
+    Branches,
+    Diffs,
+    Messages,
+    Sync,
 }
 
 impl Section {
-    const ALL: [Section; 6] = [
+    const ALL: [Section; 5] = [
         Section::Appearance,
         Section::Fonts,
         Section::Graph,
         Section::Review,
         Section::Terminal,
-        Section::Remote,
+    ];
+
+    const PROJECT: [Section; 5] = [
+        Section::Author,
+        Section::Branches,
+        Section::Diffs,
+        Section::Messages,
+        Section::Sync,
     ];
 
     fn title(self) -> &'static str {
@@ -880,7 +1197,11 @@ impl Section {
             Section::Graph => "Workflow graph",
             Section::Review => "Review",
             Section::Terminal => "Terminal",
-            Section::Remote => "Remote",
+            Section::Author => "Author",
+            Section::Branches => "Branches",
+            Section::Diffs => "Diffs",
+            Section::Messages => "Messages",
+            Section::Sync => "Sync",
         }
     }
 }
@@ -913,7 +1234,7 @@ fn installed_fonts(window: &Window, cx: &App) -> Vec<(String, bool)> {
 
 /// A row of a settings group: its label at the left, and its control, the
 /// child added next, at the right.
-fn row(label: &'static str, theme: &Theme) -> gpui::Div {
+fn row(label: impl Into<SharedString>, theme: &Theme) -> gpui::Div {
     div()
         .flex()
         .items_center()
@@ -926,8 +1247,70 @@ fn row(label: &'static str, theme: &Theme) -> gpui::Div {
                 .flex_1()
                 .min_w_0()
                 .text_color(theme.foreground)
-                .child(label),
+                .child(label.into()),
         )
+}
+
+/// A row of a project's setting: its name and where its value comes from,
+/// and the control under them, as there is no room for all in a line.
+fn project_row(
+    label: &'static str,
+    origin: AnyElement,
+    control: impl IntoElement,
+    theme: &Theme,
+) -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(6.))
+        .px(px(12.))
+        .py(px(8.))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .child(div().flex_1().text_color(theme.foreground).child(label))
+                .child(origin),
+        )
+        .child(control)
+}
+
+/// A small label saying where a value comes from; `strong` when it is
+/// one of the user's own.
+fn pill(label: &'static str, strong: bool, theme: &Theme) -> gpui::Div {
+    div()
+        .px(px(6.))
+        .rounded(px(4.))
+        .text_xs()
+        .border_1()
+        .when(strong, |pill| {
+            pill.border_color(theme.accent).text_color(theme.accent)
+        })
+        .when(!strong, |pill| {
+            pill.border_color(theme.separator)
+                .text_color(theme.secondary)
+        })
+        .child(label)
+}
+
+/// A box that scrolls on its own inside the scrolling page: gpui hands a
+/// wheel to every scrolling box under the pointer, so the page would move
+/// along with it.
+fn scroll_alone(scrolling: impl IntoElement) -> gpui::Div {
+    div()
+        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+        .child(scrolling)
+}
+
+/// A small action in a card's corner, such as a reset.
+fn link(id: &'static str, label: &'static str, theme: &Theme) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .text_xs()
+        .text_color(theme.accent)
+        .cursor_pointer()
+        .child(label)
 }
 
 /// Settings that belong together, as macOS lays them out: a title over a
@@ -1171,7 +1554,7 @@ impl Preferences {
     /// A slider for one number of the settings: drag along it, or click
     /// where the value should be; the value reads after it.
     fn slider(&self, knob: Knob, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
-        let value = knob.get(&read());
+        let value = self.knob_value(knob);
         let frac = knob.fraction(value);
         let tracks = self.tracks.clone();
         let travel = SLIDER_WIDTH - KNOB_SIZE;
@@ -1258,10 +1641,31 @@ impl Preferences {
         let travel = f32::from(bounds.size.width) - KNOB_SIZE;
         let frac = (f32::from(x - bounds.left()) - KNOB_SIZE / 2.) / travel.max(1.);
         let value = knob.at(frac.clamp(0., 1.));
-        if knob.get(&read()) != value {
-            change(|settings| knob.set(settings, value), cx);
+        if self.knob_value(knob) != value {
+            match knob {
+                Knob::IdleDays => {
+                    ProjectSetting::IdleDays.set(&self.scope, Some(value.to_string()), cx)
+                }
+                Knob::FetchMinutes => {
+                    ProjectSetting::FetchMinutes.set(&self.scope, Some(value.to_string()), cx)
+                }
+                _ => change(|settings| knob.set(settings, value), cx),
+            }
         }
         cx.notify();
+    }
+
+    /// A slider's number: the app's, or the project's for idle days and
+    /// fetches.
+    fn knob_value(&self, knob: Knob) -> f32 {
+        let project = |setting: ProjectSetting, default: u32| {
+            setting.value(&self.scope).parse().unwrap_or(default as f32)
+        };
+        match knob {
+            Knob::IdleDays => project(ProjectSetting::IdleDays, DEFAULT_IDLE_DAYS),
+            Knob::FetchMinutes => project(ProjectSetting::FetchMinutes, DEFAULT_FETCH_MINUTES),
+            _ => knob.get(&read()),
+        }
     }
 
     /// Typing filters an open font dropdown; Esc closes it, then the window.
@@ -1285,29 +1689,565 @@ impl Preferences {
         cx.notify();
     }
 
-    /// A prompt the model is told, to edit in place, with a way back to the
-    /// built-in one.
-    fn prompt_field(
+    /// Shows a project's settings, following a repository's tab for its
+    /// channels.
+    fn pick(&mut self, scope: Scope, cx: &mut Context<Self>) {
+        self.watching = match &scope {
+            Scope::Repo(repo) => crate::workspace::repo_view(repo, cx)
+                .map(|view| cx.observe(&view, |_, _, cx| cx.notify())),
+            Scope::Global => None,
+        };
+        self.scope = scope;
+        self.project_menu = None;
+        self.channel_input.edit.set_text("");
+    }
+
+    /// The project's branch settings. Its channels: for a repository, the
+    /// main branch, the global patterns and its own, each with how many
+    /// branches it names; then a field to add one, telling what it would
+    /// name as it is typed. Then how long until a branch is idle.
+    fn branches_content(
         &self,
-        setting: PromptSetting,
+        theme: &Theme,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let scope = self.scope.clone();
+        let view = match &scope {
+            Scope::Repo(repo) => crate::workspace::repo_view(repo, cx),
+            Scope::Global => None,
+        };
+        let global = global_channels();
+        let tab = view.as_ref().map(|view| view.read(cx));
+        let count = |pattern: &str| tab.map(|tab| tab.channel_matches(pattern).len());
+        let line = || {
+            div()
+                .flex()
+                .items_center()
+                .gap(px(12.))
+                .min_h(px(36.))
+                .px(px(12.))
+                .py(px(4.))
+        };
+        let mut rows = Vec::new();
+        if let Some(tab) = tab {
+            rows.push(
+                line()
+                    .child(
+                        div()
+                            .flex_1()
+                            .truncate()
+                            .child(tab.channels().0.to_string()),
+                    )
+                    .child(div().text_color(theme.secondary).child("main branch")),
+            );
+        }
+        // A repository's own come after the global ones, which only Global
+        // drops.
+        let own: Vec<String> = match tab {
+            Some(tab) => tab
+                .channels()
+                .1
+                .iter()
+                .filter(|pattern| !global.contains(pattern))
+                .cloned()
+                .collect(),
+            None => global.clone(),
+        };
+        let inherited: Vec<String> = match scope {
+            Scope::Repo(_) => global.clone(),
+            Scope::Global => Vec::new(),
+        };
+        let patterns = inherited
+            .into_iter()
+            .map(|pattern| (pattern, false))
+            .chain(own.into_iter().map(|pattern| (pattern, true)));
+        for (pattern, removable) in patterns {
+            let found = count(&pattern);
+            let remove = pattern.clone();
+            let view = view.clone();
+            rows.push(
+                line()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .font_family(code_font())
+                            .child(pattern.clone()),
+                    )
+                    .when(!removable, |row| row.child(pill("Global", false, theme)))
+                    .children(found.map(|found| {
+                        div().text_color(theme.secondary).child(match found {
+                            1 => "1 branch".to_string(),
+                            n => format!("{n} branches"),
+                        })
+                    }))
+                    .when(removable, |row| {
+                        row.child(
+                            div()
+                                .id(SharedString::from(format!("channel-remove-{pattern}")))
+                                .px(px(4.))
+                                .rounded(px(3.))
+                                .text_color(theme.secondary)
+                                .cursor_pointer()
+                                .hover(|button| button.bg(theme.selection))
+                                .on_click(move |_, _, cx| match &view {
+                                    Some(view) => {
+                                        view.update(cx, |view, cx| view.remove_channel(&remove, cx))
+                                    }
+                                    None => {
+                                        let mut patterns = global_channels();
+                                        patterns.retain(|pattern| *pattern != remove);
+                                        set_global_channels(&patterns, cx);
+                                    }
+                                })
+                                .child("✕"),
+                        )
+                    }),
+            );
+        }
+        let hint = match tab {
+            Some(tab) => tab.channel_hint(self.channel_input.text()),
+            None => "* matches any run of characters, ? one, [0-9] one of a set. \
+                     Enter to add."
+                .to_string(),
+        };
+        let focused = self.channel_focus.is_focused(window);
+        let add = div()
+            .id("channel-add")
+            .track_focus(&self.channel_focus)
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                if event.keystroke.key == "enter" {
+                    let pattern = this.channel_input.text().trim().to_string();
+                    match &this.scope {
+                        Scope::Repo(repo) => {
+                            if let Some(view) = crate::workspace::repo_view(repo, cx) {
+                                view.update(cx, |view, cx| view.add_channel(&pattern, cx));
+                            }
+                        }
+                        Scope::Global => {
+                            let mut patterns = global_channels();
+                            if !pattern.is_empty() && !patterns.contains(&pattern) {
+                                patterns.push(pattern);
+                                set_global_channels(&patterns, cx);
+                            }
+                        }
+                    }
+                    this.channel_input.edit.set_text("");
+                } else if !this.channel_input.key(&event.keystroke, cx) {
+                    return;
+                }
+                cx.stop_propagation();
+                cx.notify();
+            }))
+            .w_full()
+            .px(px(8.))
+            .py(px(5.))
+            .rounded(px(6.))
+            .border_1()
+            .border_color(if focused {
+                theme.accent
+            } else {
+                theme.separator
+            })
+            .bg(theme.background)
+            .whitespace_nowrap()
+            .overflow_hidden()
+            .child(self.channel_input.render(
+                "channel-add-text",
+                "Add a branch or a pattern, such as v[0-9]*",
+                focused,
+                true,
+                Vec::new(),
+                &self.channel_focus,
+                theme,
+                |this: &mut Self| Some(&mut this.channel_input),
+                cx,
+            ));
+        let channels_note = match self.scope {
+            Scope::Global => {
+                "Branches finished work goes to, in every repository, besides its main \
+                 branch. Work merged into one is done, and Prune offers it."
+            }
+            Scope::Repo(_) => {
+                "Branches finished work goes to. Work merged into one is done, and \
+                 Prune offers it."
+            }
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(20.))
+            .child(group(
+                Some("Channels"),
+                rows.into_iter().chain([line().child(add)]),
+                None,
+                theme,
+            ))
+            .child(
+                div()
+                    .px(px(12.))
+                    .mt(px(-14.))
+                    .text_xs()
+                    .text_color(theme.secondary)
+                    .child(hint)
+                    .child(div().pt(px(4.)).child(channels_note)),
+            )
+            .child(group(
+                Some("Branches"),
+                [project_row(
+                    "Idle after",
+                    self.origin(ProjectSetting::IdleDays, theme, cx),
+                    self.slider(Knob::IdleDays, theme, cx),
+                    theme,
+                )],
+                Some("A branch without commits for this long reads as idle, and Prune offers it."),
+                theme,
+            ))
+    }
+
+    /// The project's name: its folder's, or Global.
+    fn scope_name(&self) -> String {
+        match &self.scope {
+            Scope::Global => "Global".to_string(),
+            Scope::Repo(repo) => crate::workspace::folder_name(repo),
+        }
+    }
+
+    /// Where the project's settings are kept, over its sections.
+    fn scope_note(&self, theme: &Theme) -> gpui::Div {
+        div()
+            .px(px(12.))
+            .text_xs()
+            .text_color(theme.secondary)
+            .child(match self.scope {
+                Scope::Global => {
+                    "Every repository's, kept in your global git config, ~/.gitconfig. A \
+                     repository's own come first."
+                }
+                Scope::Repo(_) => {
+                    "This repository's, kept in its git config and shared by its \
+                     worktrees. What it has none of comes from Global."
+                }
+            })
+    }
+
+    /// The open list of projects to show the settings of: global, then each
+    /// repository open in a tab.
+    fn project_menu(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let position = self.project_menu?;
+        let mut repos: Vec<String> = Vec::new();
+        for view in crate::workspace::repo_views(cx) {
+            if let Some(path) = view.read(cx).repo_path()
+                && !repos.iter().any(|repo| repo == path)
+            {
+                repos.push(path.to_string());
+            }
+        }
+        let scopes = [Scope::Global]
+            .into_iter()
+            .chain(repos.into_iter().map(Scope::Repo));
+        let items = scopes.enumerate().map(|(k, scope)| {
+            let chosen = self.scope == scope;
+            let (name, place) = match &scope {
+                Scope::Global => ("Global".to_string(), "every repository".to_string()),
+                Scope::Repo(repo) => (crate::workspace::folder_name(repo), repo.clone()),
+            };
+            div()
+                .id(("project", k))
+                .flex()
+                .gap(px(6.))
+                .px(px(8.))
+                .py(px(2.))
+                .hover(|item| item.bg(theme.selection))
+                .cursor_pointer()
+                .child(div().w(px(10.)).child(if chosen { "✓" } else { "" }))
+                .child(div().child(name))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_right()
+                        .text_color(theme.secondary)
+                        .child(place),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.pick(scope.clone(), cx);
+                    cx.notify();
+                }))
+        });
+        let menu = div()
+            .id("project-menu")
+            .occlude()
+            .flex()
+            .flex_col()
+            .w(px(320.))
+            .py(px(4.))
+            .rounded(px(6.))
+            .border_1()
+            .border_color(theme.separator)
+            .bg(theme.background)
+            .shadow_md()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.project_menu = None;
+                cx.notify();
+            }))
+            .children(items);
+        Some(
+            gpui::deferred(
+                gpui::anchored()
+                    .position(position)
+                    .snap_to_window()
+                    .child(menu),
+            )
+            .with_priority(1)
+            .into_any_element(),
+        )
+    }
+
+    /// The last request of a kind the model got this run, filled in as
+    /// sent, with its answer; folded under a line saying when it went.
+    fn last_sent(
+        &self,
+        request: wtf_core::Request,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let note = div().px(px(12.)).text_xs().text_color(theme.secondary);
+        let Some(sent) = wtf_core::last_sent(request) else {
+            return note.child("Nothing sent with it yet since wtf started.");
+        };
+        let open = self.showing_sent == Some(request);
+        let age = crate::repo_view::short_age(sent.time, crate::repo_view::now_seconds());
+        let answer = match &sent.answer {
+            Ok(answer) => answer.trim().to_string(),
+            Err(error) => format!("Failed: {error}"),
+        };
+        let parts = [
+            ("Instructions", sent.instructions.trim().to_string()),
+            ("Input", sent.input.trim().to_string()),
+            ("Answer", answer),
+        ];
+        let whole: String = parts
+            .iter()
+            .filter(|(_, text)| !text.is_empty())
+            .map(|(title, text)| format!("{}:\n{text}", title.to_uppercase()))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let toggle = div()
+            .id(("last-sent", request as usize))
+            .text_color(theme.accent)
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.showing_sent = (this.showing_sent != Some(request)).then_some(request);
+                cx.notify();
+            }))
+            .child(format!(
+                "{} Last sent, {age} ago, as the model got it",
+                if open { "▾" } else { "▸" }
+            ));
+        let line = note.flex().gap(px(12.)).child(toggle).when(open, |line| {
+            line.child(link("copy-sent", "Copy", theme).on_click(move |_, _, cx| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(whole.clone()))
+            }))
+        });
+        if !open {
+            return line;
+        }
+        let blocks = parts
+            .into_iter()
+            .filter(|(_, text)| !text.is_empty())
+            .map(|(title, text)| {
+                // At full height, for the box to scroll rather than squeeze.
+                div()
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .child(
+                        div()
+                            .font_family(ui_font())
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme.secondary)
+                            .child(title),
+                    )
+                    .child(div().whitespace_normal().child(text))
+            });
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .child(line)
+            .child(scroll_alone(
+                card(theme)
+                    .id(("sent-text", request as usize))
+                    .max_h(px(280.))
+                    .overflow_y_scroll()
+                    .gap(px(10.))
+                    .p(px(10.))
+                    .text_xs()
+                    .font_family(code_font())
+                    .children(blocks),
+            ))
+    }
+
+    /// The commands the terminal never shows, a pattern a line.
+    fn hidden_commands_field(
+        &self,
         theme: &Theme,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let (label, custom, k) = match setting {
-            PromptSetting::Summary => ("Summary prompt", read().summary_prompt.is_some(), 0),
-            PromptSetting::Message => ("Commit message prompt", read().message_prompt.is_some(), 1),
-            PromptSetting::TextOnly => (
+        let label = "Never show commands matching, a pattern a line, such as git rev-parse*";
+        self.field_card(
+            HIDDEN_FIELD,
+            label,
+            None,
+            theme,
+            window,
+            cx,
+            |_, text, cx| {
+                let text = (!text.trim().is_empty()).then_some(text);
+                change(|settings| settings.terminal_hidden = text, cx)
+            },
+        )
+    }
+
+    /// Where the project's value of `setting` comes from, and a way back to
+    /// what it would go by when it is its own.
+    fn origin(&self, setting: ProjectSetting, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let scope = self.scope.clone();
+        let own = setting.own(&scope).is_some();
+        let from_global = scope
+            .outer()
+            .is_some_and(|outer| setting.own(&outer).is_some());
+        let none = setting.built_in().is_empty();
+        let (label, back) = match (&scope, own, from_global) {
+            (Scope::Global, true, _) if none => (pill("Set", true, theme), "Clear"),
+            (Scope::Repo(_), true, false) if none => (pill("This repo's", true, theme), "Clear"),
+            (_, false, false) if none => (pill("Not set", false, theme), ""),
+            (Scope::Global, true, _) => (pill("Custom", true, theme), "Reset to built-in"),
+            (Scope::Repo(_), true, true) => (pill("This repo's", true, theme), "Use global"),
+            (Scope::Repo(_), true, false) => {
+                (pill("This repo's", true, theme), "Reset to built-in")
+            }
+            (Scope::Repo(_), false, true) => (pill("Global", false, theme), ""),
+            (_, false, _) => (pill("Built-in", false, theme), ""),
+        };
+        div()
+            .flex()
+            .gap(px(8.))
+            .child(label)
+            .when(own, |aside| {
+                aside.child(
+                    link(setting.key(), back, theme)
+                        .on_click(cx.listener(move |_, _, _, cx| setting.set(&scope, None, cx))),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// A project's setting of one line, such as the author's email: its
+    /// name and where it comes from over the field.
+    fn line_field(
+        &self,
+        setting: ProjectSetting,
+        label: &'static str,
+        k: usize,
+        theme: &Theme,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let focus = &self.prompt_focus[k];
+        let focused = focus.is_focused(window);
+        let scope = self.scope.clone();
+        let input = div()
+            .id(("line-field", k))
+            .track_focus(focus)
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                let field = &mut this.prompts[k];
+                let before = field.text().to_string();
+                if !field.key(&event.keystroke, cx) {
+                    return;
+                }
+                cx.stop_propagation();
+                let text = field.text().to_string();
+                if text != before {
+                    setting.set(&scope, Some(text), cx);
+                }
+                cx.notify();
+            }))
+            .w_full()
+            .px(px(8.))
+            .py(px(4.))
+            .rounded(px(6.))
+            .border_1()
+            .border_color(if focused {
+                theme.accent
+            } else {
+                theme.separator
+            })
+            .bg(theme.background)
+            .whitespace_nowrap()
+            .overflow_hidden()
+            .child(self.prompts[k].render(
+                ("line-field-text", k),
+                "Not set",
+                focused,
+                true,
+                Vec::new(),
+                focus,
+                theme,
+                move |this: &mut Self| this.prompts.get_mut(k),
+                cx,
+            ));
+        project_row(label, self.origin(setting, theme, cx), input, theme)
+    }
+
+    /// A project's setting, showing what it goes by, editing its own.
+    fn project_field(
+        &self,
+        setting: ProjectSetting,
+        theme: &Theme,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let (label, k) = match setting {
+            ProjectSetting::Summary => ("Summary template", PROJECT_FIELDS + 1),
+            ProjectSetting::Message => ("Commit message template", PROJECT_FIELDS + 2),
+            _ => (
                 "Text diff for these files, a pattern a line",
-                read().text_only.is_some(),
-                2,
-            ),
-            PromptSetting::HiddenCommands => (
-                "Never show commands matching, a pattern a line, such as git rev-parse*",
-                read().terminal_hidden.is_some(),
-                3,
+                PROJECT_FIELDS,
             ),
         };
+        let origin = self.origin(setting, theme, cx);
+        let scope = self.scope.clone();
+        self.field_card(
+            k,
+            label,
+            Some(origin),
+            theme,
+            window,
+            cx,
+            move |_, text, cx| setting.set(&scope, Some(text), cx),
+        )
+    }
+
+    /// Field `k` in a card under `label`, with `aside` at its right, telling
+    /// `edited` each change of its text.
+    #[allow(clippy::too_many_arguments)]
+    fn field_card(
+        &self,
+        k: usize,
+        label: &'static str,
+        aside: Option<AnyElement>,
+        theme: &Theme,
+        window: &Window,
+        cx: &mut Context<Self>,
+        edited: impl Fn(&mut Self, String, &mut Context<Self>) + 'static,
+    ) -> impl IntoElement {
         let focus = &self.prompt_focus[k];
         let focused = focus.is_focused(window);
         card(theme)
@@ -1321,23 +2261,11 @@ impl Preferences {
                     .gap(px(8.))
                     .child(div().child(label))
                     .child(div().flex_1())
-                    .when(custom, |row| {
-                        row.child(
-                            div()
-                                .id(label)
-                                .text_xs()
-                                .text_color(theme.accent)
-                                .cursor_pointer()
-                                .on_click(cx.listener(move |_, _, _, cx| {
-                                    change(|settings| setting.set(settings, None), cx)
-                                }))
-                                .child("Reset to built-in"),
-                        )
-                    }),
+                    .children(aside),
             )
-            .child(
+            .child(scroll_alone(
                 div()
-                    .id(SharedString::from(format!("{label}-field")))
+                    .id(("field", k))
                     .track_focus(focus)
                     .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
                         let field = &mut this.prompts[k];
@@ -1348,7 +2276,7 @@ impl Preferences {
                         cx.stop_propagation();
                         let text = field.text().to_string();
                         if text != before {
-                            change(|settings| setting.set(settings, Some(text)), cx);
+                            edited(this, text, cx);
                         }
                         cx.notify();
                     }))
@@ -1367,22 +2295,17 @@ impl Preferences {
                     })
                     .text_xs()
                     .child(self.prompts[k].render(
-                        SharedString::from(format!("{label}-text")),
+                        ("field-text", k),
                         "",
                         focused,
                         true,
                         Vec::new(),
                         focus,
                         theme,
-                        match k {
-                            0 => |this: &mut Self| Some(&mut this.prompts[0]),
-                            1 => |this: &mut Self| Some(&mut this.prompts[1]),
-                            2 => |this: &mut Self| Some(&mut this.prompts[2]),
-                            _ => |this: &mut Self| Some(&mut this.prompts[3]),
-                        },
+                        move |this: &mut Self| this.prompts.get_mut(k),
                         cx,
                     )),
-            )
+            ))
     }
 
     /// A button showing a font, opening the dropdown to choose another.
@@ -1544,20 +2467,33 @@ impl Preferences {
 impl Render for Preferences {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         window.set_rem_size(px(ui_size()));
-        // A prompt not being edited shows the one in the settings, which
-        // may have been reset.
-        for (k, setting) in [
-            PromptSetting::Summary,
-            PromptSetting::Message,
-            PromptSetting::TextOnly,
-            PromptSetting::HiddenCommands,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let text = setting.text();
+        // A field not being edited shows the setting as it stands, which
+        // may have been reset, or be another project's.
+        let hidden = read().terminal_hidden.clone().unwrap_or_default();
+        let fields = [
+            (HIDDEN_FIELD, hidden),
+            (PROJECT_FIELDS, ProjectSetting::TextDiff.value(&self.scope)),
+            (
+                PROJECT_FIELDS + 1,
+                ProjectSetting::Summary.value(&self.scope),
+            ),
+            (
+                PROJECT_FIELDS + 2,
+                ProjectSetting::Message.value(&self.scope),
+            ),
+        ];
+        for (k, text) in fields {
             if !self.prompt_focus[k].is_focused(window) && self.prompts[k].text() != text {
                 self.prompts[k].edit = LineEdit::multiline(text);
+            }
+        }
+        for (k, setting) in [ProjectSetting::Name, ProjectSetting::Email]
+            .into_iter()
+            .enumerate()
+        {
+            let (k, text) = (PROJECT_FIELDS + 3 + k, setting.value(&self.scope));
+            if !self.prompt_focus[k].is_focused(window) && self.prompts[k].text() != text {
+                self.prompts[k].edit = LineEdit::new(text);
             }
         }
         let theme = Theme::for_appearance(window.appearance());
@@ -1678,29 +2614,13 @@ impl Render for Preferences {
                             |chars, cx| change(|settings| settings.one_column_below = chars, cx),
                             &theme,
                         )),
-                        row("Text diff above", &theme).child(segmented(
-                            "structural-max",
-                            &[
-                                ("100 KB", 100),
-                                ("200 KB", 200),
-                                ("500 KB", 500),
-                                ("1 MB", 1024),
-                                ("Any size", 0),
-                            ],
-                            settings.structural_max_kb,
-                            |kb, cx| change(|settings| settings.structural_max_kb = kb, cx),
-                            &theme,
-                        )),
                     ],
                     Some(
                         "Characters of code. A split diff narrower than this shows old and \
-                         new lines in one column; Split and Unified in the strip choose by hand. \
-                         Larger files, and those below, get the text diff even in Structural \
-                         mode: their structure is slow to find and tells little.",
+                         new lines in one column; Split and Unified in the strip choose by hand.",
                     ),
                     &theme,
                 ))
-                .child(self.prompt_field(PromptSetting::TextOnly, &theme, window, cx))
                 .child(group(
                     Some("Apple Intelligence"),
                     [
@@ -1713,12 +2633,12 @@ impl Render for Preferences {
                     Some(
                         "Several selected commits are summarized, and commit messages \
                          written, by Apple's on-device model, through the fm command. \
-                         Nothing leaves this Mac.",
+                         Nothing leaves this Mac. What it is told, and which files get \
+                         the text diff, are a project's: Review under Global or a \
+                         repository.",
                     ),
                     &theme,
-                ))
-                .child(self.prompt_field(PromptSetting::Summary, &theme, window, cx))
-                .child(self.prompt_field(PromptSetting::Message, &theme, window, cx)),
+                )),
             Section::Terminal => div()
                 .child(group(
                     Some("Show the app's commands"),
@@ -1748,32 +2668,174 @@ impl Render for Preferences {
                     ),
                     &theme,
                 ))
-                .child(self.prompt_field(PromptSetting::HiddenCommands, &theme, window, cx)),
-            Section::Remote => div().child(group(
+                .child(self.hidden_commands_field(&theme, window, cx)),
+            Section::Author => div().child(self.scope_note(&theme)).child(group(
                 None,
                 [
-                    row("Fetch in background", &theme).child(self.slider(
-                        Knob::FetchMinutes,
+                    self.line_field(
+                        ProjectSetting::Name,
+                        "Name",
+                        PROJECT_FIELDS + 3,
                         &theme,
+                        window,
                         cx,
-                    )),
-                    row("Prune on fetch", &theme).child(switch_for(
-                        "prune",
-                        settings.fetch_prune,
-                        |s, on| s.fetch_prune = on,
-                    )),
-                    row("Ahead/behind badges", &theme).child(switch_for(
-                        "badges",
-                        settings.sync_badges,
-                        |s, on| s.sync_badges = on,
-                    )),
+                    ),
+                    self.line_field(
+                        ProjectSetting::Email,
+                        "Email",
+                        PROJECT_FIELDS + 4,
+                        &theme,
+                        window,
+                        cx,
+                    ),
                 ],
                 Some(
-                    "Fetches every remote. Pruning drops remote branches deleted there, so \
-                     local ones tracking them read as remote gone.",
+                    "Who commits are by: git's user.name and user.email, which git \
+                     commit in a terminal goes by too.",
                 ),
                 &theme,
             )),
+            Section::Branches => div()
+                .child(self.scope_note(&theme))
+                .child(self.branches_content(&theme, window, cx)),
+            Section::Diffs => {
+                let scope = self.scope.clone();
+                let kb = ProjectSetting::TextDiffAbove
+                    .value(&scope)
+                    .parse()
+                    .unwrap_or(DEFAULT_TEXT_DIFF_ABOVE);
+                div()
+                    .child(self.scope_note(&theme))
+                    .child(group(
+                        None,
+                        [project_row(
+                            "Text diff above",
+                            self.origin(ProjectSetting::TextDiffAbove, &theme, cx),
+                            segmented(
+                                "text-diff-above",
+                                &[
+                                    ("100 KB", 100),
+                                    ("200 KB", 200),
+                                    ("500 KB", 500),
+                                    ("1 MB", 1024),
+                                    ("Any size", 0),
+                                ],
+                                kb,
+                                move |kb: usize, cx| {
+                                    ProjectSetting::TextDiffAbove.set(
+                                        &scope,
+                                        Some(kb.to_string()),
+                                        cx,
+                                    )
+                                },
+                                &theme,
+                            ),
+                            &theme,
+                        )],
+                        Some(
+                            "Larger files, and those below, get the text diff even in \
+                             Structural mode: their structure is slow to find and tells little.",
+                        ),
+                        &theme,
+                    ))
+                    .child(self.project_field(ProjectSetting::TextDiff, &theme, window, cx))
+            }
+            Section::Messages => div()
+                .child(self.scope_note(&theme))
+                .child(self.project_field(ProjectSetting::Summary, &theme, window, cx))
+                .child(self.last_sent(wtf_core::Request::Summary, &theme, cx))
+                .child(self.project_field(ProjectSetting::Message, &theme, window, cx))
+                .child(self.last_sent(wtf_core::Request::Message, &theme, cx))
+                .child(
+                    div()
+                        .px(px(12.))
+                        .text_xs()
+                        .text_color(theme.secondary)
+                        .child(TEMPLATE_NOTE),
+                ),
+            Section::Sync => {
+                let scope = self.scope.clone();
+                let prune = git_bool(&ProjectSetting::Prune.value(&scope));
+                let option = |setting: ProjectSetting| -> usize {
+                    setting.value(&scope).parse().unwrap_or(0)
+                };
+                let (pull, push) = (option(ProjectSetting::Pull), option(ProjectSetting::Push));
+                let set = |setting: ProjectSetting| {
+                    let scope = scope.clone();
+                    move |at: usize, cx: &mut App| setting.set(&scope, Some(at.to_string()), cx)
+                };
+                let set_prune = {
+                    let scope = scope.clone();
+                    move |on: bool, cx: &mut App| {
+                        ProjectSetting::Prune.set(&scope, Some(on.to_string()), cx)
+                    }
+                };
+                div()
+                    .child(self.scope_note(&theme))
+                    .child(group(
+                        Some("Fetch"),
+                        [
+                            project_row(
+                                "In the background",
+                                self.origin(ProjectSetting::FetchMinutes, &theme, cx),
+                                self.slider(Knob::FetchMinutes, &theme, cx),
+                                &theme,
+                            ),
+                            project_row(
+                                "Prune",
+                                self.origin(ProjectSetting::Prune, &theme, cx),
+                                switch("prune", prune, set_prune, &theme),
+                                &theme,
+                            ),
+                        ],
+                        Some(
+                            "Fetches every remote. Pruning drops remote branches deleted there, \
+                             so local ones tracking them read as remote gone; kept as git's \
+                             fetch.prune, which git fetch in a terminal goes by too.",
+                        ),
+                        &theme,
+                    ))
+                    .child(group(
+                        Some("Buttons"),
+                        [
+                            project_row(
+                                "Pull runs",
+                                self.origin(ProjectSetting::Pull, &theme, cx),
+                                segmented(
+                                    "pull-option",
+                                    &[
+                                        ("Merge", 0),
+                                        ("Fast-forward", 1),
+                                        ("Rebase", 2),
+                                        ("Rebase, stash", 3),
+                                    ],
+                                    pull,
+                                    set(ProjectSetting::Pull),
+                                    &theme,
+                                ),
+                                &theme,
+                            ),
+                            project_row(
+                                "Push runs",
+                                self.origin(ProjectSetting::Push, &theme, cx),
+                                segmented(
+                                    "push-option",
+                                    &[("Push", 0), ("Force with lease", 1), ("No verify", 2)],
+                                    push,
+                                    set(ProjectSetting::Push),
+                                    &theme,
+                                ),
+                                &theme,
+                            ),
+                        ],
+                        Some(
+                            "What the Pull and Push buttons run; their menus run the others \
+                             once. Pull is kept as git's pull.rebase, pull.ff and \
+                             rebase.autoStash, which git pull in a terminal goes by too.",
+                        ),
+                        &theme,
+                    ))
+            }
             // A sample graph, drawn as the settings stand, over them in groups:
             // where things go, how commits look, how lines look.
             Section::Graph => div()
@@ -1784,13 +2846,6 @@ impl Render for Preferences {
                         row("Row height", &theme).child(self.slider(Knob::RowHeight, &theme, cx)),
                         row("Node spacing", &theme).child(self.slider(Knob::Column, &theme, cx)),
                         row("Curve length", &theme).child(self.slider(Knob::Curve, &theme, cx)),
-                        row("Stacked branches", &theme).child(segmented(
-                            "graph-stairs",
-                            &[("In a row", false), ("As stairs", true)],
-                            graph.stairs,
-                            |stairs, cx| change(|settings| settings.graph.stairs = stairs, cx),
-                            &theme,
-                        )),
                     ],
                     None,
                     &theme,
@@ -1823,9 +2878,13 @@ impl Render for Preferences {
                     &theme,
                 ))
                 .child(group(
-                    Some("Branches"),
-                    [row("Idle after", &theme).child(self.slider(Knob::IdleDays, &theme, cx))],
-                    None,
+                    Some("Labels"),
+                    [row("Ahead/behind badges", &theme).child(switch_for(
+                        "badges",
+                        settings.sync_badges,
+                        |s, on| s.sync_badges = on,
+                    ))],
+                    Some("How far a branch is from its upstream, as ↑2 ↓1."),
                     &theme,
                 ))
                 .child(
@@ -1841,14 +2900,8 @@ impl Render for Preferences {
                             .hover(|button| button.bg(theme.selection))
                             .cursor_pointer()
                             .on_click(cx.listener(|_, _, _, cx| {
-                                // Everything in this section, idle days too.
-                                change(
-                                    |settings| {
-                                        settings.graph = GraphStyle::default();
-                                        settings.idle_days = Settings::default().idle_days;
-                                    },
-                                    cx,
-                                )
+                                // Everything in this section.
+                                change(|settings| settings.graph = GraphStyle::default(), cx)
                             }))
                             .child("Reset to Defaults"),
                     ),
@@ -1858,9 +2911,9 @@ impl Render for Preferences {
         .flex()
         .flex_col()
         .gap(px(20.));
-        let sections = Section::ALL.map(|section| {
+        let item = |section: Section| {
             div()
-                .id(section.title())
+                .id(("section", section as usize))
                 .px(px(10.))
                 .py(px(5.))
                 .rounded(px(6.))
@@ -1878,7 +2931,44 @@ impl Render for Preferences {
                     cx.notify();
                 }))
                 .child(section.title())
-        });
+        };
+        let sections = Section::ALL.map(&item);
+        // The app's settings, then a project's: global ones or a
+        // repository's, under a button to pick which.
+        let heading = |text: &'static str| {
+            div()
+                .px(px(10.))
+                .pb(px(2.))
+                .text_xs()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(theme.secondary)
+                .child(text)
+        };
+        let picker = div()
+            .id("project-picker")
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .mx(px(4.))
+            .mb(px(2.))
+            .px(px(6.))
+            .py(px(2.))
+            .rounded(px(5.))
+            .border_1()
+            .border_color(theme.separator)
+            .bg(theme.background)
+            .cursor_pointer()
+            .hover(|button| button.bg(theme.selection))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
+                    this.project_menu = Some(event.position);
+                    cx.notify();
+                }),
+            )
+            .child(div().flex_1().truncate().child(self.scope_name()))
+            .child(div().text_color(theme.secondary).child("▾"));
+        let project_sections = Section::PROJECT.map(&item);
 
         div()
             .id("preferences")
@@ -1925,7 +3015,11 @@ impl Render for Preferences {
                     .bg(theme.filler)
                     .border_r_1()
                     .border_color(theme.separator)
+                    .child(heading("App"))
                     .children(sections)
+                    .child(heading("Project").mt(px(14.)))
+                    .child(picker)
+                    .children(project_sections)
                     .child(div().flex_1())
                     .child(
                         div()
@@ -1950,15 +3044,33 @@ impl Render for Preferences {
                     .py(px(20.))
                     .child(
                         div()
-                            .text_lg()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .child(self.section.title()),
+                            .flex()
+                            .items_baseline()
+                            .gap(px(8.))
+                            .child(
+                                div()
+                                    .text_lg()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .child(self.section.title()),
+                            )
+                            .when(Section::PROJECT.contains(&self.section), |title| {
+                                title.child(
+                                    div().text_color(theme.secondary).child(self.scope_name()),
+                                )
+                            }),
                     )
                     .child(content),
             )
             .children(self.font_menu(&theme, cx))
+            .children(self.project_menu(&theme, cx))
     }
 }
+
+/// What a prompt template may hold, said under the prompts.
+const TEMPLATE_NOTE: &str = "Above a line of ---, the model's instructions; below it, what \
+it reads. Without the line, all of it is what it reads. {{diff}} the changes, {{files}} the files \
+changed, {{commits}} the commits summarized, {{examples 3}} the latest 3 commit subjects. The \
+model reads about 6000 characters at most: put {{diff}} last.";
 
 #[cfg(test)]
 mod tests {
@@ -1967,8 +3079,7 @@ mod tests {
     #[test]
     fn settings_survive_saving_and_loading() {
         let settings = Settings {
-            summary_prompt: Some("Two\nlines".to_string()),
-            message_prompt: Some(" Write \\n, not C:\\dir ".to_string()),
+            terminal_hidden: Some(" git log\\n, not C:\\dir\nTwo".to_string()),
             summaries: Some(true),
             ui_font: "Helvetica".into(),
             code_font: "SF Mono".into(),
@@ -1985,6 +3096,42 @@ mod tests {
     }
 
     #[test]
+    fn settings_projects_keep_now_leave_the_file() {
+        let text =
+            "idle_days=14\nsummary_prompt=One\\ntwo\ntext_only=*.lock\\n*.snap\nidle_days=30\n";
+        assert_eq!(
+            moved_settings(text),
+            [
+                ("wtf.summaryTemplate", vec!["One\ntwo".to_string()]),
+                (
+                    "wtf.textDiff",
+                    vec!["*.lock".to_string(), "*.snap".to_string()]
+                ),
+                ("wtf.idleDays", vec!["30".to_string()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn pull_options_go_by_git_config_and_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().to_string_lossy().into_owned();
+        std::process::Command::new("git")
+            .args(["init", "-q", &repo])
+            .status()
+            .unwrap();
+        let config = wtf_core::ConfigScope::Repo(&repo);
+        assert_eq!(pull_option(config), None);
+        for option in 0..4 {
+            set_pull_option(config, Some(option)).unwrap();
+            assert_eq!(pull_option(config), Some(option));
+        }
+        set_pull_option(config, None).unwrap();
+        assert_eq!(pull_option(config), None);
+        assert!(wtf_core::project_values(config, "rebase.autoStash").is_empty());
+    }
+
+    #[test]
     fn unknown_and_bad_lines_keep_defaults() {
         let settings = parse("graph.dot=big\nnope=1\ncode_size=13\n");
         assert_eq!(settings.graph.dot, GraphStyle::default().dot);
@@ -1994,15 +3141,9 @@ mod tests {
 
     #[test]
     fn numbers_out_of_range_are_clamped() {
-        let settings = parse("ui_size=0\ncode_size=NaN\npush_option=99\n");
+        let settings = parse("ui_size=0\ncode_size=NaN\n");
         assert_eq!(settings.ui_size, 12.);
         assert_eq!(settings.code_size, Settings::default().code_size);
-        assert_eq!(settings.push_option, sync::PUSH.len() - 1);
-        // A pull option no longer offered goes back to the default.
-        assert_eq!(
-            parse("pull_option=4\n").pull_option,
-            Settings::default().pull_option
-        );
     }
 
     #[test]
@@ -2031,7 +3172,6 @@ mod tests {
             Knob::CodeWeight,
             Knob::CodeLine,
             Knob::TerminalLine,
-            Knob::FetchMinutes,
             Knob::RowHeight,
             Knob::Column,
             Knob::Curve,
@@ -2040,7 +3180,6 @@ mod tests {
             Knob::Beads,
             Knob::Line,
             Knob::HoverLine,
-            Knob::IdleDays,
         ];
         for knob in knobs {
             for k in 0..=40 {

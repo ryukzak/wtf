@@ -7140,6 +7140,7 @@ dependencies = [
  "objc",
  "raw-window-handle",
  "syntect",
+ "tempfile",
  "unicode-width",
  "wtf_core",
 ]

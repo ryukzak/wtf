@@ -651,7 +651,7 @@ impl RepoView {
         let (base, tip) = (node.base.clone(), node.tip.clone());
         self.summaries.insert(key.clone(), None);
         self.bar_summary_running = true;
-        let prompt = preferences::summary_prompt();
+        let prompt = preferences::summary_template(&repo);
         let run = cx.background_executor().spawn(async move {
             wtf_core::summarize_commits(&repo, &commits, base.as_deref(), &tip, &prompt)
                 .map_err(message)

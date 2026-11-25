@@ -101,7 +101,7 @@ impl Field {
         styles: Vec<(Range<usize>, HighlightStyle)>,
         focus: &gpui::FocusHandle,
         theme: &Theme,
-        field: fn(&mut V) -> Option<&mut Field>,
+        field: impl Fn(&mut V) -> Option<&mut Field> + Copy + 'static,
         cx: &mut Context<V>,
     ) -> AnyElement {
         let caret_color = theme.accent;

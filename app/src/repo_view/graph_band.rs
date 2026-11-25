@@ -440,7 +440,7 @@ impl RepoView {
         let key = (
             self.worktree_order,
             preferences::graph(),
-            preferences::idle_days(),
+            self.graph.idle_days,
             preferences::sync_badges(),
             now_seconds() / 3_600,
         );

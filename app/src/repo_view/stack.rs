@@ -22,7 +22,7 @@ impl RepoView {
             .iter()
             .map(|file| self.many_files() && self.is_folded(file.path()))
             .collect();
-        let text_only = preferences::text_only_rule();
+        let text_only = preferences::text_only_rule(&repo_path);
         let load = cx.background_executor().spawn(async move {
             let diffs = files
                 .iter()

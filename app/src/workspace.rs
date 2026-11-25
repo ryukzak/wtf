@@ -484,7 +484,7 @@ impl Workspace {
             true => ("↑", ahead),
             false => ("↓", behind),
         };
-        let option = crate::preferences::sync_option(push);
+        let option = crate::preferences::sync_option(push, view.repo_path().unwrap_or_default());
         let options = crate::sync::options(push);
         let label = options
             .get(option)
@@ -557,8 +557,8 @@ impl Workspace {
             )
     }
 
-    /// The options of the open Pull or Push menu: each runs at once and
-    /// becomes what its button runs.
+    /// The options of the open Pull or Push menu: each runs at once; the one
+    /// marked is what the button runs, as the project's settings choose.
     fn sync_menu(
         &self,
         theme: &Theme,
@@ -567,7 +567,11 @@ impl Workspace {
     ) -> Option<AnyElement> {
         let push = self.sync_menu?;
         let options = crate::sync::options(push);
-        let chosen = crate::preferences::sync_option(push);
+        let repo = self.tabs[self.active]
+            .read(cx)
+            .repo_path()
+            .unwrap_or_default();
+        let chosen = crate::preferences::sync_option(push, repo);
         let rows = options.iter().enumerate().map(|(k, option)| {
             div()
                 .id(("sync-option", k))
@@ -582,7 +586,6 @@ impl Workspace {
                 .when(k == chosen, |row| row.bg(theme.selection.opacity(0.5)))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.sync_menu = None;
-                    crate::preferences::set_sync_option(push, k, cx);
                     this.tabs[this.active].update(cx, |view, cx| view.sync(push, k, cx));
                 }))
                 .child(div().flex_none().child(crate::sync::label(push, option)))
@@ -769,6 +772,43 @@ pub fn open_paths(paths: Vec<String>, cx: &mut App) {
     if !missing.is_empty() {
         open_window(missing, cx);
     }
+}
+
+/// The repository tabs of every window, the front window's shown one first.
+pub fn repo_views(cx: &App) -> Vec<Entity<RepoView>> {
+    let front = cx.active_window();
+    let mut windows = cx.windows();
+    windows.sort_by_key(|window| Some(*window) != front);
+    let mut views = Vec::new();
+    for window in windows {
+        let Some(workspace) = window.downcast::<Workspace>() else {
+            continue;
+        };
+        if let Ok(workspace) = workspace.read(cx) {
+            views.extend(workspace.tabs.get(workspace.active).cloned());
+            views.extend(
+                (0..workspace.tabs.len())
+                    .filter(|&k| k != workspace.active)
+                    .map(|k| workspace.tabs[k].clone()),
+            );
+        }
+    }
+    views
+}
+
+/// The repository the front window shows, when it is a window of tabs.
+pub fn front_repo(cx: &App) -> Option<String> {
+    let workspace = cx.active_window()?.downcast::<Workspace>()?;
+    let workspace = workspace.read(cx).ok()?;
+    let tab = workspace.tabs.get(workspace.active)?;
+    tab.read(cx).repo_path().map(str::to_string)
+}
+
+/// The tab showing `repo`, in whichever window.
+pub fn repo_view(repo: &str, cx: &App) -> Option<Entity<RepoView>> {
+    repo_views(cx)
+        .into_iter()
+        .find(|view| view.read(cx).repo_path() == Some(repo))
 }
 
 /// A local path from a `file://` URL, with percent escapes decoded.
