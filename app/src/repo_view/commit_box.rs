@@ -526,16 +526,17 @@ impl RepoView {
                                     .justify_center()
                                     .gap(px(6.))
                                     .text_color(theme.secondary)
-                                    .child(
-                                        div().child("✦").with_animation(
-                                            "writing-message",
-                                            Animation::new(Duration::from_millis(1200))
-                                                .repeat()
-                                                .with_easing(pulsating_between(0.25, 1.)),
-                                            |mark, delta| mark.opacity(delta),
-                                        ),
-                                    )
-                                    .child("Writing a commit message…"),
+                                    .child(working_mark(
+                                        "writing-message",
+                                        (preferences::ui_size() * 0.85).round(),
+                                        theme,
+                                    ))
+                                    .child(shimmer(
+                                        "writing-message-text",
+                                        "Writing a commit message…".to_string(),
+                                        theme.secondary,
+                                        theme.foreground,
+                                    )),
                             )
                         },
                     )
@@ -543,7 +544,7 @@ impl RepoView {
                     // corner that says so on hover.
                     .children(self.suggesting().then(|| {
                         let note = "Written by Apple Intelligence from what is staged; rewritten \
-                                    as staging changes until you edit it. Click ✦ for another \
+                                    as staging changes until you edit it. Click the dots for another \
                                     wording. ⌘Z brings back what was there.";
                         div()
                             .absolute()
@@ -553,14 +554,12 @@ impl RepoView {
                             .child(
                                 div()
                                     .id("ai-mark")
-                                    .text_xs()
-                                    .text_color(theme.accent)
                                     .cursor_pointer()
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         cx.stop_propagation();
                                         this.rewrite_message(cx)
                                     }))
-                                    .child("✦"),
+                                    .child(ai_mark((preferences::ui_size() * 0.75).round(), None, theme)),
                             )
                             .child(
                                 div()

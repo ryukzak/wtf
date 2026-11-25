@@ -5,6 +5,14 @@ use super::*;
 impl RepoView {
     /// Stages or unstages files, all of them when `files` is empty, then
     /// shows the result.
+    /// Gives the view the keys after a click on a button, when nothing in it
+    /// has them, so ⌘↩ commits what was just staged.
+    pub(super) fn keep_keys(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.focus.contains_focused(window, cx) {
+            self.focus.focus(window);
+        }
+    }
+
     pub(super) fn stage(&mut self, staged: bool, files: Vec<String>, cx: &mut Context<Self>) {
         let Some(path) = self.staging_worktree() else {
             return;

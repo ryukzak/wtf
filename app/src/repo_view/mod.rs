@@ -9,7 +9,7 @@ use gpui::{
     FocusHandle, HighlightStyle, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent,
     MouseMoveEvent, PathPromptOptions, Pixels, Point, PromptLevel, ScrollHandle, ScrollStrategy,
     SharedString, Stateful, StyledText, Task, UniformListScrollHandle, Window, actions, anchored,
-    canvas, deferred, div, point, prelude::*, pulsating_between, px, rems, uniform_list,
+    canvas, deferred, div, point, prelude::*, px, rems, uniform_list,
 };
 use wtf_core::{
     Attention, ChangedFile, Commit, CoreError, DiffMode, FileDiff, Revision, Scope, WorkflowGraph,
@@ -2806,6 +2806,18 @@ impl Render for RepoView {
                     cx.stop_propagation();
                     return;
                 }
+                // ⌘↩ commits from anywhere in the view, as from the message,
+                // while a worktree is shown and no other field has the keys.
+                if modifiers.platform
+                    && keystroke.key == "enter"
+                    && !typing
+                    && this.context_menu.is_none()
+                    && this.staging_worktree().is_some()
+                {
+                    this.commit(cx);
+                    cx.stop_propagation();
+                    return;
+                }
                 if keystroke.modifiers.platform && keystroke.key == "a" && !typing {
                     this.message_selection = None;
                     if !this.narrowed.is_empty() {
@@ -4047,13 +4059,6 @@ mod tests {
             nothing_staged.last(),
             Some(StackItem::Section(true, 0))
         ));
-    }
-
-    #[test]
-    fn names_shorten_to_first_name_and_initial() {
-        assert_eq!(header::short_name("Andrey Listopadov"), "Andrey L.");
-        assert_eq!(header::short_name("Ann"), "Ann");
-        assert_eq!(header::short_name("Mary Ann Smith"), "Mary S.");
     }
 
     #[test]

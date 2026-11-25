@@ -664,13 +664,18 @@ impl RepoView {
                     Some(Some(Err(error))) if on => Some(error.clone()),
                     _ => None,
                 };
+                let size = (preferences::ui_size() * 0.95).round();
                 let mark = div()
                     .id("summary-mark")
                     .flex_none()
-                    .text_size(px(preferences::ui_size() * 1.2))
-                    .text_color(theme.accent)
+                    .p(px(2.))
                     .cursor_pointer()
-                    .child("✦")
+                    .child(match summarizing {
+                        true => {
+                            working_mark("summary-mark-working", size, theme).into_any_element()
+                        }
+                        false => ai_mark(size, None, theme).into_any_element(),
+                    })
                     .tooltip(move |_, cx| {
                         let text = match summarizing {
                             true => "Apple Intelligence is summarizing",
@@ -680,18 +685,6 @@ impl RepoView {
                             .into()
                     })
                     .on_click(cx.listener(|this, _, _, cx| this.regenerate_summary(cx)));
-                let mark = match summarizing {
-                    true => mark
-                        .with_animation(
-                            "summary-mark-pulse",
-                            Animation::new(Duration::from_millis(1200))
-                                .repeat()
-                                .with_easing(pulsating_between(0.25, 1.)),
-                            |mark, delta| mark.opacity(delta),
-                        )
-                        .into_any_element(),
-                    false => mark.into_any_element(),
-                };
                 if let Some(summary) = &summary {
                     let mut text = summary.header.clone();
                     let header = text.len();
@@ -736,7 +729,12 @@ impl RepoView {
                             .items_center()
                             .gap(px(8.))
                             .text_color(theme.secondary)
-                            .child(format!("Summarizing {} commits…", several.len()))
+                            .child(shimmer(
+                                "summarizing-text",
+                                format!("Summarizing {} commits…", several.len()),
+                                theme.secondary,
+                                theme.foreground,
+                            ))
                             .child(div().flex_1())
                             .child(mark),
                     );
@@ -983,15 +981,10 @@ impl RepoView {
                 });
             }
         }
-        let short_names: Vec<String> = authors
-            .iter()
-            .take(3)
-            .map(|name| short_name(name))
-            .collect();
-        let more = authors.len().saturating_sub(3);
-        let who = match more {
-            0 => short_names.join(", "),
-            n => format!("{}, +{n}", short_names.join(", ")),
+        let names = authors[..authors.len().min(3)].join(", ");
+        let who = match authors.len().saturating_sub(3) {
+            0 => names,
+            n => format!("{names}, +{n}"),
         };
         let (Some(newest), Some(oldest)) = (commits.first(), commits.last()) else {
             return Vec::new();
@@ -1188,18 +1181,6 @@ const REMOVED: gpui::Hsla = gpui::Hsla {
     l: 0.5,
     a: 1.,
 };
-
-/// A name as the facts give it: the first name and the last one's first
-/// letter, "Andrey L.".
-pub(super) fn short_name(name: &str) -> String {
-    let mut words = name.split_whitespace();
-    match (words.next(), words.last()) {
-        (Some(first), Some(last)) => {
-            format!("{first} {}.", last.chars().next().unwrap_or_default())
-        }
-        _ => name.to_string(),
-    }
-}
 
 /// The summary bar's height: the header's first line with its padding.
 pub(super) fn summary_bar_height() -> f32 {

@@ -221,8 +221,9 @@ impl TerminalView {
                 cx.stop_propagation();
             }
             // ⌘A is the terminal's, though it has nothing to select all of;
-            // it does not reach the review behind.
-            if keystroke.key == "a" {
+            // it does not reach the review behind, nor does ⌘↩, which would
+            // commit there.
+            if matches!(keystroke.key.as_str(), "a" | "enter") {
                 cx.stop_propagation();
             }
             // Other Cmd shortcuts belong to the app.

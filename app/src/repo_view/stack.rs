@@ -550,8 +550,9 @@ impl RepoView {
                         section.child(
                             button(SharedString::from(format!("section-{staged}")), label)
                                 .font_weight(gpui::FontWeight::NORMAL)
-                                .on_click(cx.listener(move |this, _, _, cx| {
+                                .on_click(cx.listener(move |this, _, window, cx| {
                                     cx.stop_propagation();
+                                    this.keep_keys(window, cx);
                                     this.stage(staged, Vec::new(), cx)
                                 })),
                         )
@@ -676,8 +677,9 @@ impl RepoView {
                                         SharedString::from(format!("lines-{index}")),
                                         lines_label,
                                     )
-                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                    .on_click(cx.listener(move |this, _, window, cx| {
                                         cx.stop_propagation();
+                                        this.keep_keys(window, cx);
                                         this.stage_selected_lines(staged, cx)
                                     }))
                                     .child(format!(" ({lines})")),
@@ -685,8 +687,9 @@ impl RepoView {
                             })
                             .child(
                                 button(SharedString::from(format!("stage-{index}")), label)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                    .on_click(cx.listener(move |this, _, window, cx| {
                                         cx.stop_propagation();
+                                        this.keep_keys(window, cx);
                                         this.stage(staged, paths.clone(), cx)
                                     })),
                             )
@@ -793,8 +796,9 @@ impl RepoView {
                                             .h(px(diff_view::row_height() - 4.))
                                             .bg(theme.background)
                                             .on_click(
-                                                cx.listener(move |this, _, _, cx| {
+                                                cx.listener(move |this, _, window, cx| {
                                                     cx.stop_propagation();
+                                                    this.keep_keys(window, cx);
                                                     this.stage_rows(file, vec![index], staged, cx)
                                                 }),
                                             ),
@@ -861,7 +865,8 @@ impl RepoView {
                         hunk.child(
                             button(SharedString::from(format!("hunk-{file}-{start}")), label)
                                 .text_color(theme.foreground)
-                                .on_click(cx.listener(move |this, _, _, cx| {
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.keep_keys(window, cx);
                                     this.stage_rows(file, (start..end).collect(), staged, cx)
                                 })),
                         )

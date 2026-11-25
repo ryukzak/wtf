@@ -293,3 +293,114 @@ pub fn chevron(open: bool, color: gpui::Hsla, size: f32) -> impl IntoElement {
     };
     stroke_icon(path, color, size)
 }
+
+/// How the mark and waiting text move while the model works: over and
+/// over.
+pub(super) fn working_animation() -> Animation {
+    Animation::new(Duration::from_millis(1200)).repeat()
+}
+
+/// The mark of Apple Intelligence's work, dots on a circle as macOS draws
+/// it working: with `lead`, the place of the dot ahead, 0 to 1 round the
+/// circle, the dots trail off behind it, smaller and dimmer; without, they
+/// rest alike.
+pub(super) fn ai_mark(size: f32, lead: Option<f32>, theme: &Theme) -> impl IntoElement + use<> {
+    dots(size, lead, theme.foreground, theme.secondary)
+}
+
+/// [`ai_mark`]'s dots, from `dim` to `bright` by how near the lead they are.
+fn dots(size: f32, lead: Option<f32>, bright: gpui::Hsla, dim: gpui::Hsla) -> impl IntoElement {
+    const DOTS: usize = 8;
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            let center = bounds.center();
+            let round = size * 0.34;
+            for k in 0..DOTS {
+                let place = k as f32 / DOTS as f32;
+                // How near the lead the dot is, 1 at it, falling off behind.
+                let near = match lead {
+                    Some(lead) => 1. - (lead - place).rem_euclid(1.),
+                    None => 0.4,
+                };
+                let angle = std::f32::consts::TAU * place - std::f32::consts::FRAC_PI_2;
+                let at = center + point(px(round * angle.cos()), px(round * angle.sin()));
+                let dot = |radius: f32, color: gpui::Hsla, window: &mut Window| {
+                    let bounds = gpui::Bounds::new(
+                        at - point(px(radius), px(radius)),
+                        gpui::size(px(2. * radius), px(2. * radius)),
+                    );
+                    window.paint_quad(gpui::fill(bounds, color).corner_radii(px(radius)));
+                };
+                let radius = size * (0.05 + 0.05 * near);
+                // A glow round the brightest.
+                if lead.is_some() && near > 0.7 {
+                    dot(radius * 2.2, bright.opacity(0.18 * near), window);
+                }
+                dot(radius, mix(dim.opacity(0.5), bright, near), window);
+            }
+        },
+    )
+    .flex_none()
+    .size(px(size))
+}
+
+/// [`ai_mark`] while the model works, its dots going round.
+pub(super) fn working_mark(
+    id: impl Into<gpui::ElementId>,
+    size: f32,
+    theme: &Theme,
+) -> gpui::AnimationElement<gpui::Div> {
+    let (bright, dim) = (theme.foreground, theme.secondary);
+    div()
+        .flex_none()
+        .with_animation(id, working_animation(), move |mark, delta| {
+            mark.child(dots(size, Some(delta), bright, dim))
+        })
+}
+
+/// `from` blended toward `to` by `amount`, 0 to 1, in RGB.
+fn mix(from: gpui::Hsla, to: gpui::Hsla, amount: f32) -> gpui::Hsla {
+    let (from, to) = (gpui::Rgba::from(from), gpui::Rgba::from(to));
+    let channel = |a: f32, b: f32| a + (b - a) * amount;
+    gpui::Rgba {
+        r: channel(from.r, to.r),
+        g: channel(from.g, to.g),
+        b: channel(from.b, to.b),
+        a: channel(from.a, to.a),
+    }
+    .into()
+}
+
+/// Text waiting on the model, such as "Writing a commit message…": a
+/// light band sweeps across it, from `base` up to `bright` and back.
+pub(super) fn shimmer(
+    id: impl Into<gpui::ElementId>,
+    text: String,
+    base: gpui::Hsla,
+    bright: gpui::Hsla,
+) -> impl IntoElement {
+    /// How many characters the band lights on each side of its middle.
+    const BAND: f32 = 6.;
+    div().with_animation(
+        id,
+        Animation::new(Duration::from_millis(2000)).repeat(),
+        move |row, delta| {
+            let count = text.chars().count() as f32;
+            // The band comes in from before the first character and leaves
+            // past the last, so the text rests a moment between sweeps.
+            let middle = -BAND + delta * (count + 2. * BAND);
+            let highlights = text.char_indices().enumerate().map(|(n, (at, c))| {
+                let light = (1. - (n as f32 - middle).abs() / BAND).max(0.);
+                (
+                    at..at + c.len_utf8(),
+                    HighlightStyle {
+                        color: Some(mix(base, bright, light)),
+                        ..Default::default()
+                    },
+                )
+            });
+            row.child(StyledText::new(text.clone()).with_highlights(highlights.collect::<Vec<_>>()))
+        },
+    )
+}

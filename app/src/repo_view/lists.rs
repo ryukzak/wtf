@@ -520,30 +520,10 @@ impl RepoView {
         );
         // The chevron hangs in the row's padding, so the title lines up
         // with the commits' summaries.
+        let size = (preferences::ui_size() * 0.7).round();
         let mark = match (waiting, summarized) {
-            (true, _) => Some(
-                div()
-                    .flex_none()
-                    .text_xs()
-                    .text_color(theme.secondary)
-                    .child("✦")
-                    .with_animation(
-                        ("summarizing", index),
-                        Animation::new(Duration::from_millis(1200))
-                            .repeat()
-                            .with_easing(pulsating_between(0.25, 1.)),
-                        |mark, delta| mark.opacity(delta),
-                    )
-                    .into_any_element(),
-            ),
-            (false, true) => Some(
-                div()
-                    .flex_none()
-                    .text_xs()
-                    .text_color(theme.secondary)
-                    .child("✦")
-                    .into_any_element(),
-            ),
+            (true, _) => Some(working_mark(("summarizing", index), size, theme).into_any_element()),
+            (false, true) => Some(ai_mark(size, None, theme).into_any_element()),
             _ => None,
         };
         let item = match folded {
