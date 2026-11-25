@@ -1714,8 +1714,14 @@ fn rails(edges: Vec<Edge>, width: f32) -> impl IntoElement {
                     path.line_to(corner);
                     s_curve(&mut path, corner, to);
                 } else {
-                    let corner = point(from.x + bend, to.y);
-                    s_curve(&mut path, from, corner);
+                    // A fork drops from its commit first, then turns into its
+                    // row: the commit's labels sit right after it on its row,
+                    // and forks from one commit share the drop, the further
+                    // turning later, so neither crosses a label nor another.
+                    let bend = bend.min((to.y - from.y).abs());
+                    let toward = if to.y > from.y { -bend } else { bend };
+                    path.line_to(point(from.x, to.y + toward));
+                    path.curve_to(point(from.x + bend, to.y), point(from.x, to.y));
                     path.line_to(to);
                 }
                 if let Ok(path) = path.build() {
