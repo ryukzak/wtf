@@ -287,10 +287,10 @@ pub struct WorktreeStatus {
 
 /// Fetches every remote of a repository. A background fetch is logged as
 /// a refresh command, hidden with them.
-pub fn fetch(repo: &str, background: bool) -> Result<(), CoreError> {
+pub fn fetch(repo: &str, prune: bool, background: bool) -> Result<(), CoreError> {
     match background {
-        true => console::as_refresh(|| git::fetch(repo)),
-        false => git::fetch(repo),
+        true => console::as_refresh(|| git::fetch(repo, prune)),
+        false => git::fetch(repo, prune),
     }
 }
 

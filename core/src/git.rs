@@ -26,11 +26,12 @@ pub fn run<S: AsRef<OsStr>>(dir: &str, args: &[S]) -> Result<String, CoreError> 
     run_with_env(dir, args, None, &[])
 }
 
-/// Fetches every remote, dropping remote branches deleted there as git's
-/// `fetch.prune` says. Git asks no password: with no terminal to answer
-/// it, a fetch that needs one fails rather than waits.
-pub fn fetch(repo: &str) -> Result<(), CoreError> {
-    let args = ["fetch", "--all", "--quiet"];
+/// Fetches every remote, dropping remote branches deleted there when
+/// `prune`. Git asks no password: with no terminal to answer it, a fetch
+/// that needs one fails rather than waits.
+pub fn fetch(repo: &str, prune: bool) -> Result<(), CoreError> {
+    let prune = if prune { "--prune" } else { "--no-prune" };
+    let args = ["fetch", "--all", "--quiet", prune];
     run_with_env(repo, &args, None, &[("GIT_TERMINAL_PROMPT", "0")]).map(|_| ())
 }
 

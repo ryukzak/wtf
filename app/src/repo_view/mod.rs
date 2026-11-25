@@ -944,16 +944,17 @@ impl RepoView {
         }
     }
 
-    /// Fetches every remote, then rebuilds the graph to show what came.
-    /// Git's own `fetch.prune` says whether it drops deleted branches.
+    /// Fetches every remote, then rebuilds the graph to show what came;
+    /// it drops branches deleted there unless the project says not to.
     fn fetch(&mut self, background: bool, cx: &mut Context<Self>) {
         // A fetch under way already brings what another would.
         let Some(path) = self.repo_path.clone().filter(|_| self.fetch_task.is_none()) else {
             return;
         };
+        let prune = preferences::fetch_prune(&path);
         let load = cx
             .background_executor()
-            .spawn(async move { wtf_core::fetch(&path, background) });
+            .spawn(async move { wtf_core::fetch(&path, prune, background) });
         self.fetch_task = Some(cx.spawn(async move |this, cx| {
             let result = load.await;
             this.update(cx, |this, cx| {

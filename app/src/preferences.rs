@@ -199,6 +199,11 @@ pub fn sync_badges() -> bool {
     read().sync_badges
 }
 
+/// Whether fetches of `repo` drop remote branches deleted there.
+pub fn fetch_prune(repo: &str) -> bool {
+    git_bool(&ProjectSetting::Prune.value(&Scope::Repo(repo.to_string())))
+}
+
 /// The option the Pull (`false`) or Push (`true`) button runs in `repo`.
 pub fn sync_option(push: bool, repo: &str) -> usize {
     let setting = match push {
@@ -696,9 +701,10 @@ impl ProjectSetting {
             ProjectSetting::TextDiffAbove => DEFAULT_TEXT_DIFF_ABOVE.to_string(),
             ProjectSetting::IdleDays => DEFAULT_IDLE_DAYS.to_string(),
             ProjectSetting::FetchMinutes => DEFAULT_FETCH_MINUTES.to_string(),
-            // As git has them: no pruning; Pull fast-forwards only, where
-            // git's own default would merge.
-            ProjectSetting::Prune => "false".to_string(),
+            // Fetches prune, where git's own default would not, so
+            // branches deleted on the remote go; Pull fast-forwards only,
+            // where git's would merge.
+            ProjectSetting::Prune => "true".to_string(),
             ProjectSetting::Pull => "1".to_string(),
             ProjectSetting::Push => "0".to_string(),
             // Git has none: commits fail until one is set.
@@ -2790,8 +2796,8 @@ impl Render for Preferences {
                         ],
                         Some(
                             "Fetches every remote. Pruning drops remote branches deleted there, \
-                             so local ones tracking them read as remote gone; kept as git's \
-                             fetch.prune, which git fetch in a terminal goes by too.",
+                             so local ones tracking them read as remote gone; on unless git's \
+                             fetch.prune says otherwise, which git fetch in a terminal goes by.",
                         ),
                         &theme,
                     ))
