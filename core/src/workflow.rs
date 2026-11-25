@@ -294,6 +294,34 @@ pub fn build(
         true => stashes.iter().map(|stash| stash.base.as_str()).collect(),
         false => HashSet::new(),
     };
+    // Every tag, newest first, and the commit each labels. A commit a shown
+    // tag is on ends its run, as a stash's does, so the tag sits right
+    // after it.
+    let tag_list = git::run(
+        repo_path,
+        &[
+            "for-each-ref",
+            "--sort=-creatordate",
+            "--format=%(refname:short)%09%(objectname)%09%(*objectname)",
+            "refs/tags",
+        ],
+    )?;
+    let mut tags = Vec::new();
+    let mut tagged: Vec<(String, String)> = Vec::new();
+    for line in tag_list.lines() {
+        // Annotated tags point at a tag object; the commit is the peeled one.
+        let fields: Vec<&str> = line.split('\t').collect();
+        let [name, id, peeled] = fields[..] else {
+            continue;
+        };
+        tags.push(name.to_string());
+        if attention.tags {
+            let commit = if peeled.is_empty() { id } else { peeled };
+            tagged.push((name.to_string(), commit.to_string()));
+        }
+    }
+    let tag_commits: HashSet<&str> = tagged.iter().map(|(_, commit)| commit.as_str()).collect();
+
     let (channel_ends, channel_commits) = release_lines(&log, &index, &tips[0].id, &branches);
     let mut children = vec![0; log.len()];
     for parent in log.iter().flat_map(|(_, parents)| parents) {
@@ -323,6 +351,7 @@ pub fn build(
             && children[p] == 1
             && !tip_ids.contains(log[p].0.id.as_str())
             && !stash_bases.contains(log[p].0.id.as_str())
+            && !tag_commits.contains(log[p].0.id.as_str())
             && !channel_ends.contains_key(log[p].0.id.as_str())
             && lane_of[p] == lane_of[i]
         {
@@ -413,29 +442,9 @@ pub fn build(
         }
     }
 
-    // Every tag, newest first, and the commit each labels.
-    let tag_list = git::run(
-        repo_path,
-        &[
-            "for-each-ref",
-            "--sort=-creatordate",
-            "--format=%(refname:short)%09%(objectname)%09%(*objectname)",
-            "refs/tags",
-        ],
-    )?;
-    let mut tags = Vec::new();
-    for line in tag_list.lines() {
-        // Annotated tags point at a tag object; the commit is the peeled one.
-        let fields: Vec<&str> = line.split('\t').collect();
-        let [name, id, peeled] = fields[..] else {
-            continue;
-        };
-        tags.push(name.to_string());
-        let commit = if peeled.is_empty() { id } else { peeled };
-        if attention.tags
-            && let Some(&i) = index.get(commit)
-        {
-            nodes[node_of[i]].tags.push(name.to_string());
+    for (name, commit) in &tagged {
+        if let Some(&i) = index.get(commit.as_str()) {
+            nodes[node_of[i]].tags.push(name.clone());
         }
     }
 
@@ -1826,6 +1835,36 @@ mod tests {
         let messages = fixture.git(".", &["log", "--format=%s"]);
         assert_eq!(messages, "Three lines\nThe first commit");
         assert_eq!(fixture.git(".", &["rev-list", "--count", "HEAD"]), "2");
+    }
+
+    #[test]
+    fn a_tag_ends_the_run_it_is_in() {
+        let fixture = Fixture::new();
+        fixture.commit(".", "a.txt", "1\n", "c1");
+        fixture.commit(".", "a.txt", "2\n", "c2");
+        fixture.git(".", &["tag", "v1"]);
+        fixture.commit(".", "a.txt", "3\n", "c3");
+        fixture.commit(".", "a.txt", "4\n", "c4");
+        let tags = Attention {
+            tags: true,
+            ..Attention::default()
+        };
+        let runs = |graph: &WorkflowGraph| -> Vec<Vec<String>> {
+            graph
+                .nodes
+                .iter()
+                .filter(|node| node.kind != NodeKind::Uncommitted)
+                .map(|node| node.commits.iter().map(|c| c.summary.clone()).collect())
+                .collect()
+        };
+        // The tag, on c2, sits between c2 and c3.
+        let graph = fixture.graph_with(&tags);
+        assert_eq!(runs(&graph), [vec!["c1"], vec!["c2"], vec!["c3", "c4"]]);
+        let tagged = graph.nodes.iter().find(|node| node.tags == ["v1"]).unwrap();
+        assert_eq!(tagged.commits.last().unwrap().summary, "c2");
+        // Tags left out of the graph split nothing.
+        let graph = fixture.graph();
+        assert_eq!(runs(&graph), [vec!["c1"], vec!["c2", "c3", "c4"]]);
     }
 
     #[test]

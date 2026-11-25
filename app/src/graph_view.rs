@@ -219,12 +219,14 @@ pub struct Layout {
     pub height: f32,
 }
 
-/// A stash's place: like a short branch, forking from its commit.
+/// A stash's or tag's place: like a short branch, forking from its commit.
 pub struct StashPlace {
-    /// The node of the commit it was made on.
+    /// The node of the commit it was made on, or is on.
     pub node: usize,
     pub name: String,
-    /// The center of its mark.
+    /// A tag, not a stash.
+    pub tag: bool,
+    /// The center of a stash's mark; where a tag's label starts.
     pub x: f32,
     pub y: f32,
 }
@@ -326,17 +328,26 @@ pub fn layout(graph: &WorkflowGraph, order: WorktreeOrder) -> Layout {
     // Worktrees off a commit with something after it get layout lanes of their
     // own, past the graph's lanes, so their rows never hold their commit.
     // Stashes fork off their commits onto rows of their own too, as short
-    // branches do.
-    let stash_rows: Vec<(usize, String)> = graph
+    // branches do; so do tags, off the main line, which they would break.
+    let stash_rows: Vec<(usize, String, bool)> = graph
         .nodes
         .iter()
         .enumerate()
         .filter(|(_, node)| node.kind != NodeKind::Uncommitted)
-        .flat_map(|(i, node)| node.stashes.iter().map(move |name| (i, name.clone())))
+        .flat_map(|(i, node)| {
+            let stashes = node
+                .stashes
+                .iter()
+                .map(move |name| (i, name.clone(), false));
+            stashes.chain(node.tags.iter().map(move |name| (i, name.clone(), true)))
+        })
         .collect();
     let stash_x: Vec<f32> = stash_rows
         .iter()
-        .map(|&(p, _)| xs[p].1 + style().dot / 2. + FORK_GAP + symbol() / 2.)
+        .map(|&(p, _, tag)| {
+            let mark = if tag { 0. } else { symbol() / 2. };
+            xs[p].1 + style().dot / 2. + FORK_GAP + mark
+        })
         .collect();
     // Clean worktrees on a commit with history after it: their frames stay
     // on the commit, but their leads rise to rows of their own above the
@@ -419,8 +430,9 @@ pub fn layout(graph: &WorkflowGraph, order: WorktreeOrder) -> Layout {
         let start = xs[graph.nodes[worktree].parents[0]].1;
         widen(&mut spans, framed_lane(worktree), start, f32::INFINITY);
     }
-    for (k, (parent, name)) in stash_rows.iter().enumerate() {
-        let end = stash_x[k] + symbol() / 2. + TAG_GAP + label_width(name);
+    for (k, (parent, name, tag)) in stash_rows.iter().enumerate() {
+        let mark = if *tag { 0. } else { symbol() / 2. + TAG_GAP };
+        let end = stash_x[k] + mark + label_width(name);
         widen(&mut spans, stash_lane(k), xs[*parent].1, end);
     }
     for (i, node) in graph.nodes.iter().enumerate() {
@@ -696,9 +708,10 @@ pub fn layout(graph: &WorkflowGraph, order: WorktreeOrder) -> Layout {
     let stashes: Vec<StashPlace> = stash_rows
         .into_iter()
         .enumerate()
-        .map(|(k, (node, name))| StashPlace {
+        .map(|(k, (node, name, tag))| StashPlace {
             node,
             name,
+            tag,
             x: stash_x[k],
             y: row_y(stash_lane(k)),
         })
@@ -845,8 +858,7 @@ fn label_width(name: &str) -> f32 {
 /// How wide a node's labels are, roughly, so nothing is drawn over them.
 fn labels_width(graph: &WorkflowGraph, node: &GraphNode) -> f32 {
     let notes: f32 = node.refs.iter().map(|name| extras_width(graph, name)).sum();
-    let names = node.refs.iter().chain(&node.tags);
-    names.map(|name| label_width(name)).sum::<f32>() + notes
+    node.refs.iter().map(|name| label_width(name)).sum::<f32>() + notes
 }
 
 /// Why a branch looks left behind, as its labels say it: `merged · idle 30d`.
@@ -970,7 +982,7 @@ fn stair_lanes(graph: &WorkflowGraph) -> (Vec<usize>, Vec<Option<usize>>) {
 }
 
 /// Each node one column after its parents, as long as its commits' beads, and
-/// past a parent's labels when it continues that parent's branch.
+/// past a parent's labels and tags when it continues that parent's branch.
 fn topological(graph: &WorkflowGraph) -> Vec<(f32, f32)> {
     let mut xs: Vec<(f32, f32)> = Vec::with_capacity(graph.nodes.len());
     for (index, node) in graph.nodes.iter().enumerate() {
@@ -982,9 +994,17 @@ fn topological(graph: &WorkflowGraph) -> Vec<(f32, f32)> {
                 // A branch stepping down from it clears its labels on the
                 // row below, so it starts as a fork would.
                 let continues = parent.lane == node.lane && !steps_down(graph, p, index);
+                // Its tags, on a row above, end before the next ones along
+                // the line start, so a line's tags share one row.
+                let tags = parent
+                    .tags
+                    .iter()
+                    .map(|name| style().dot / 2. + FORK_GAP + label_width(name) + ROW_GAP + TAG_GAP)
+                    .fold(0., f32::max);
                 let labels = match continues {
                     true => {
-                        style().dot / 2. + TAG_GAP + labels_width(graph, parent) + style().curve
+                        (style().dot / 2. + TAG_GAP + labels_width(graph, parent) + style().curve)
+                            .max(tags)
                     }
                     false => 0.,
                 };
@@ -1159,7 +1179,8 @@ pub fn render(
             },
         });
     }
-    // A stash forks up from its commit, dashed: set aside, not history.
+    // A stash forks up from its commit, dashed: set aside, not history; a
+    // tag does too, off the main line.
     for place in &layout.stashes {
         let (parent_start, parent_end, parent_y) = layout.nodes[place.node];
         // A commit framed by clean worktrees: the line leaves the outermost
@@ -1179,15 +1200,28 @@ pub fn render(
                 point(px(parent_end), px(parent_y - style().dot / 2. - pad))
             }
         };
-        edges.push(Edge {
-            from,
-            to: point(px(place.x - symbol() / 2.), px(place.y)),
-            merge: false,
-            dashed: true,
-            strong: shown_stash == Some(place.name.as_str()),
-            current: false,
-            lane: usize::MAX,
-            color: theme.secondary,
+        // A tag's line is history's, solid, in its colour, up to its label.
+        edges.push(match place.tag {
+            true => Edge {
+                from,
+                to: point(px(place.x), px(place.y)),
+                merge: false,
+                dashed: false,
+                strong: false,
+                current: false,
+                lane: usize::MAX,
+                color: theme.git_tag_background,
+            },
+            false => Edge {
+                from,
+                to: point(px(place.x - symbol() / 2.), px(place.y)),
+                merge: false,
+                dashed: true,
+                strong: shown_stash == Some(place.name.as_str()),
+                current: false,
+                lane: usize::MAX,
+                color: theme.secondary,
+            },
         });
     }
     // The current worktree's branch, whose label has its bar as the
@@ -1429,7 +1463,7 @@ pub fn render(
             continue;
         }
 
-        if node.refs.is_empty() && node.tags.is_empty() {
+        if node.refs.is_empty() {
             continue;
         }
         // Branches get outlined tags.
@@ -1441,7 +1475,7 @@ pub fn render(
             .filter(|(_, w)| w.kind == NodeKind::Uncommitted && w.parents.first() == Some(&i))
             .filter_map(|(w, _)| own_row_branch(graph, &layout.detached, w))
             .collect();
-        let mut branches: Vec<AnyElement> = node
+        let branches: Vec<AnyElement> = node
             .refs
             .iter()
             .filter(|name| !elsewhere.contains(&name.as_str()))
@@ -1461,22 +1495,6 @@ pub fn render(
                 menu_label(tag, name, target, i, true, cx)
             })
             .collect();
-        let commit = node
-            .commits
-            .last()
-            .map(|commit| commit.id.clone())
-            .unwrap_or_default();
-        branches.extend(node.tags.iter().enumerate().map(|(k, name)| {
-            let target = Target::Tag {
-                name: name.clone(),
-                commit: commit.clone(),
-            };
-            let label = pill()
-                .bg(theme.git_tag_background)
-                .text_color(theme.git_tag_text)
-                .child(name.clone());
-            with_menu(label, ("git-tag", i * 100 + k), target, cx)
-        }));
         content = content.child(
             div()
                 .absolute()
@@ -1563,6 +1581,31 @@ pub fn render(
     // Each stash: a muted diamond, set-aside changes as a worktree's are,
     // and its label; a click shows it, a right click offers its menu.
     for (k, place) in layout.stashes.iter().enumerate() {
+        // A tag: its label where its line ends, with the tag's menu.
+        if place.tag {
+            let target = Target::Tag {
+                name: place.name.clone(),
+                commit: graph.nodes[place.node]
+                    .commits
+                    .last()
+                    .map(|commit| commit.id.clone())
+                    .unwrap_or_default(),
+            };
+            let label = pill()
+                .bg(theme.git_tag_background)
+                .text_color(theme.git_tag_text)
+                .child(place.name.clone());
+            content = content.child(
+                div()
+                    .absolute()
+                    .left(px(place.x))
+                    .top(px(place.y - TAG_HEIGHT / 2.))
+                    .whitespace_nowrap()
+                    .text_xs()
+                    .child(with_menu(label, ("git-tag", k), target, cx)),
+            );
+            continue;
+        }
         let Some(stash) = graph.stashes.iter().find(|stash| stash.name == place.name) else {
             continue;
         };
@@ -2771,6 +2814,27 @@ mod tests {
         let layout = layout(&graph, WorktreeOrder::LastCommit);
         assert!(layout.detached.is_empty());
         assert_eq!(layout.framed, [1, 2]);
+    }
+
+    #[test]
+    fn tags_along_one_line_share_a_row() {
+        let tagged = |parents: &[usize], time: i64, tag: &str| GraphNode {
+            tags: vec![tag.to_string()],
+            ..node(0, parents, 1, time)
+        };
+        let graph = graph(vec![
+            tagged(&[], 0, "v0.0.1"),
+            tagged(&[0], 1, "v0.0.2"),
+            node(0, &[1], 1, 2),
+        ]);
+        let layout = layout(&graph, WorktreeOrder::LastCommit);
+        let [first, second] = &layout.stashes[..] else {
+            panic!("two tags")
+        };
+        assert!(first.tag && second.tag);
+        assert!(first.y < layout.nodes[0].2, "above the line");
+        assert_eq!(first.y, second.y, "one row");
+        assert!(second.x >= first.x + label_width("v0.0.1"), "apart");
     }
 
     #[test]
