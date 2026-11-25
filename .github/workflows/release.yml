@@ -1,0 +1,56 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Release
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # The tag names the version that app/Cargo.toml holds.
+      - name: Check version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' app/Cargo.toml)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match app/Cargo.toml version $version"
+            exit 1
+          fi
+
+      # Users build from the source tarball, so it must build here first.
+      - run: scripts/build.sh
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --generate-notes
+
+      - name: Bump the Homebrew cask
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "$TAP_TOKEN" ]; then
+            echo "No HOMEBREW_TAP_TOKEN secret; update ryukzak/homebrew-tap by hand."
+            exit 0
+          fi
+          version=${GITHUB_REF_NAME#v}
+          url="https://github.com/$GITHUB_REPOSITORY/archive/refs/tags/$GITHUB_REF_NAME.tar.gz"
+          sha=$(curl -sfL "$url" | shasum -a 256 | cut -d' ' -f1)
+          git clone "https://x-access-token:$TAP_TOKEN@github.com/ryukzak/homebrew-tap.git" tap
+          scripts/bump-cask.sh tap "$version" "$sha"
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "wtf $version"
+          git push

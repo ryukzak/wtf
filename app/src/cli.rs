@@ -24,14 +24,9 @@ const MARKER: &str = "# Installed by wtf.app";
 
 /// The command hands its folders to the app through `open`, which launches
 /// the app or reaches the running one, as dropping them on its Dock icon does.
-fn script() -> String {
-    format!(
-        "#!/bin/sh\n\
-         {MARKER}: opens repositories in wtf.\n\
-         # Usage: wtf [path ...], the current directory when none is given.\n\
-         [ $# -eq 0 ] && set -- .\n\
-         exec open -b dev.wtf.wtf \"$@\"\n"
-    )
+/// The same file is in the app bundle, for Homebrew to link.
+fn script() -> &'static str {
+    include_str!("../../scripts/wtf")
 }
 
 /// Installs the command: in a folder of the user's own on their PATH, or,

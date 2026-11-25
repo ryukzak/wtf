@@ -1,0 +1,5 @@
+#!/bin/sh
+# Installed by wtf.app: opens repositories in wtf.
+# Usage: wtf [path ...], the current directory when none is given.
+[ $# -eq 0 ] && set -- .
+exec open -b dev.wtf.wtf "$@"
