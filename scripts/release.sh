@@ -1,6 +1,6 @@
 #!/bin/sh
-# Releases wtf from a clean, pushed master that passes CI's checks: sets the
-# version, commits, tags and, when asked, pushes.
+# Releases wtf from a clean, pushed master that passes CI's checks: asks,
+# then sets the version, commits, tags and pushes. Saying no changes nothing.
 # The tag starts the Release workflow, which also bumps the Homebrew cask.
 #
 # Usage: scripts/release.sh <major|minor|patch|X.Y.Z>
@@ -49,9 +49,18 @@ cargo test -q --workspace --locked || die "Tests failed."
 
 if [ "$version" = "$current" ]; then
     # Such as the first release: the version is already set.
-    echo "Releasing $version as it is"
+    printf "Release %s as it is" "$version"
 else
-    echo "Releasing $current -> $version"
+    printf "Release %s -> %s" "$current" "$version"
+fi
+printf ": commit, tag %s and push, starting the release? [y/N] " "$tag"
+read -r answer
+case $answer in
+y | Y) ;;
+*) die "Nothing changed." ;;
+esac
+
+if [ "$version" != "$current" ]; then
     sed "s/^version = \"$current\"/version = \"$version\"/" app/Cargo.toml >app/Cargo.toml.new
     mv app/Cargo.toml.new app/Cargo.toml
     # The build runs with --locked, so the lock file must name the new version.
@@ -59,11 +68,5 @@ else
     git commit -q -m "Release $version" app/Cargo.toml Cargo.lock
 fi
 git tag "$tag"
-echo "Tagged $tag."
-
-printf "Push master and %s to origin, starting the release? [y/N] " "$tag"
-read -r answer
-case $answer in
-y | Y) git push -q origin master "$tag" && echo "Pushed. Follow it with: gh run watch" ;;
-*) echo "Not pushed. Later: git push origin master $tag" ;;
-esac
+git push -q origin master "$tag"
+echo "Pushed $tag. Follow it with: gh run watch"
