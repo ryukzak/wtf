@@ -15,6 +15,14 @@ Sources of ideas:
 - [Difftastic](https://github.com/wilfred/difftastic) (Structured diff)
 - Original (working with worktrees from above)
 
+## Install
+
+With [Homebrew](https://brew.sh), which builds the app on your Mac, so the first install takes several minutes:
+
+    brew install --cask ryukzak/tap/wtf
+
+It also puts the `wtf` command on your PATH: `wtf .` opens the repository you are in. Update with `brew upgrade --cask wtf`.
+
 ## Run
 
 macOS only; needs Rust and Git. Structural diffs need [difftastic](https://difftastic.wilfred.me.uk) (`brew install difftastic`):
