@@ -99,7 +99,7 @@ pub fn push(path: &str, to: Option<&str>, options: &[&str]) -> Result<(), CoreEr
 }
 
 /// Runs git with `input` on its standard input, recorded like [`run`].
-fn run_with_input(dir: &str, args: &[&str], input: &str) -> Result<String, CoreError> {
+pub(crate) fn run_with_input(dir: &str, args: &[&str], input: &str) -> Result<String, CoreError> {
     run_with_env(dir, args, Some(input), &[])
 }
 
@@ -176,7 +176,7 @@ pub(crate) fn run_answer<S: AsRef<OsStr>>(
     }
 }
 
-fn run_with_env<S: AsRef<OsStr>>(
+pub(crate) fn run_with_env<S: AsRef<OsStr>>(
     dir: &str,
     args: &[S],
     input: Option<&str>,
@@ -573,7 +573,7 @@ pub(crate) fn copy_commit_onto(
 }
 
 /// A commit of `tree` on `parents` with `message`, by `commit`'s author.
-fn copy_commit_as(
+pub(crate) fn copy_commit_as(
     path: &str,
     commit: &str,
     tree: &str,

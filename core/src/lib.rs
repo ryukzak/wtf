@@ -5,6 +5,7 @@ mod difft;
 mod git;
 mod patch;
 mod pick;
+pub mod plan;
 mod project;
 mod submodule;
 mod summary;

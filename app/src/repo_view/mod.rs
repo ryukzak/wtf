@@ -38,6 +38,7 @@ mod graph_band;
 mod header;
 mod lists;
 mod overlays;
+mod plan_panel;
 mod search;
 mod stack;
 mod staging;
@@ -48,6 +49,7 @@ mod widgets;
 
 use attention_panel::*;
 use header::*;
+use plan_panel::*;
 use time::*;
 use trees::*;
 use widgets::*;
@@ -279,6 +281,9 @@ enum SidePanel {
     /// The changed files as a tree: a table of contents for the changes, or
     /// the file a snapshot shows.
     Files,
+    /// Changes to history, worked out before they are applied: the
+    /// Rewrite tab.
+    Plan,
 }
 
 /// A row of a branch tree: a folder of branch names, or a branch.
@@ -554,6 +559,15 @@ pub struct RepoView {
     pick_branches: Vec<PickPlace>,
     /// Counts menus opened, so a forecast for one gone is dropped.
     pick_generation: usize,
+    /// Changes to history being prepared in the Rewrite tab.
+    plan: Option<PlanView>,
+    /// The middle's editor of a plan's code and messages.
+    plan_focus: FocusHandle,
+    /// Works the plan out again once typing pauses.
+    plan_typing: Option<Task<()>>,
+    /// A notice of a change done at once, and its timer.
+    toast: Option<Toast>,
+    toast_task: Option<Task<()>>,
     /// Diff rows picked for staging, all in one file.
     line_selection: Option<(usize, Vec<usize>)>,
     line_anchor: Option<usize>,
@@ -815,6 +829,11 @@ impl RepoView {
             pick_places: Vec::new(),
             pick_branches: Vec::new(),
             pick_generation: 0,
+            plan: None,
+            plan_focus: cx.focus_handle(),
+            plan_typing: None,
+            toast: None,
+            toast_task: None,
             line_selection: None,
             line_anchor: None,
             line_drag: None,
@@ -1822,6 +1841,10 @@ impl RepoView {
     fn set_selection(&mut self, selected: Vec<usize>, cx: &mut Context<Self>) {
         // A selection made gives up one waiting to come back.
         self.restore_keys.clear();
+        // Anything else selected takes the middle back from a plan's merge.
+        if let Some(view) = self.plan.as_mut() {
+            view.middle = false;
+        }
         // The last worktree among those selected becomes the current one.
         if let Some(path) =
             selected
@@ -2307,9 +2330,11 @@ impl RepoView {
 
     /// The panels open, by name, for the session to bring back.
     pub fn open_panels(&self) -> Vec<String> {
-        let side = self.side_panel.map(|panel| match panel {
-            SidePanel::Attention => "attention",
-            SidePanel::Files => "files",
+        // A plan is worked out anew, so its panel is not brought back.
+        let side = self.side_panel.and_then(|panel| match panel {
+            SidePanel::Attention => Some("attention"),
+            SidePanel::Files => Some("files"),
+            SidePanel::Plan => None,
         });
         let console = self.console_open.then_some("console");
         side.into_iter()
@@ -2573,6 +2598,10 @@ impl RepoView {
         if self.repo_path.is_none() {
             let hint = "Open a Git repository to review its commits.";
             return placeholder("No repository", Some(hint.into()), theme);
+        }
+        // A plan's step: its conflicts, message or files.
+        if let Some(step) = self.plan_middle_view(theme, window, cx) {
+            return step;
         }
         if self.snapshot_mode {
             let view = self.snapshot_view(theme, window, cx);
@@ -2877,6 +2906,7 @@ impl RepoView {
                     })
                     .into_any_element(),
             ),
+            Some(SidePanel::Plan) => Some(self.plan_panel_view(theme, cx)),
             None => None,
         };
         div()
@@ -2938,6 +2968,7 @@ impl RepoView {
             })
             .child(tab(SidePanel::Attention, "Attention"))
             .child(tab(SidePanel::Files, "Files"))
+            .child(tab(SidePanel::Plan, "Rewrite"))
             .child(div().w(px(16.)).h(px(1.)).bg(theme.separator))
             .child(self.view_toggles(theme, window, cx))
             .child(div().flex_1())
@@ -3022,7 +3053,7 @@ type DiffRange = (Option<String>, Revision);
 impl Render for RepoView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // An open prompt's caret blinks, from when it opened or was typed in.
-        if self.prompt.is_some() && self.blink_task.is_none() {
+        if (self.prompt.is_some() || self.plan_editing()) && self.blink_task.is_none() {
             self.blink(cx);
         }
         let theme = Theme::for_appearance(window.appearance());
@@ -3157,7 +3188,9 @@ impl Render for RepoView {
                 .any(|focus| focus.is_focused(window));
                 // ⌘C copies picked diff lines' code, while no text field has
                 // the keys.
-                let editing = typing || this.commit_focus.is_focused(window);
+                let editing = typing
+                    || this.commit_focus.is_focused(window)
+                    || this.plan_focus.is_focused(window);
                 if keystroke.key == "c"
                     && keystroke.modifiers.platform
                     && !keystroke.modifiers.shift
@@ -3316,6 +3349,7 @@ impl Render for RepoView {
             })
             .children(self.context_menu_view(&theme, cx))
             .children(self.notice_view(&theme, cx))
+            .children(self.toast_view(&theme, cx))
             .children(self.dropdown_view(&theme, cx))
             .children(self.prompt_view(&theme, window, cx))
             .children(self.goto_view(&theme, window, cx))

@@ -59,7 +59,7 @@ impl RepoView {
     /// no worktree has, channels first, then the latest, as many as fit.
     fn open_pick_branches(
         &mut self,
-        picks: Vec<String>,
+        picks: Vec<(String, String)>,
         position: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
@@ -81,7 +81,8 @@ impl RepoView {
             .collect();
         self.pick_generation += 1;
         self.pick_branches = branches;
-        self.forecast_picks(true, picks.clone(), cx);
+        let ids = picks.iter().map(|(id, _)| id.clone()).collect();
+        self.forecast_picks(true, ids, cx);
         self.context_menu = Some((Target::PickBranches { commits: picks }, position));
         cx.notify();
     }
@@ -137,60 +138,6 @@ impl RepoView {
                     break;
                 }
             }
-        })
-        .detach();
-    }
-
-    /// Cherry-picks onto a branch no worktree has, in git's object store:
-    /// done when every commit applies cleanly; otherwise nothing changes and
-    /// it offers a worktree for the branch to pick in, where git stops on
-    /// the conflict.
-    fn pick_onto_branch(
-        &mut self,
-        branch: String,
-        picks: Vec<String>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(repo) = self.repo_path.clone() else {
-            return;
-        };
-        let task = cx.background_executor().spawn({
-            let (repo, branch, picks) = (repo.clone(), branch.clone(), picks.clone());
-            async move {
-                let merges = wtf_core::has_merges(&repo, &picks);
-                (wtf_core::pick_onto_branch(&repo, &branch, &picks), merges)
-            }
-        });
-        cx.spawn_in(window, async move |this, cx| {
-            let (result, merges) = task.await;
-            this.update_in(cx, |this, window, cx| match result {
-                Ok(wtf_core::Forecast::Clean { .. }) => this.start_refresh(cx),
-                Ok(wtf_core::Forecast::Conflicts { step, files }) => {
-                    let path = popups::worktree_path(&repo, &branch);
-                    let commit = picks.get(step).map(|c| popups::short_hash(c));
-                    let detail = format!(
-                        "{} conflicts with {branch} in {}. Nothing was changed. In a worktree \
-                         for {branch}, git stops on the conflict for you to resolve.",
-                        commit.unwrap_or_default(),
-                        files.join(", ")
-                    );
-                    let line = popups::pick_in_new_worktree(&repo, &path, &branch, &picks, merges);
-                    this.confirm(
-                        format!("Cherry-pick onto {branch} conflicts"),
-                        &detail,
-                        "Pick in New Worktree",
-                        line,
-                        window,
-                        cx,
-                    );
-                }
-                Err(error) => {
-                    this.error_message = Some(message(error));
-                    cx.notify();
-                }
-            })
-            .ok();
         })
         .detach();
     }
@@ -333,20 +280,59 @@ impl RepoView {
                 }
             }
             Command::Title => {}
+            // Changes to history: at once when clean, else into the plan.
+            Command::DropCommits => self.history_action(HistoryAction::Drop(picks), cx),
+            Command::Squash => self.history_action(HistoryAction::Squash(picks), cx),
+            Command::Fixup => self.history_action(HistoryAction::Fixup(picks), cx),
+            Command::Reword | Command::Edit | Command::MoveUp | Command::MoveDown => {
+                if let Some(commit) = picks.first().cloned() {
+                    let action = match command {
+                        Command::Reword => HistoryAction::Reword(commit),
+                        Command::Edit => HistoryAction::Edit(commit),
+                        Command::MoveUp => HistoryAction::MoveUp(commit),
+                        _ => HistoryAction::MoveDown(commit),
+                    };
+                    self.history_action(action, cx);
+                }
+            }
+            // The current worktree's branch, onto the commit or branch
+            // right-clicked.
+            Command::RebaseHere => {
+                let path = self
+                    .current_worktree_path()
+                    .or(self.repo_path.as_deref())
+                    .map(str::to_string);
+                let base = match &target {
+                    Target::Branch { name, .. } => Some(name.clone()),
+                    _ => picks.first().cloned(),
+                };
+                if let (Some(path), Some(base)) = (path, base) {
+                    let onto = wtf_core::plan::Onto::Worktree(path);
+                    self.history_action(HistoryAction::Rebase { onto, base }, cx);
+                }
+            }
+            // Worked out in the Rewrite tab first; nothing changes until Apply.
             Command::CherryPick(k) => {
                 if let Some(path) = self.pick_places.get(k).and_then(|pick| pick.path.clone()) {
-                    let merges = wtf_core::has_merges(&repo, &picks);
-                    self.run_in_terminal(popups::cherry_pick(&path, &picks, merges), window, cx);
+                    let action = HistoryAction::Pick {
+                        onto: wtf_core::plan::Onto::Worktree(path),
+                        commits: picks,
+                    };
+                    self.history_action(action, cx);
                 }
             }
             Command::CherryPickInto => {
-                self.open_pick_branches(picks, position, cx);
+                self.open_pick_branches(target.picked(), position, cx);
                 return;
             }
             Command::CherryPickOnto(k) => {
                 if let Some(pick) = self.pick_branches.get(k) {
                     let branch = pick.place.name.clone();
-                    self.pick_onto_branch(branch, picks, window, cx);
+                    let action = HistoryAction::Pick {
+                        onto: wtf_core::plan::Onto::Branch(branch),
+                        commits: picks,
+                    };
+                    self.history_action(action, cx);
                 }
             }
             // Files only, handled above.
@@ -1706,7 +1692,7 @@ impl RepoView {
                 let open = this.update(cx, |this, cx| {
                     this.caret_on = !this.caret_on;
                     cx.notify();
-                    this.prompt.is_some()
+                    this.prompt.is_some() || this.plan_editing()
                 });
                 if !open.unwrap_or(false) {
                     break;

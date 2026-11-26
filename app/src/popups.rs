@@ -65,19 +65,24 @@ pub enum Target {
         /// A section: its newest commit can be checked out and branched from.
         section: bool,
     },
-    /// The branches no worktree has, to cherry-pick `commits` onto.
+    /// The branches no worktree has, to cherry-pick `commits`, with their
+    /// messages, onto.
     PickBranches {
-        commits: Vec<String>,
+        commits: Vec<(String, String)>,
     },
 }
 
 impl Target {
     /// The commits a cherry-pick from this menu takes, oldest first.
     pub fn picks(&self) -> Vec<String> {
+        self.picked().into_iter().map(|(id, _)| id).collect()
+    }
+
+    /// Those commits with their messages.
+    pub fn picked(&self) -> Vec<(String, String)> {
         match self {
-            Target::Commit { commit, .. } => vec![commit.clone()],
-            Target::Commits { commits, .. } => commits.iter().map(|(id, _)| id.clone()).collect(),
-            Target::PickBranches { commits } => commits.clone(),
+            Target::Commit { commit, message } => vec![(commit.clone(), message.clone())],
+            Target::Commits { commits, .. } | Target::PickBranches { commits } => commits.clone(),
             _ => Vec::new(),
         }
     }
@@ -142,6 +147,17 @@ pub enum Command {
     CopyMessages,
     /// The menu's title line, which does nothing.
     Title,
+    /// Changes to the history the menu's commits are in.
+    Reword,
+    Edit,
+    Squash,
+    Fixup,
+    MoveUp,
+    MoveDown,
+    DropCommits,
+    /// Moves the current worktree's branch to start from this commit or
+    /// branch.
+    RebaseHere,
 }
 
 /// The name attention knows a target by: its branch, or a detached
@@ -292,6 +308,14 @@ pub fn commands(
             })
             .collect::<Vec<_>>()
     };
+    // The current worktree's branch moved to start here; not where it is
+    // already.
+    let rebase_here = || {
+        places
+            .iter()
+            .find(|place| place.current && !place.has)
+            .map(|place| at(Command::RebaseHere, "Rebase onto This", Some(place)))
+    };
     // Into each worktree, then onto a branch none has.
     let cherry_picks = |count: usize| {
         let verb = match count {
@@ -316,7 +340,17 @@ pub fn commands(
             actions.push(text(Command::NewWorktree, "New Worktree…"));
             let mut copied = copies(false, commit);
             copied.push(text(Command::CopyMessage, "Copy Message"));
-            grouped(vec![actions, cherry_picks(1), copied])
+            let mut history = vec![
+                text(Command::Reword, "Reword…"),
+                text(Command::Edit, "Edit…"),
+                text(Command::Squash, "Squash into Previous"),
+                text(Command::Fixup, "Fixup into Previous"),
+                text(Command::MoveUp, "Move Up"),
+                text(Command::MoveDown, "Move Down"),
+                danger(Command::DropCommits, "Drop"),
+            ];
+            history.extend(rebase_here());
+            grouped(vec![actions, cherry_picks(1), history, copied])
         }
         Target::Commits {
             commits,
@@ -329,10 +363,15 @@ pub fn commands(
                 actions.push(text(Command::NewBranch, "New Branch…"));
                 actions.push(text(Command::NewWorktree, "New Worktree…"));
             }
+            let n = commits.len();
             grouped(vec![
                 vec![text(Command::Title, title.clone())],
                 actions,
-                cherry_picks(commits.len()),
+                cherry_picks(n),
+                vec![
+                    text(Command::Squash, format!("Squash {n} Together")),
+                    danger(Command::DropCommits, format!("Drop {n}")),
+                ],
                 vec![
                     text(Command::CopyHashes, "Copy SHAs"),
                     text(Command::CopyMessages, "Copy Messages"),
@@ -352,6 +391,7 @@ pub fn commands(
         }
         Target::Branch { name, commit, leaf } => {
             let mut actions = switches(true);
+            actions.extend(rebase_here());
             let mut removal = Vec::new();
             if name != main {
                 actions.push(text(Command::NewWorktree, "New Worktree…"));
@@ -611,43 +651,12 @@ pub fn stash_apply(worktree: &str, stash: &str, pop: bool) -> String {
     format!("git -C {} stash {verb} {}", quote(worktree), quote(stash))
 }
 
-/// Cherry-picks `commits`, oldest first, in the worktree at `path`; with a
-/// merge among them, each goes as its changes from its first parent.
-pub fn cherry_pick(path: &str, commits: &[String], merges: bool) -> String {
-    let mut line = format!("git -C {} cherry-pick", quote(path));
-    if merges {
-        line.push_str(" -m 1");
-    }
-    for commit in commits {
-        line.push(' ');
-        line.push_str(&quote(commit));
-    }
-    line
-}
-
 /// Goes on with a stopped cherry-pick: `--continue` with the message the
 /// commit had, `--skip` or `--abort`.
 pub fn cherry_pick_step(path: &str, step: &str) -> String {
     format!(
         "git -C {} -c core.editor=true cherry-pick {step}",
         quote(path)
-    )
-}
-
-/// A worktree at `path` for `branch`, and the cherry-pick in it.
-pub fn pick_in_new_worktree(
-    repo: &str,
-    path: &str,
-    branch: &str,
-    commits: &[String],
-    merges: bool,
-) -> String {
-    format!(
-        "git -C {} worktree add {} {} && {}",
-        quote(repo),
-        quote(path),
-        quote(branch),
-        cherry_pick(path, commits, merges)
     )
 }
 
@@ -756,23 +765,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cherry_pick_lines() {
-        let picks = ["a1".to_string(), "b2".to_string()];
-        assert_eq!(
-            cherry_pick("/w t", &picks, false),
-            "git -C '/w t' cherry-pick a1 b2"
-        );
-        assert_eq!(
-            cherry_pick("/w", &picks[..1], true),
-            "git -C /w cherry-pick -m 1 a1"
-        );
+    fn cherry_pick_steps() {
         assert_eq!(
             cherry_pick_step("/w", "--continue"),
             "git -C /w -c core.editor=true cherry-pick --continue"
-        );
-        assert_eq!(
-            pick_in_new_worktree("/r", "/r-fix", "fix", &picks[..1], false),
-            "git -C /r worktree add /r-fix fix && git -C /r-fix cherry-pick a1"
         );
     }
 
@@ -934,7 +930,8 @@ mod tests {
             [
                 (Command::CheckoutIn(0), "Checkout · wtf".to_string()),
                 (Command::SelectWorktree(1), "Go To · wtf-x".to_string()),
-                (Command::NewWorktree, "New Worktree…".to_string()),
+                // The current worktree's branch moved to start from it.
+                (Command::RebaseHere, "Rebase onto This · wtf".to_string()),
             ]
         );
 
@@ -1005,6 +1002,9 @@ mod tests {
                 "—",
                 "Cherry-pick 2 · wtf",
                 "Cherry-pick 2 into Branch…",
+                "—",
+                "Squash 2 Together",
+                "Drop 2",
                 "—",
                 "Copy SHAs",
                 "Copy Messages",

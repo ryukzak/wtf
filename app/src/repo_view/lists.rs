@@ -539,7 +539,20 @@ impl RepoView {
                 message: full_message(only),
             }),
             commits => Some(Target::Commits {
-                title: match &node.branch {
+                // Named as the history's heading names it: its branch, a
+                // ref at its tip, or the main branch it is on.
+                title: match node
+                    .branch
+                    .clone()
+                    .or_else(|| node.refs.first().cloned())
+                    .or_else(|| {
+                        self.graph
+                            .on_main
+                            .get(index)
+                            .copied()
+                            .unwrap_or(false)
+                            .then(|| self.graph.main.clone())
+                    }) {
                     Some(branch) => format!("{} commits · {branch}", commits.len()),
                     None => format!("{} commits", commits.len()),
                 },
