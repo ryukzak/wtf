@@ -2369,7 +2369,8 @@ impl RepoView {
             // Headers and code lines share one line height, whatever the font.
             .line_height(px(diff_view::row_height()));
             // The header of the file at the top stays pinned while its lines
-            // scroll under it.
+            // scroll under it, and from the moment its own row starts to slip
+            // under the bar, so it never shows cut.
             // Rows have one height, so the offset tells the top row. Past the
             // top, the list holds still as it lays out, and so does the header.
             let scroll_y =
@@ -2382,18 +2383,38 @@ impl RepoView {
             let pinned = top
                 .checked_sub(spacers)
                 .and_then(|top| {
-                    self.stacked[..(top + 1).min(self.stacked.len())]
+                    // A header reaches up into the pad row above it, so it
+                    // is at the top once that row is.
+                    self.stacked[..(top + 2).min(self.stacked.len())]
                         .iter()
                         .rposition(|item| {
                             matches!(item, StackItem::Header(_) | StackItem::Section(..))
                         })
-                        .filter(|&at| at < top)
                 })
                 .and_then(|at| match self.stacked[at] {
                     StackItem::Header(file) => Some(file),
                     _ => None,
                 })
                 .filter(|&file| self.stack_item_fits(&StackItem::Header(file)));
+            // The next file's header, coming up, pushes the pinned one up
+            // and out, so one never covers the other.
+            let row = diff_view::row_height();
+            let push = top
+                .checked_sub(spacers)
+                .and_then(|top| {
+                    self.stacked
+                        .iter()
+                        .skip(top + 2)
+                        .position(|item| {
+                            matches!(item, StackItem::Header(_) | StackItem::Section(..))
+                        })
+                        .map(|k| top + 2 + k)
+                })
+                .map_or(0., |next| {
+                    // Headers are two rows tall, from the pad row above them.
+                    let y = (spacers + next - 1) as f32 * row - scroll_y;
+                    (y - bar - 2. * row).min(0.)
+                });
             return div()
                 .flex()
                 .flex_col()
@@ -2407,7 +2428,7 @@ impl RepoView {
                     list.into_any_element(),
                     scroll_y,
                     pinned.map(|file| {
-                        div()
+                        let header = div()
                             .font_family(preferences::code_font())
                             .font_weight(preferences::code_weight())
                             .text_size(px(preferences::code_size()))
@@ -2415,7 +2436,8 @@ impl RepoView {
                             .border_b_1()
                             .border_color(theme.separator)
                             .child(self.stack_row_unchecked(&StackItem::Header(file), theme, cx))
-                            .into_any_element()
+                            .into_any_element();
+                        (header, push)
                     }),
                     theme,
                     window,

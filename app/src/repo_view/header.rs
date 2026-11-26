@@ -1112,12 +1112,13 @@ impl RepoView {
     }
 
     /// The diff `list` with the commit header scrolling above its first rows,
-    /// and the summary bar and a `pinned` file header kept on top.
+    /// and the summary bar and a `pinned` file header kept on top, pushed
+    /// up by as much as the next one needs.
     pub(super) fn under_header(
         &self,
         list: AnyElement,
         scroll_y: f32,
-        pinned: Option<AnyElement>,
+        pinned: Option<(AnyElement, f32)>,
         theme: &Theme,
         window: &Window,
         cx: &mut Context<Self>,
@@ -1141,10 +1142,11 @@ impl RepoView {
                         .child(self.commit_header(theme, window, cx)),
                 )
             })
-            .children(pinned.map(|pinned| {
+            .children(pinned.map(|(pinned, push)| {
+                let bar = if scrolled { summary_bar_height() } else { 0. };
                 div()
                     .absolute()
-                    .top(px(if scrolled { summary_bar_height() } else { 0. }))
+                    .top(px(bar + push))
                     .left_0()
                     .right_0()
                     .child(pinned)
