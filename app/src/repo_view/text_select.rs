@@ -2,7 +2,9 @@
 //! code, a word double-clicked, a line triple-clicked. Lines are picked from
 //! their numbers instead.
 
-use gpui::{ClipboardItem, Context, Modifiers, Pixels, Point};
+use gpui::{
+    ClipboardItem, Context, Modifiers, MouseDownEvent, MouseMoveEvent, Pixels, Point, Window,
+};
 
 use super::*;
 use crate::diff_view::{self, Pane};
@@ -206,6 +208,107 @@ impl RepoView {
         let lines: Vec<&str> = (from.row..=to.row)
             .filter_map(|row| {
                 let text = self.row_text(selection.file, row, selection.pane)?;
+                let start = if row == from.row { from.byte } else { 0 };
+                let end = if row == to.row { to.byte } else { text.len() };
+                text.get(start.min(text.len())..end.min(text.len()))
+            })
+            .collect();
+        cx.write_to_clipboard(ClipboardItem::new_string(lines.join("\n")));
+        true
+    }
+
+    /// The Snapshot file's line `row`, as shown.
+    fn snapshot_line(&self, row: usize) -> Option<&str> {
+        let (_, _, text) = self.snapshot.text.as_ref()?;
+        text.as_ref().ok()?.lines().nth(row)
+    }
+
+    /// The byte of the Snapshot file's line `row` the mouse at `position`
+    /// is nearest.
+    fn snapshot_byte(&self, row: usize, position: Point<Pixels>, window: &Window) -> usize {
+        let bounds = self.snapshot_scroll.0.borrow().base_handle.bounds();
+        let x = f32::from(position.x - bounds.origin.x) - diff_view::gutter_width();
+        let width = stack::code_char_width(window).max(1.);
+        let column = (x / width).round().max(0.) as usize;
+        let text = self.snapshot_line(row).unwrap_or_default();
+        text.char_indices().nth(column).map_or(text.len(), |(i, _)| i)
+    }
+
+    /// A press on the Snapshot file: starts a selection there, a word's on
+    /// a double click, the line's on a triple; ⇧ extends the one there is.
+    pub(super) fn press_snapshot(
+        &mut self,
+        row: usize,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(path) = self.snapshot.path.clone() else {
+            return;
+        };
+        let byte = self.snapshot_byte(row, event.position, window);
+        self.selecting_snapshot = true;
+        match &mut self.snapshot_selection {
+            Some((shown, _, head)) if event.modifiers.shift && *shown == path => {
+                *head = TextAt { row, byte };
+            }
+            _ => {
+                let text = self.snapshot_line(row).unwrap_or_default();
+                let (start, end) = match event.click_count {
+                    0 | 1 => (byte, byte),
+                    2 => word_around(text, byte),
+                    _ => (0, text.len()),
+                };
+                self.snapshot_selection = Some((
+                    path,
+                    TextAt { row, byte: start },
+                    TextAt { row, byte: end },
+                ));
+            }
+        }
+        cx.notify();
+    }
+
+    /// The mouse over the Snapshot file's line `row` while selecting: the
+    /// selection runs to it. Released, it is over.
+    pub(super) fn drag_snapshot(
+        &mut self,
+        row: usize,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.selecting_snapshot {
+            return;
+        }
+        if event.pressed_button != Some(gpui::MouseButton::Left) {
+            self.selecting_snapshot = false;
+            return;
+        }
+        let head = TextAt {
+            row,
+            byte: self.snapshot_byte(row, event.position, window),
+        };
+        if let Some((_, _, at)) = &mut self.snapshot_selection
+            && *at != head
+        {
+            *at = head;
+            cx.notify();
+        }
+    }
+
+    /// Copies the text selected in the Snapshot file; false with none.
+    pub(super) fn copy_snapshot_text(&self, cx: &mut Context<Self>) -> bool {
+        let Some((path, anchor, head)) = &self.snapshot_selection else {
+            return false;
+        };
+        if self.snapshot.path.as_ref() != Some(path) || anchor == head {
+            return false;
+        }
+        let (from, to) = (*anchor.min(head), *anchor.max(head));
+        let lines: Vec<&str> = (from.row..=to.row)
+            .filter_map(|row| {
+                let text = self.snapshot_line(row)?;
                 let start = if row == from.row { from.byte } else { 0 };
                 let end = if row == to.row { to.byte } else { text.len() };
                 text.get(start.min(text.len())..end.min(text.len()))

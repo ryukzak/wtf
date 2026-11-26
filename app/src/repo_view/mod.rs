@@ -499,6 +499,9 @@ pub struct RepoView {
     /// Code selected as text, to copy, and whether a drag is selecting it.
     text_selection: Option<text_select::TextSelection>,
     selecting_text: bool,
+    /// Text selected in the Snapshot file: which file, from where to where.
+    snapshot_selection: Option<(String, text_select::TextAt, text_select::TextAt)>,
+    selecting_snapshot: bool,
     /// The next changes to load keep the diff's scroll: the selection only
     /// grew under the reader.
     keep_place: bool,
@@ -737,6 +740,8 @@ impl RepoView {
             line_drag: None,
             text_selection: None,
             selecting_text: false,
+            snapshot_selection: None,
+            selecting_snapshot: false,
             keep_place: false,
             fallback: false,
             prune_sizes: HashMap::new(),
@@ -2954,7 +2959,9 @@ impl Render for RepoView {
                     && keystroke.modifiers.platform
                     && !keystroke.modifiers.shift
                     && !editing
-                    && (this.copy_selected_text(cx) || this.copy_picked_lines(cx))
+                    && ((this.snapshot_mode && this.copy_snapshot_text(cx))
+                        || this.copy_selected_text(cx)
+                        || this.copy_picked_lines(cx))
                 {
                     cx.stop_propagation();
                     return;
@@ -3982,10 +3989,15 @@ impl RepoView {
             (false, Some((shown, lines))) if shown == path => lines,
             (false, _) => Rc::new(HashSet::new()),
         };
+        let selected = self
+            .snapshot_selection
+            .as_ref()
+            .filter(|(shown, _, _)| *shown == path)
+            .map(|&(_, anchor, head)| (anchor.min(head), anchor.max(head)));
         uniform_list(
             "snapshot-text",
             lines.len(),
-            cx.processor(move |_, range: std::ops::Range<usize>, _, _| {
+            cx.processor(move |_, range: std::ops::Range<usize>, _, cx| {
                 range
                     .map(|i| {
                         let line = &lines[i];
@@ -4008,10 +4020,35 @@ impl RepoView {
                                 )
                             })
                             .collect();
+                        let picked = selected.and_then(|(from, to)| {
+                            (from.row..=to.row).contains(&i).then(|| {
+                                let start = if i == from.row { from.byte } else { 0 };
+                                let end = if i == to.row { to.byte } else { line.len() };
+                                start.min(line.len())..end.min(line.len())
+                            })
+                        });
+                        let highlights = diff_view::with_selection(
+                            diff_view::covering(highlights, line.len()),
+                            picked,
+                            selection,
+                        );
                         div()
+                            .id(("snapshot-line", i))
                             .flex()
                             .w_full()
                             .h(px(diff_view::row_height()))
+                            .cursor(gpui::CursorStyle::IBeam)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                    this.press_snapshot(i, event, window, cx)
+                                }),
+                            )
+                            .on_mouse_move(cx.listener(
+                                move |this, event: &gpui::MouseMoveEvent, window, cx| {
+                                    this.drag_snapshot(i, event, window, cx)
+                                },
+                            ))
                             .whitespace_nowrap()
                             .overflow_hidden()
                             .when(changed.contains(&(i as u32 + 1)), |row| row.bg(inserted))

@@ -332,9 +332,34 @@ fn side(
     side_cell(side, code, theme, line, char, fit, true, selected)
 }
 
+/// `highlights` with what they leave out of a line `len` bytes long
+/// filled in unstyled, so they cover it end to end.
+pub fn covering(
+    mut highlights: Vec<(std::ops::Range<usize>, HighlightStyle)>,
+    len: usize,
+) -> Vec<(std::ops::Range<usize>, HighlightStyle)> {
+    highlights.sort_by_key(|(range, _)| range.start);
+    let mut covered = Vec::with_capacity(highlights.len() * 2 + 1);
+    let mut at = 0;
+    for (range, style) in highlights {
+        if range.start < at {
+            continue;
+        }
+        if at < range.start {
+            covered.push((at..range.start, HighlightStyle::default()));
+        }
+        at = range.end;
+        covered.push((range, style));
+    }
+    if at < len {
+        covered.push((at..len, HighlightStyle::default()));
+    }
+    covered
+}
+
 /// `highlights`, covering a line end to end, with the `selected` bytes'
 /// background the selection's.
-fn with_selection(
+pub fn with_selection(
     highlights: Vec<(std::ops::Range<usize>, HighlightStyle)>,
     selected: Option<std::ops::Range<usize>>,
     color: Hsla,

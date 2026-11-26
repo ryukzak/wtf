@@ -981,7 +981,7 @@ pub(super) fn stack_items(
 }
 
 /// The width of a character of code, in its monospaced font.
-fn code_char_width(window: &Window) -> f32 {
+pub(super) fn code_char_width(window: &Window) -> f32 {
     let text = window.text_system();
     let font = text.resolve_font(&gpui::font(preferences::code_font()));
     text.advance(font, px(preferences::code_size()), 'm')
