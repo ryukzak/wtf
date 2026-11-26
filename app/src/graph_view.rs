@@ -1051,8 +1051,15 @@ fn idle_age(graph: &WorkflowGraph, name: &str) -> Option<String> {
     let branch = graph.branches.iter().find(|branch| branch.name == name)?;
     let days = (crate::repo_view::now_seconds() - branch.time) / 86_400;
     let live = branch.busy || branch.remote || branch.name == graph.main;
-    (!live && branch.time > 0 && days >= i64::from(graph.idle_days.unwrap_or(crate::preferences::DEFAULT_IDLE_DAYS)))
-        .then(|| format!("{days}d"))
+    (!live
+        && branch.time > 0
+        && days
+            >= i64::from(
+                graph
+                    .idle_days
+                    .unwrap_or(crate::preferences::DEFAULT_IDLE_DAYS),
+            ))
+    .then(|| format!("{days}d"))
 }
 
 /// The cloud after a local branch's label: there when the branch is on

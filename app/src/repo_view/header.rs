@@ -554,6 +554,19 @@ impl RepoView {
                     .truncate()
                     .child(self.selectable_text(key, summary, styles, menu, theme, cx))
             })
+            .children(
+                who_when(&commits, now_seconds()).map(|WhoWhen { who, when, .. }| {
+                    div()
+                        .flex_none()
+                        .max_w(gpui::relative(0.4))
+                        .truncate()
+                        .pl(px(12.))
+                        .text_xs()
+                        .text_color(theme.secondary)
+                        .on_mouse_down(MouseButton::Right, self.facts_menu(&commits, cx))
+                        .child(format!("{who} · {when}"))
+                }),
+            )
     }
 
     /// What the diff shows, above it: the selected commit's message, or the
@@ -1000,41 +1013,17 @@ impl RepoView {
                     .child(div().text_color(ADDED).child(format!("+{added}")))
                     .child(div().text_color(REMOVED).child(format!("−{removed}")))
             });
-        // Each author once, with their address as git gives it.
-        let mut authors: Vec<&str> = Vec::new();
-        let mut signatures: Vec<String> = Vec::new();
-        for commit in commits {
-            if !authors.contains(&commit.author.as_str()) {
-                authors.push(&commit.author);
-                signatures.push(match commit.email.is_empty() {
-                    true => commit.author.clone(),
-                    false => format!("{} <{}>", commit.author, commit.email),
-                });
-            }
-        }
-        let names = authors[..authors.len().min(3)].join(", ");
-        let who = match authors.len().saturating_sub(3) {
-            0 => names,
-            n => format!("{names}, +{n}"),
+        let Some(WhoWhen {
+            who,
+            signatures,
+            when,
+            exact,
+        }) = who_when(commits, now)
+        else {
+            return Vec::new();
         };
         let (Some(newest), Some(oldest)) = (commits.first(), commits.last()) else {
             return Vec::new();
-        };
-        let (from, to) = (
-            relative_time(oldest.time, now),
-            relative_time(newest.time, now),
-        );
-        let when = match from == to {
-            true => from,
-            false => format!("{from} – {to}"),
-        };
-        let exact = match commits.len() {
-            1 => local_datetime(newest.time),
-            _ => format!(
-                "{} – {}",
-                local_datetime(oldest.time),
-                local_datetime(newest.time)
-            ),
         };
         let first = match commits {
             [commit] => div().child(sha(&commit.id, &commit.short_id, "sha")),
@@ -1050,9 +1039,7 @@ impl RepoView {
             1 => ("Commit", "Author"),
             _ => ("Commits", "Authors"),
         };
-        let mut parts = vec![(label, first.into_any_element())];
-        parts.extend(changes.map(|changes| ("Changes", changes.into_any_element())));
-        parts.push((
+        let mut parts = vec![(
             who_label,
             div()
                 .id("facts-who")
@@ -1060,7 +1047,7 @@ impl RepoView {
                 .child(who)
                 .tooltip(tip(signatures.join("\n")))
                 .into_any_element(),
-        ));
+        )];
         parts.push((
             "When",
             div()
@@ -1069,7 +1056,80 @@ impl RepoView {
                 .tooltip(tip(exact))
                 .into_any_element(),
         ));
+        parts.push((label, first.into_any_element()));
+        parts.extend(changes.map(|changes| ("Changes", changes.into_any_element())));
         parts
+    }
+
+    /// The facts as text to copy, each by its name, for their menu.
+    fn fact_copies(&self, commits: &[Commit]) -> Vec<(String, String)> {
+        let (Some(newest), Some(oldest)) = (commits.first(), commits.last()) else {
+            return Vec::new();
+        };
+        let fact = |name: &str, value: String| (name.to_string(), value);
+        let mut signatures: Vec<String> = Vec::new();
+        for commit in commits {
+            let signature = match commit.email.is_empty() {
+                true => commit.author.clone(),
+                false => format!("{} <{}>", commit.author, commit.email),
+            };
+            if !signatures.contains(&signature) {
+                signatures.push(signature);
+            }
+        }
+        let hashes = match commits {
+            [commit] => vec![
+                fact("Hash", commit.id.clone()),
+                fact("Short Hash", commit.short_id.clone()),
+            ],
+            several => vec![fact(
+                "Hashes",
+                several
+                    .iter()
+                    .map(|commit| commit.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )],
+        };
+        let mut facts = Vec::new();
+        match commits {
+            [commit] => {
+                facts.push(fact("Author", commit.author.clone()));
+                if !commit.email.is_empty() {
+                    facts.push(fact("Author and Email", signatures[0].clone()));
+                }
+            }
+            _ => facts.push(fact("Authors", signatures.join("\n"))),
+        }
+        facts.push(fact(
+            "Date",
+            match commits.len() {
+                1 => local_datetime(newest.time),
+                _ => format!(
+                    "{} – {}",
+                    local_datetime(oldest.time),
+                    local_datetime(newest.time)
+                ),
+            },
+        ));
+        facts.extend(hashes);
+        facts
+    }
+
+    /// A right-click on the facts opens their menu, to copy them.
+    fn facts_menu(
+        &self,
+        commits: &[Commit],
+        cx: &mut Context<Self>,
+    ) -> impl Fn(&MouseDownEvent, &mut Window, &mut gpui::App) + 'static {
+        let facts = self.fact_copies(commits);
+        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+            cx.stop_propagation();
+            let target = Target::Facts {
+                facts: facts.clone(),
+            };
+            this.open_context_menu(target, event.position, cx);
+        })
     }
 
     /// The facts beside a wide header, a line each under its name.
@@ -1092,6 +1152,7 @@ impl RepoView {
             .border_color(theme.separator)
             .text_xs()
             .text_color(theme.secondary)
+            .on_mouse_down(MouseButton::Right, self.facts_menu(commits, cx))
             .children(
                 self.fact_parts(commits, now, theme, cx)
                     .into_iter()
@@ -1130,16 +1191,20 @@ impl RepoView {
         let count = parts.len();
         // What does not fit goes on to the next line, a fact whole, its
         // dot kept with it.
-        div().flex().flex_wrap().gap_x(px(6.)).min_w_0().children(
-            parts.into_iter().enumerate().map(move |(k, (_, value))| {
+        div()
+            .flex()
+            .flex_wrap()
+            .gap_x(px(6.))
+            .min_w_0()
+            .on_mouse_down(MouseButton::Right, self.facts_menu(commits, cx))
+            .children(parts.into_iter().enumerate().map(move |(k, (_, value))| {
                 div()
                     .flex()
                     .gap(px(6.))
                     .whitespace_nowrap()
                     .child(value)
                     .when(k + 1 < count, |part| part.child("·"))
-            }),
-        )
+            }))
     }
 
     /// The diff `list` with the commit header scrolling above its first rows,
@@ -1184,6 +1249,60 @@ impl RepoView {
             }))
             .when(scrolled, |pane| pane.child(self.summary_bar(theme, cx)))
     }
+}
+
+/// Who wrote commits and when, as the facts and the pinned bar say it.
+struct WhoWhen {
+    /// Up to three names, then how many more.
+    who: String,
+    /// Each author once, with their address as git gives it.
+    signatures: Vec<String>,
+    /// How long ago, or from when to when.
+    when: String,
+    /// The exact times, for a tooltip.
+    exact: String,
+}
+
+fn who_when(commits: &[Commit], now: i64) -> Option<WhoWhen> {
+    let (newest, oldest) = (commits.first()?, commits.last()?);
+    let mut authors: Vec<&str> = Vec::new();
+    let mut signatures: Vec<String> = Vec::new();
+    for commit in commits {
+        if !authors.contains(&commit.author.as_str()) {
+            authors.push(&commit.author);
+            signatures.push(match commit.email.is_empty() {
+                true => commit.author.clone(),
+                false => format!("{} <{}>", commit.author, commit.email),
+            });
+        }
+    }
+    let names = authors[..authors.len().min(3)].join(", ");
+    let who = match authors.len().saturating_sub(3) {
+        0 => names,
+        n => format!("{names}, +{n}"),
+    };
+    let (from, to) = (
+        relative_time(oldest.time, now),
+        relative_time(newest.time, now),
+    );
+    let when = match from == to {
+        true => from,
+        false => format!("{from} – {to}"),
+    };
+    let exact = match commits.len() {
+        1 => local_datetime(newest.time),
+        _ => format!(
+            "{} – {}",
+            local_datetime(oldest.time),
+            local_datetime(newest.time)
+        ),
+    };
+    Some(WhoWhen {
+        who,
+        signatures,
+        when,
+        exact,
+    })
 }
 
 /// The strip's pairs of modes, top down, by their buttons' names.

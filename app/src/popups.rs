@@ -52,6 +52,10 @@ pub enum Target {
         path: String,
         exists: bool,
     },
+    /// The facts beside a commit's message, each by its name, to copy.
+    Facts {
+        facts: Vec<(String, String)>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -100,6 +104,8 @@ pub enum Command {
     FollowFilters,
     /// Adds the branch's name as a channel, or takes it away.
     ToggleChannel,
+    /// One of the facts of a `Target::Facts`.
+    CopyFact(usize),
 }
 
 /// The name attention knows a target by: its branch, or a detached
@@ -115,7 +121,7 @@ pub fn attention_name(target: &Target) -> String {
         Target::Commit { commit, .. } => commit.clone(),
         Target::Remote { remote, branch, .. } => format!("{remote}/{branch}"),
         Target::Tag { name, .. } | Target::Stash { name, .. } => name.clone(),
-        Target::Group { .. } | Target::File { .. } => String::new(),
+        Target::Group { .. } | Target::File { .. } | Target::Facts { .. } => String::new(),
     }
 }
 
@@ -330,6 +336,14 @@ pub fn commands(
                 ],
             ])
         }
+        // Each fact copies alone.
+        Target::Facts { facts } => grouped(vec![
+            facts
+                .iter()
+                .enumerate()
+                .map(|(k, (name, _))| text(Command::CopyFact(k), format!("Copy {name}")))
+                .collect(),
+        ]),
         // A group's branches all show, all hide, or follow the filters.
         Target::Group { .. } => grouped(vec![
             vec![
@@ -872,5 +886,20 @@ mod tests {
             ]
         );
         assert_eq!(labels(false), ["Copy Name", "Copy Path", "Copy Full Path"]);
+    }
+
+    #[test]
+    fn each_fact_copies_alone() {
+        let facts = Target::Facts {
+            facts: vec![
+                ("Hash".to_string(), "abc123".to_string()),
+                ("Author".to_string(), "Ann".to_string()),
+            ],
+        };
+        let labels: Vec<String> = commands(&facts, "main", None, &[], true, false, &[])
+            .into_iter()
+            .map(|item| item.map_or("—".to_string(), |(_, label)| label.to_string()))
+            .collect();
+        assert_eq!(labels, ["Copy Hash", "Copy Author"]);
     }
 }

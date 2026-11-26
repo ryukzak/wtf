@@ -906,8 +906,10 @@ impl RepoView {
                                     .when(this.selected_file == Some(index), |item| {
                                         item.bg(theme.selection)
                                     })
+                                    // Clicked again, a file scrolls the changes
+                                    // back to it.
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        if this.selected_file != Some(index) {
+                                        if this.selected_file != Some(index) || this.is_stacked() {
                                             this.select_file(Some(index), cx);
                                         }
                                     }))

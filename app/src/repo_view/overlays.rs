@@ -29,6 +29,16 @@ impl RepoView {
         if let Target::File { name, path, .. } = &target {
             return self.file_command(name, path, command, cx);
         }
+        if let Target::Facts { facts } = &target {
+            let text = match command {
+                Command::CopyFact(k) => facts.get(k).map(|(_, value)| value.clone()),
+                _ => None,
+            };
+            if let Some(text) = text {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            return;
+        }
         let repo = self.repo_path.clone().unwrap_or_default();
         let (name, path, commit) = match &target {
             Target::Branch { name, commit, .. } => (Some(name.clone()), None, commit.clone()),
@@ -46,7 +56,7 @@ impl RepoView {
                 commit,
                 ..
             } => (branch.clone(), Some(path.clone()), commit.clone()),
-            Target::Group { .. } | Target::File { .. } => return,
+            Target::Group { .. } | Target::File { .. } | Target::Facts { .. } => return,
         };
         let copy = |text: String, cx: &mut Context<Self>| {
             cx.write_to_clipboard(ClipboardItem::new_string(text))
@@ -62,7 +72,7 @@ impl RepoView {
             }
             Command::CopyPath => copy(path.unwrap_or_default(), cx),
             // Files only, handled above.
-            Command::CopyRelativePath | Command::Open => {}
+            Command::CopyRelativePath | Command::Open | Command::CopyFact(_) => {}
             Command::OpenWithRecent(k) => {
                 if let (Some(path), Some(command)) = (path, self.open_with.get(k).cloned()) {
                     self.run_in_terminal(popups::open_with(&command, &path), window, cx);
@@ -2030,6 +2040,13 @@ fn copy_hint(target: &Target, command: Command) -> Option<String> {
                 Command::CopyName => file_name(name),
                 Command::CopyRelativePath => name.clone(),
                 Command::CopyPath => popups::tilde(path),
+                _ => return None,
+            };
+            return Some(cut_short(text));
+        }
+        Target::Facts { facts } => {
+            let text = match command {
+                Command::CopyFact(k) => facts.get(k)?.1.lines().next()?.to_string(),
                 _ => return None,
             };
             return Some(cut_short(text));
