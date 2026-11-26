@@ -687,6 +687,8 @@ impl RepoView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let merge = fold.is_some();
+        let mark = self.plan_mark(&commit.id, theme);
+        let dropped = mark.is_some_and(|(_, _, dropped)| dropped);
         let detail = match &fold {
             Some((_, _, count)) => format!("{} · +{count} merged", commit_detail(commit, now)),
             None => commit_detail(commit, now),
@@ -743,8 +745,24 @@ impl RepoView {
                             .flex_1()
                             .min_w_0()
                             .truncate()
+                            .when(dropped, |text| {
+                                text.line_through().text_color(theme.secondary)
+                            })
                             .child(commit.summary.clone()),
-                    ),
+                    )
+                    // What the open rewrite does with it.
+                    .children(mark.map(|(label, color, _)| {
+                        div()
+                            .flex_none()
+                            .ml(px(6.))
+                            .px(px(4.))
+                            .rounded(px(3.))
+                            .bg(color.opacity(0.14))
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(color)
+                            .child(label)
+                    })),
             )
             .child(
                 div()

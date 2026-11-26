@@ -1036,7 +1036,7 @@ fn move_to(repo: &str, onto: &Onto, from: &str, to: &str, why: &str) -> Result<(
 /// The one branch that shows a rewrite's progress in the graph: the steps
 /// settled so far. In capitals, apart from any branch of the user's, and
 /// short whatever branch is rewritten.
-pub const REWRITE_BRANCH: &str = "REWRITE";
+pub const REWRITE_BRANCH: &str = "WTF-REWRITE";
 
 /// Points the progress branch at `commit`, or deletes it with none.
 pub fn mark_wip(repo: &str, name: &str, commit: Option<&str>) -> Result<(), CoreError> {

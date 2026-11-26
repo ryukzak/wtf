@@ -1185,15 +1185,15 @@ mod tests {
     #[test]
     fn a_rewrite_has_its_own_lane_and_leaves_the_branch_its_commits() {
         // The rewrite of feature after f1: f2 again, as a new commit, newer
-        // than everything, on the REWRITE branch.
+        // than everything, on the WTF-REWRITE branch.
         let fixture = forked();
-        fixture.git(".", &["checkout", "-q", "-b", "REWRITE", "feature~1"]);
+        fixture.git(".", &["checkout", "-q", "-b", "WTF-REWRITE", "feature~1"]);
         fixture.commit(".", "b.txt", "x\ny\nz\n", "f2 again");
         fixture.git(".", &["checkout", "-q", "master"]);
         let graph = fixture.graph();
         let (_, feature) = node(&graph, "feature");
         assert_eq!(summaries(feature), vec!["f2"]);
-        let (_, rewrite) = node(&graph, "REWRITE");
+        let (_, rewrite) = node(&graph, "WTF-REWRITE");
         assert_eq!(summaries(rewrite), vec!["f2 again"]);
         assert_ne!(rewrite.lane, feature.lane);
         // f1 stays with feature, not taken by the newer rewrite.

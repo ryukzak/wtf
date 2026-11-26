@@ -260,6 +260,8 @@ enum Border {
     Commits,
     /// The commit header over a snapshot's file.
     SnapshotHeader,
+    /// The commit header over a diff.
+    CommitHeader,
 }
 
 /// How long diff lines show.
@@ -685,6 +687,9 @@ pub struct RepoView {
     /// The commit header's height over a snapshot's file, as dragged; and
     /// where a drag of its edge began, with the height then.
     snapshot_header_height: Option<f32>,
+    /// How tall the commit header over a diff may stand, as dragged; `None`
+    /// fits its content.
+    commit_header_height: Option<f32>,
     header_drag: Option<(f32, f32)>,
     dragging: Option<Border>,
     commits_width: f32,
@@ -725,6 +730,7 @@ impl RepoView {
             graph: None,
             commits: 300.,
             snapshot_header: None,
+            commit_header: None,
         });
         Self {
             focus,
@@ -895,6 +901,7 @@ impl RepoView {
             terminal: None,
             graph_height: sizes.graph,
             snapshot_header_height: sizes.snapshot_header,
+            commit_header_height: sizes.commit_header,
             header_drag: None,
             dragging: None,
             commits_width: sizes.commits,
@@ -1481,6 +1488,17 @@ impl RepoView {
         }
         self.graph = graph;
         self.graph_layout.take();
+        // Plans live as long as the app: a progress branch with none open
+        // is left from a run before, and goes.
+        let wip = wtf_core::plan::REWRITE_BRANCH;
+        if self.plan.is_none()
+            && let Some(repo) = self.repo_path.clone()
+            && self.graph.branches.iter().any(|branch| branch.name == wip)
+        {
+            cx.background_executor()
+                .spawn(async move { wtf_core::plan::mark_wip(&repo, wip, None) })
+                .detach();
+        }
         // Drafts of worktrees the graph no longer has go, so a new one at
         // the same path starts empty.
         let worktrees: HashSet<&str> = self
@@ -2419,6 +2437,13 @@ impl RepoView {
                     self.snapshot_header_height = Some((start + y - from).clamp(2. * lines, max));
                 }
             }
+            Border::CommitHeader => {
+                if let Some((from, start)) = self.header_drag {
+                    let lines = HEADER_LINE * preferences::ui_size();
+                    let least = 2. * HEADER_PADDING + 2. * lines;
+                    self.commit_header_height = Some((start + y - from).clamp(least, max));
+                }
+            }
             Border::Dock => self.dock_height = (height - y).clamp(MIN_PANEL_HEIGHT, max),
             Border::Graph => {
                 let top = workspace::TAB_BAR_HEIGHT;
@@ -2466,6 +2491,7 @@ impl RepoView {
             graph: self.graph_height,
             commits: self.commits_width,
             snapshot_header: self.snapshot_header_height,
+            commit_header: self.commit_header_height,
         }
     }
 

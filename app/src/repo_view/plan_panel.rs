@@ -154,6 +154,11 @@ pub(super) struct PlanView {
     /// Applied: how to take it back.
     pub applied: Option<Undo>,
     pub error: Option<String>,
+    /// The commit the steps are rebuilt on, and the one before it, by id
+    /// and subject: they stay as they are.
+    pub stays: Vec<(String, String)>,
+    /// Steps whose commits the branch's history doesn't have: cherry-picks.
+    pub new_commits: HashSet<String>,
 }
 
 /// A step being dragged to another place in the Rewrite tab.
@@ -207,6 +212,37 @@ impl RepoView {
             Onto::Worktree(path) => format!("⌂ {}", workspace::folder_name(path)),
             Onto::Branch(branch) => branch.clone(),
         }
+    }
+
+    /// A worktree's HEAD commit and the one before it, by id and subject,
+    /// as the graph has them.
+    fn head_stays(&self, worktree: usize) -> Vec<(String, String)> {
+        let mut found = Vec::new();
+        let mut at = self.graph.nodes[worktree].parents.first().copied();
+        while let Some(node) = at {
+            let node = &self.graph.nodes[node];
+            for commit in node.commits.iter().rev() {
+                found.push((commit.id.clone(), commit.summary.clone()));
+                if found.len() == 2 {
+                    return found;
+                }
+            }
+            at = node.parents.first().copied();
+        }
+        found
+    }
+
+    /// What the open plan does with a commit, for the commit history to mark.
+    pub(super) fn plan_mark(
+        &self,
+        commit: &str,
+        theme: &Theme,
+    ) -> Option<(&'static str, gpui::Hsla, bool)> {
+        let view = self.open_plan()?;
+        let step = &view.plan.steps[view.plan.step_of(commit)?];
+        let new = view.new_commits.contains(commit);
+        let (label, color) = action_chip(step.action, new, theme);
+        Some((label, color, step.action == Action::Drop))
     }
 
     /// A plan still to apply.
@@ -323,12 +359,24 @@ impl RepoView {
     fn install_plan(&mut self, repo: &str, plan: Plan, cx: &mut Context<Self>) {
         let ids: Vec<String> = plan.steps.iter().map(|s| s.commit.clone()).collect();
         let subjects = plan::subjects(repo, &ids).unwrap_or_default();
+        let stays = stays(repo, &plan);
+        let (dir, rev) = match &plan.onto {
+            Onto::Worktree(path) => (path.clone(), "HEAD".to_string()),
+            Onto::Branch(branch) => (repo.to_string(), format!("refs/heads/{branch}")),
+        };
+        let new_commits: HashSet<String> = ids
+            .iter()
+            .filter(|id| !wtf_core::has_commit(&dir, &rev, id))
+            .cloned()
+            .collect();
         let place = Self::place_name(&plan.onto);
         let wip = plan::REWRITE_BRANCH.to_string();
         match self.plan.as_mut().filter(|v| v.applied.is_none()) {
             Some(view) => {
                 view.plan = plan;
                 view.subjects = subjects;
+                view.stays = stays;
+                view.new_commits = new_commits;
             }
             None => {
                 self.plan = Some(PlanView {
@@ -349,6 +397,8 @@ impl RepoView {
                     changed: Vec::new(),
                     applied: None,
                     error: None,
+                    stays,
+                    new_commits,
                 });
             }
         }
@@ -551,8 +601,40 @@ impl RepoView {
     /// a step with none of them shows the commit it makes.
     /// Selects a step: the middle shows it, the commit history stays as
     /// it is.
+    /// Selects a step: its commit in the graph and the commit history, for
+    /// the commit panel to show; and in the middle, when it needs something
+    /// there, its conflicts, message or files.
     pub(super) fn select_plan_step(&mut self, step: usize, cx: &mut Context<Self>) {
-        self.focus_step(step, cx);
+        let Some(view) = self.plan.as_ref() else {
+            return;
+        };
+        let Some(entry) = view.plan.steps.get(step).cloned() else {
+            return;
+        };
+        let conflicts = self
+            .plan_outcome(step)
+            .is_some_and(|outcome| !outcome.files.is_empty());
+        let needs = conflicts || matches!(entry.action, Action::Reword | Action::Edit);
+        self.reveal_commit(entry.commit, cx);
+        match needs {
+            true => self.focus_step(step, cx),
+            false => {
+                if let Some(view) = self.plan.as_mut() {
+                    view.selected = Some(step);
+                    view.middle = false;
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Selects a commit in the graph and the commit history, or on its own
+    /// when the graph leaves it out.
+    pub(super) fn reveal_commit(&mut self, commit: String, cx: &mut Context<Self>) {
+        match self.node_of_commit(&commit) {
+            Some(node) => self.select_commit(node, commit, cx),
+            None => self.show_commit_off_graph(commit, cx),
+        }
     }
 
     /// Makes `step` the one the tab and the middle show: its conflicts,
@@ -1125,6 +1207,19 @@ impl RepoView {
                             .child(line)
                     }),
                 )
+                // Where a cherry-pick would go: the current worktree's HEAD.
+                .children(self.current_worktree().map(|node| {
+                    let place = match &self.graph.nodes[node].tip {
+                        Revision::Worktree(path) => format!("⌂ {}", workspace::folder_name(path)),
+                        Revision::Commit(_) => String::new(),
+                    };
+                    div().pt(px(6.)).children(stays_rows(
+                        &self.head_stays(node),
+                        format!("tip of {place}"),
+                        theme,
+                        cx,
+                    ))
+                }))
                 .into_any_element();
         };
         let outcomes = view.worked.as_ref().map(|w| &w.outcomes);
@@ -1168,178 +1263,218 @@ impl RepoView {
         // Steps whose commit the commit history shows now: marked apart from
         // the selected one.
         let viewed: HashSet<&str> = self.commits.iter().map(|c| c.id.as_str()).collect();
-        let steps = view.plan.steps.iter().enumerate().rev().map(|(k, step)| {
-            let outcome = outcomes.and_then(|o| o.get(k));
-            let (mark, color, note) = step_note(outcome, view.applied.is_some(), theme);
-            let selected = view.selected == Some(k);
-            let related = viewed.contains(step.commit.as_str())
-                || outcome
-                    .and_then(|o| o.shown())
-                    .is_some_and(|c| viewed.contains(c));
-            // As it will read: a message written for it, or its own.
-            let subject = step
-                .message
-                .as_deref()
-                .and_then(|m| m.lines().next())
-                .map(str::to_string)
-                .or_else(|| view.subjects.get(&step.commit).cloned())
-                .unwrap_or_else(|| popups::short_hash(&step.commit));
-            // The commit it was, and the one it becomes.
-            let ids = match outcome.and_then(|o| o.commit.as_deref()) {
-                Some(new) => format!(
-                    "{} → {}",
-                    popups::short_hash(&step.commit),
-                    popups::short_hash(new)
-                ),
-                None => popups::short_hash(&step.commit),
-            };
-            let dropped = step.action == Action::Drop;
-            let arrow = |id: &'static str, label: &'static str, later: bool, on: bool| {
-                div()
-                    .id((id, k))
-                    .px(px(3.))
-                    .text_xs()
-                    .text_color(theme.secondary)
-                    .when(!on, |a| a.opacity(0.3))
-                    .when(on, |a| {
-                        a.cursor_pointer()
-                            .hover(|a| a.text_color(theme.foreground))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.move_step(k, later, cx)
-                            }))
-                    })
-                    .child(label)
-            };
-            let highlight = theme.selection;
-            let dragged = DraggedStep {
-                step: k,
-                subject: subject.clone(),
-            };
-            let row = div()
-                .id(("plan-step", k))
-                .relative()
-                // Dragged onto another step, it takes that one's place.
-                .when(editable, |row| {
-                    row.on_drag(dragged, |step, _, _, cx| {
-                        cx.new(|_| crate::workspace::TabPreview(step.subject.clone()))
-                    })
-                    .drag_over::<DraggedStep>(move |style, _, _, _| style.bg(highlight))
-                    .on_drop(cx.listener(
-                        move |this, dragged: &DraggedStep, _, cx| {
-                            this.drop_step(dragged.step, k, cx)
-                        },
-                    ))
-                })
-                .flex()
-                .items_start()
-                .gap(px(6.))
-                .mx(px(6.))
-                .px(px(6.))
-                .py(px(4.))
-                .rounded(px(4.))
-                .border_1()
-                .border_color(match selected {
-                    true => theme.accent,
-                    false => theme.separator,
-                })
-                .cursor_pointer()
-                .hover(|row| row.bg(theme.selection))
-                .on_click(cx.listener(move |this, _, _, cx| this.select_plan_step(k, cx)))
-                .when(related, |row| {
-                    row.child(
-                        div()
-                            .absolute()
-                            .left(px(-1.))
-                            .top(px(4.))
-                            .bottom(px(4.))
-                            .w(px(3.))
-                            .rounded(px(1.5))
-                            .bg(theme.lanes[0]),
-                    )
-                })
-                .child(
+        let steps = shown_order(&view.plan.steps)
+            .into_iter()
+            .map(|(k, joined, size)| {
+                let step = &view.plan.steps[k];
+                let outcome = outcomes.and_then(|o| o.get(k));
+                let (mark, color, note) = step_note(outcome, view.applied.is_some(), theme);
+                let selected = view.selected == Some(k);
+                let related = viewed.contains(step.commit.as_str())
+                    || outcome
+                        .and_then(|o| o.shown())
+                        .is_some_and(|c| viewed.contains(c));
+                // As it will read: a message written for it, or its own.
+                let subject = step
+                    .message
+                    .as_deref()
+                    .and_then(|m| m.lines().next())
+                    .map(str::to_string)
+                    .or_else(|| view.subjects.get(&step.commit).cloned())
+                    .unwrap_or_else(|| popups::short_hash(&step.commit));
+                // The commit it was, and the one it becomes.
+                let ids = match outcome.and_then(|o| o.commit.as_deref()) {
+                    Some(new) => format!(
+                        "{} → {}",
+                        popups::short_hash(&step.commit),
+                        popups::short_hash(new)
+                    ),
+                    None => popups::short_hash(&step.commit),
+                };
+                let dropped = step.action == Action::Drop;
+                let new = view.new_commits.contains(&step.commit);
+                let (chip_label, chip_color) = action_chip(step.action, new, theme);
+                let note = match size {
+                    n if n > 1 => format!("{note} · {n} commits"),
+                    _ => note,
+                };
+                let arrow = |id: &'static str, label: &'static str, later: bool, on: bool| {
                     div()
-                        .flex_none()
-                        .w(px(12.))
-                        .text_color(color)
-                        .font_weight(gpui::FontWeight::BOLD)
-                        .child(mark),
-                )
-                .child(
-                    div()
-                        .id(("plan-action", k))
-                        .flex_none()
-                        .px(px(4.))
-                        .rounded(px(3.))
-                        .border_1()
-                        .border_color(theme.separator)
+                        .id((id, k))
+                        .px(px(3.))
                         .text_xs()
                         .text_color(theme.secondary)
-                        .when(editable, |chip| {
-                            chip.cursor_pointer()
+                        .when(!on, |a| a.opacity(0.3))
+                        .when(on, |a| {
+                            a.cursor_pointer()
+                                .hover(|a| a.text_color(theme.foreground))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
-                                    if let Some(view) = this.plan.as_mut() {
-                                        view.choosing = match view.choosing == Some(k) {
-                                            true => None,
-                                            false => Some(k),
-                                        };
-                                    }
-                                    cx.notify();
+                                    this.move_step(k, later, cx)
                                 }))
                         })
-                        .child(step.action.name()),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .flex_1()
-                        .min_w_0()
-                        .child(
+                        .child(label)
+                };
+                let highlight = theme.selection;
+                let dragged = DraggedStep {
+                    step: k,
+                    subject: subject.clone(),
+                };
+                let row = div()
+                    .id(("plan-step", k))
+                    .relative()
+                    // Dragged onto another step, it takes that one's place.
+                    .when(editable, |row| {
+                        row.on_drag(dragged, |step, _, _, cx| {
+                            cx.new(|_| crate::workspace::TabPreview(step.subject.clone()))
+                        })
+                        .drag_over::<DraggedStep>(move |style, _, _, _| style.bg(highlight))
+                        .on_drop(cx.listener(
+                            move |this, dragged: &DraggedStep, _, cx| {
+                                this.drop_step(dragged.step, k, cx)
+                            },
+                        ))
+                    })
+                    .flex()
+                    .items_start()
+                    .gap(px(6.))
+                    // Squashed into the step under it, it hangs inside it.
+                    .ml(px(if joined { 30. } else { 6. }))
+                    .mr(px(6.))
+                    .px(px(6.))
+                    .py(px(4.))
+                    .rounded(px(4.))
+                    .border_1()
+                    .border_color(match selected {
+                        true => theme.accent,
+                        false => theme.separator,
+                    })
+                    .when(dropped, |row| row.bg(theme.error.opacity(0.07)))
+                    .when(joined, |row| {
+                        row.child(
                             div()
-                                .truncate()
-                                .text_color(match dropped {
-                                    true => theme.secondary,
-                                    false => theme.foreground,
-                                })
-                                .when(dropped, |t| t.line_through())
-                                .child(subject),
+                                .absolute()
+                                .left(px(-18.))
+                                .top(px(2.))
+                                .text_color(chip_color)
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .child("↳"),
                         )
-                        .child(
+                    })
+                    .cursor_pointer()
+                    .hover(|row| row.bg(theme.selection))
+                    .on_click(cx.listener(move |this, _, _, cx| this.select_plan_step(k, cx)))
+                    .when(related, |row| {
+                        row.child(
                             div()
-                                .text_xs()
-                                .text_color(color)
-                                .child(format!("{ids} · {note}")),
-                        ),
-                )
-                .when(editable, |row| {
-                    row.child(
+                                .absolute()
+                                .left(px(-1.))
+                                .top(px(4.))
+                                .bottom(px(4.))
+                                .w(px(3.))
+                                .rounded(px(1.5))
+                                .bg(theme.lanes[0]),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(12.))
+                            .text_color(color)
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .child(mark),
+                    )
+                    .child(
+                        div()
+                            .id(("plan-action", k))
+                            .flex_none()
+                            .px(px(4.))
+                            .rounded(px(3.))
+                            .bg(chip_color.opacity(0.14))
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(chip_color)
+                            .when(editable, |chip| {
+                                chip.cursor_pointer().on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        if let Some(view) = this.plan.as_mut() {
+                                            view.choosing = match view.choosing == Some(k) {
+                                                true => None,
+                                                false => Some(k),
+                                            };
+                                        }
+                                        cx.notify();
+                                    },
+                                ))
+                            })
+                            .child(chip_label),
+                    )
+                    .child(
                         div()
                             .flex()
-                            .flex_none()
-                            // Up the list is later in history.
-                            .child(arrow("plan-up", "↑", true, k + 1 < count))
-                            .child(arrow("plan-down", "↓", false, k > 0))
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
                             .child(
                                 div()
-                                    .id(("plan-remove", k))
-                                    .px(px(3.))
+                                    .truncate()
+                                    .text_color(match dropped {
+                                        true => theme.secondary,
+                                        false => theme.foreground,
+                                    })
+                                    .when(dropped, |t| t.line_through())
+                                    .child(subject),
+                            )
+                            .child(
+                                div()
                                     .text_xs()
-                                    .text_color(theme.secondary)
-                                    .cursor_pointer()
-                                    .hover(|a| a.text_color(theme.error))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        cx.stop_propagation();
-                                        this.remove_step(k, cx)
-                                    }))
-                                    .child("×"),
+                                    .text_color(color)
+                                    .child(format!("{ids} · {note}")),
                             ),
                     )
-                });
-            let choices =
-                (view.choosing == Some(k)).then(|| {
+                    .when(editable, |row| {
+                        row.child(
+                            div()
+                                .flex()
+                                .flex_none()
+                                // A dropped step comes back as it was.
+                                .when(dropped, |controls| {
+                                    controls.child(
+                                        div()
+                                            .id(("plan-undrop", k))
+                                            .px(px(3.))
+                                            .text_xs()
+                                            .text_color(theme.accent)
+                                            .cursor_pointer()
+                                            .hover(|a| a.underline())
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.set_step_action(k, Action::Pick, cx)
+                                            }))
+                                            .child("undo"),
+                                    )
+                                })
+                                // Up the list is later in history.
+                                .child(arrow("plan-up", "↑", true, k + 1 < count))
+                                .child(arrow("plan-down", "↓", false, k > 0))
+                                .child(
+                                    div()
+                                        .id(("plan-remove", k))
+                                        .px(px(3.))
+                                        .text_xs()
+                                        .text_color(theme.secondary)
+                                        .cursor_pointer()
+                                        .hover(|a| a.text_color(theme.error))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.remove_step(k, cx)
+                                        }))
+                                        .child("×"),
+                                ),
+                        )
+                    });
+                let choices = (view.choosing == Some(k)).then(|| {
                     div().flex().flex_wrap().gap(px(4.)).mx(px(26.)).children(
                         Action::ALL.iter().map(|&action| {
                             let on = step.action == action;
@@ -1367,13 +1502,13 @@ impl RepoView {
                         }),
                     )
                 });
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(3.))
-                .child(row)
-                .children(choices)
-        });
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(3.))
+                    .child(row)
+                    .children(choices)
+            });
         let ready = view.worked.as_ref().is_some_and(WorkedOut::ready)
             && !view.working
             && !view.plan.steps.is_empty();
@@ -1406,7 +1541,17 @@ impl RepoView {
                     button("plan-cancel", false, true)
                         .child("Cancel")
                         .on_click(cx.listener(|this, _, _, cx| this.close_plan(cx))),
-                ),
+                )
+                // What is settled so far, on the progress branch, to look at
+                // in the graph and the commit history as any branch.
+                .when(count > 0, |buttons| {
+                    buttons.child(
+                        button("plan-progress", false, true)
+                            .text_color(theme.accent)
+                            .child("Show Done So Far")
+                            .on_click(cx.listener(|this, _, _, cx| this.show_progress(cx))),
+                    )
+                }),
         };
         panel
             .child(
@@ -1422,22 +1567,6 @@ impl RepoView {
                     .child(div().text_xs().text_color(theme.secondary).child(note)),
             )
             .child(div().px(px(12.)).child(actions))
-            // What is settled so far, on the progress branch, to look at in
-            // the commit history as any branch.
-            .when(view.applied.is_none() && count > 0, |panel| {
-                panel.child(
-                    div().px(px(12.)).flex().child(
-                        div()
-                            .id("plan-progress")
-                            .text_xs()
-                            .text_color(theme.accent)
-                            .cursor_pointer()
-                            .hover(|b| b.underline())
-                            .on_click(cx.listener(|this, _, _, cx| this.show_progress(cx)))
-                            .child(format!("Show done so far: {}", view.wip)),
-                    ),
-                )
-            })
             .children(view.error.clone().map(|error| {
                 div()
                     .px(px(12.))
@@ -1445,7 +1574,21 @@ impl RepoView {
                     .text_color(theme.error)
                     .child(error)
             }))
+            .when(count == 0 && view.applied.is_none(), |panel| {
+                panel.child(
+                    div()
+                        .px(px(12.))
+                        .py(px(6.))
+                        .text_xs()
+                        .text_color(theme.secondary)
+                        .italic()
+                        .child(
+                            "Pick commits in the history or the graph: right-click, Cherry-pick",
+                        ),
+                )
+            })
             .children(steps)
+            .children(stays_rows(&view.stays, base_label(view), theme, cx))
             .into_any_element()
     }
 
@@ -2352,5 +2495,172 @@ fn step_note(
                 format!("{guess}conflict in {}", files(left)),
             )
         }
+    }
+}
+
+/// The steps in the order the tab shows them: newest first, each squash or
+/// fixup under the step it joins, as `(step, joined, commits it holds)`.
+fn shown_order(steps: &[plan::Step]) -> Vec<(usize, bool, usize)> {
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for (k, step) in steps.iter().enumerate() {
+        let joins = matches!(step.action, Action::Squash | Action::Fixup);
+        match groups.last_mut() {
+            Some(group) if joins => group.push(k),
+            _ => groups.push(vec![k]),
+        }
+    }
+    groups
+        .iter()
+        .rev()
+        .flat_map(|group| {
+            let size = group.len();
+            let head = std::iter::once((group[0], false, size));
+            head.chain(group[1..].iter().rev().map(|&k| (k, true, 1)))
+        })
+        .collect()
+}
+
+/// A step's chip: its action, or `new` for a commit picked from elsewhere,
+/// and its colour.
+fn action_chip(action: Action, new: bool, theme: &Theme) -> (&'static str, gpui::Hsla) {
+    match action {
+        Action::Pick if new => ("new", header::ADDED),
+        Action::Pick => ("pick", theme.accent),
+        Action::Drop => ("drop", theme.error),
+        Action::Squash | Action::Fixup => (action.name(), theme.lanes[1]),
+        Action::Reword | Action::Edit => (action.name(), theme.lanes[3]),
+    }
+}
+
+/// The commit the plan is rebuilt on, and the one before it.
+fn stays(repo: &str, plan: &Plan) -> Vec<(String, String)> {
+    let base = match &plan.base {
+        Base::Tip => plan::tip_of(repo, &plan.onto).ok(),
+        Base::Commit { base, .. } => Some(base.clone()),
+    };
+    let Some(base) = base else {
+        return Vec::new();
+    };
+    let ids: Vec<String> = std::iter::once(base.clone())
+        .chain(plan::rev(repo, &format!("{base}^")).ok())
+        .collect();
+    let subjects = plan::subjects(repo, &ids).unwrap_or_default();
+    ids.into_iter()
+        .map(|id| {
+            let subject = subjects.get(&id).cloned().unwrap_or_default();
+            (id, subject)
+        })
+        .collect()
+}
+
+/// What the base row says on its right: where the plan starts.
+fn base_label(view: &PlanView) -> String {
+    match view.plan.base {
+        Base::Tip => format!("tip of {}", view.place),
+        Base::Commit { .. } => "base".to_string(),
+    }
+}
+
+/// The commits that stay, under a dashed line: the base, and fainter, the
+/// one before it.
+fn stays_rows(
+    stays: &[(String, String)],
+    label: String,
+    theme: &Theme,
+    cx: &mut Context<RepoView>,
+) -> Vec<AnyElement> {
+    stays
+        .iter()
+        .enumerate()
+        .map(|(k, (id, subject))| {
+            let commit = id.clone();
+            div()
+                .id(("plan-stays", k))
+                .cursor_pointer()
+                .rounded(px(4.))
+                .hover(|row| row.bg(theme.selection))
+                .on_click(cx.listener(move |this, _, _, cx| this.reveal_commit(commit.clone(), cx)))
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .mx(px(6.))
+                .px(px(6.))
+                .py(px(4.))
+                .when(k == 0, |row| {
+                    row.border_t_1()
+                        .border_dashed()
+                        .border_color(theme.secondary)
+                })
+                .opacity(if k == 0 { 0.85 } else { 0.5 })
+                .child(div().flex_none().w(px(12.)))
+                .child(
+                    div()
+                        .flex_none()
+                        .px(px(4.))
+                        .rounded(px(3.))
+                        .bg(theme.secondary.opacity(0.14))
+                        .text_xs()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(theme.secondary)
+                        .child("stays"),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_xs()
+                        .text_color(theme.secondary)
+                        .child(popups::short_hash(id)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .italic()
+                        .text_color(theme.secondary)
+                        .child(subject.clone()),
+                )
+                .when(k == 0, |row| {
+                    row.child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(theme.secondary)
+                            .child(label.clone()),
+                    )
+                })
+                .into_any_element()
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn squashes_hang_under_the_step_they_join() {
+        let step = |action| plan::Step {
+            action,
+            ..plan::Step::new("c")
+        };
+        // Oldest first: a, b squashed into a, c, d fixed up into c, e.
+        let steps = [
+            step(Action::Pick),
+            step(Action::Squash),
+            step(Action::Pick),
+            step(Action::Fixup),
+            step(Action::Drop),
+        ];
+        assert_eq!(
+            shown_order(&steps),
+            [
+                (4, false, 1),
+                (2, false, 2),
+                (3, true, 1),
+                (0, false, 2),
+                (1, true, 1),
+            ]
+        );
     }
 }
