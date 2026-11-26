@@ -497,6 +497,13 @@ pub fn layout(graph: &WorkflowGraph, order: WorktreeOrder) -> Layout {
     // another line stay below, near it: going up they would cross every
     // row between; so do worktrees stacked under another at a tip.
     let mid_lane = |k: usize| goes_up(detached[k]);
+    // A stash or tag on a line other than the main one gets a row of its own right
+    // above that line's, below the rest: going up from it, it crosses no
+    // other row. Stashes on the main line go up above it.
+    let stash_over: Vec<Option<usize>> = stash_rows
+        .iter()
+        .map(|&(parent, _, _)| (lane_of[parent] != 0).then_some(lane_of[parent]))
+        .collect();
     let mut lanes: Vec<(usize, (f32, f32))> = (1..stash_lane(0))
         .filter(|&lane| !(base..stash_lane(0)).contains(&lane) || { !mid_lane(lane - base) })
         .chain(
@@ -504,6 +511,11 @@ pub fn layout(graph: &WorkflowGraph, order: WorktreeOrder) -> Layout {
                 .iter()
                 .filter(|&&w| !goes_up(w))
                 .map(|&w| framed_lane(w)),
+        )
+        .chain(
+            (0..stash_rows.len())
+                .filter(|&k| stash_over[k].is_some())
+                .map(stash_lane),
         )
         .filter_map(|lane| Some((lane, spans[lane]?)))
         .collect();
@@ -632,16 +644,49 @@ pub fn layout(graph: &WorkflowGraph, order: WorktreeOrder) -> Layout {
             ordered.push((lane, span));
         }
     }
+    // Each such stash goes right before its line, so it takes the row above
+    // the line's and the line the one under it.
+    for (k, over) in stash_over.iter().enumerate() {
+        let Some(line) = *over else {
+            continue;
+        };
+        let lane = stash_lane(k);
+        let Some(at) = ordered.iter().position(|&(l, _)| l == lane) else {
+            continue;
+        };
+        let stash = ordered.remove(at);
+        let to = ordered
+            .iter()
+            .position(|&(l, _)| l == line)
+            .unwrap_or(ordered.len());
+        ordered.insert(to, stash);
+    }
+    let stash_of_lane = |lane: usize| {
+        (0..stash_rows.len())
+            .find(|&k| stash_lane(k) == lane)
+            .and_then(|k| stash_over[k])
+    };
     for (lane, (start, end)) in ordered {
         let free = |row: &Vec<(f32, f32)>| {
             row.iter()
                 .all(|&(s, e)| end + ROW_GAP < s || e + ROW_GAP < start)
         };
-        let lowest = step_from
-            .get(lane)
-            .copied()
-            .flatten()
-            .map_or(1, |from| row_of[from] + 1);
+        // A stash's row is as low as its line's would be; the line goes
+        // under its stashes.
+        let stepped = |lane: usize| {
+            step_from
+                .get(lane)
+                .copied()
+                .flatten()
+                .map_or(1, |from| row_of[from] + 1)
+        };
+        let lowest = match stash_of_lane(lane) {
+            Some(line) => stepped(line),
+            None => (0..stash_rows.len())
+                .filter(|&k| stash_over[k] == Some(lane))
+                .map(|k| row_of[stash_lane(k)] + 1)
+                .fold(stepped(lane), usize::max),
+        };
         let row = match (lowest.max(1)..rows.len()).find(|&row| free(&rows[row])) {
             Some(row) => row,
             None => {
@@ -672,7 +717,11 @@ pub fn layout(graph: &WorkflowGraph, order: WorktreeOrder) -> Layout {
                 .filter(|&&w| goes_up(w))
                 .map(|&w| framed_lane(w)),
         )
-        .chain((0..stash_rows.len()).map(stash_lane))
+        .chain(
+            (0..stash_rows.len())
+                .filter(|&k| stash_over[k].is_none())
+                .map(stash_lane),
+        )
         .filter_map(|lane| Some((lane, spans[lane]?)))
         .collect();
     up.sort_by(|a, b| a.1.1.total_cmp(&b.1.1).then(a.1.0.total_cmp(&b.1.0)));
@@ -855,10 +904,22 @@ fn label_width(name: &str) -> f32 {
     name.chars().count() as f32 * LABEL_CHAR + LABEL_EXTRA + LABEL_SPACING
 }
 
+/// A remote branch at the same commit as its local one: that one's dot
+/// stands for it, with no label of its own.
+fn beside_local(graph: &WorkflowGraph, node: &GraphNode, name: &str) -> bool {
+    graph.branches.iter().any(|b| b.name == name && b.remote)
+        && partner(graph, name).is_some_and(|local| node.refs.contains(&local))
+}
+
 /// How wide a node's labels are, roughly, so nothing is drawn over them.
 fn labels_width(graph: &WorkflowGraph, node: &GraphNode) -> f32 {
-    let notes: f32 = node.refs.iter().map(|name| extras_width(graph, name)).sum();
-    node.refs.iter().map(|name| label_width(name)).sum::<f32>() + notes
+    let shown: Vec<&String> = node
+        .refs
+        .iter()
+        .filter(|name| !beside_local(graph, node, name))
+        .collect();
+    let notes: f32 = shown.iter().map(|name| extras_width(graph, name)).sum();
+    shown.into_iter().map(|name| label_width(name)).sum::<f32>() + notes
 }
 
 /// Why a branch looks left behind, as its labels say it: `merged · idle 30d`.
@@ -906,35 +967,155 @@ fn note_width(note: &str) -> f32 {
     note.chars().count() as f32 * LABEL_CHAR + NOTE_GAP
 }
 
-/// How much a branch's stale note and sync badge widen its label.
+/// How much a branch's remote dot, its counts and its idle age widen its
+/// label.
 fn extras_width(graph: &WorkflowGraph, name: &str) -> f32 {
-    [stale_note(graph, name), sync_badge(graph, name)]
-        .iter()
-        .flatten()
-        .map(|text| note_width(text))
-        .sum()
+    let dot = match remote_of(graph, name) {
+        Some(_) => REMOTE_DOT + NOTE_GAP,
+        None => 0.,
+    };
+    let counts = match remote_of(graph, name) {
+        Some(Remote::Apart(counts)) => note_width(&counts),
+        _ => 0.,
+    };
+    dot + counts + idle_age(graph, name).map_or(0., |age| note_width(&age))
 }
 
-/// A branch's label: filled when a worktree has it checked out, and when it
-/// looks left behind, faded, in italics, with why after its name. How far
-/// it is from its upstream follows the name.
+/// The remote dot's size.
+const REMOTE_DOT: f32 = 7.;
+
+/// Where a local branch stands against the remote, as the dot after its
+/// label shows it.
+#[derive(Clone, PartialEq, Debug)]
+enum Remote {
+    /// On the remote, at the same commit: a filled dot.
+    InStep,
+    /// Ahead or behind it, by the counts: a half-filled dot and `↑2 ↓1`.
+    Apart(String),
+    /// Never pushed: a hollow dot.
+    Local,
+    /// Its remote branch is gone, as after a merged pull request: a red ring.
+    Gone,
+}
+
+/// A local branch's remote standing; none for a remote branch.
+fn remote_of(graph: &WorkflowGraph, name: &str) -> Option<Remote> {
+    let branch = graph
+        .branches
+        .iter()
+        .find(|branch| branch.name == name && !branch.remote)?;
+    if branch.stale.iter().any(|reason| reason == "remote gone") {
+        return Some(Remote::Gone);
+    }
+    let pushed = branch.upstream.is_some()
+        || graph
+            .branches
+            .iter()
+            .any(|other| other.remote && other.name.ends_with(&format!("/{name}")));
+    if !pushed {
+        return Some(Remote::Local);
+    }
+    Some(match sync_badge(graph, name) {
+        Some(counts) => Remote::Apart(counts),
+        None => Remote::InStep,
+    })
+}
+
+/// How long a branch has sat idle, short, as `40d`: from its last commit,
+/// against the days set in Settings; none for live work.
+fn idle_age(graph: &WorkflowGraph, name: &str) -> Option<String> {
+    let branch = graph.branches.iter().find(|branch| branch.name == name)?;
+    let days = (crate::repo_view::now_seconds() - branch.time) / 86_400;
+    let live = branch.busy || branch.remote || branch.name == graph.main;
+    (!live && branch.time > 0 && days >= i64::from(graph.idle_days.unwrap_or(crate::preferences::DEFAULT_IDLE_DAYS)))
+        .then(|| format!("{days}d"))
+}
+
+/// The dot after a local branch's label.
+fn remote_dot(remote: &Remote, color: Hsla, theme: &Theme) -> gpui::Div {
+    let dot = div()
+        .flex_none()
+        .size(px(REMOTE_DOT))
+        .ml(px(NOTE_GAP))
+        .rounded_full();
+    match remote {
+        Remote::InStep => dot.bg(color),
+        Remote::Apart(_) => dot.relative().border_1().border_color(color).child(
+            div()
+                .absolute()
+                .left_0()
+                .top_0()
+                .bottom_0()
+                .w(px(REMOTE_DOT / 2.))
+                .rounded_l_full()
+                .bg(color),
+        ),
+        Remote::Local => dot.border_1().border_color(theme.secondary),
+        Remote::Gone => dot.border_1().border_color(theme.error),
+    }
+}
+
+/// A branch's label: filled when a worktree has it checked out. After its
+/// name, a dot for where it stands against the remote, and how far apart
+/// they are. Left behind, merged or its remote gone, it fades, in italics,
+/// struck through when the remote is gone; idle long, its age follows. A
+/// branch only on the remote is outlined, dashed, with no fill.
 fn branch_tag(
+    graph: &WorkflowGraph,
     name: &str,
-    note: Option<String>,
-    badge: Option<String>,
+    shown: &str,
     color: Hsla,
     filled: bool,
     theme: &Theme,
 ) -> gpui::Div {
-    let badge = badge.map(|badge| div().ml(px(NOTE_GAP)).opacity(0.8).child(badge));
-    let Some(note) = note else {
-        return tag(name, color, filled, theme).children(badge);
+    let remote_only = graph
+        .branches
+        .iter()
+        .any(|branch| branch.name == name && branch.remote);
+    if remote_only {
+        return pill()
+            .pl(px(6.))
+            .border_1()
+            .border_dashed()
+            .border_color(color)
+            .text_color(theme.secondary)
+            .italic()
+            .child(shown.to_string());
+    }
+    let remote = remote_of(graph, name);
+    let faded = stale_note(graph, name).is_some();
+    // On a filled label, the dot takes the label's text colour, to show.
+    let dot_color = match (faded, filled) {
+        (true, _) => theme.secondary,
+        (false, true) => theme.tag_head_text,
+        (false, false) => color,
     };
-    tag(name, color.opacity(0.45), false, theme)
-        .italic()
-        .text_color(theme.secondary)
-        .children(badge)
-        .child(div().ml(px(NOTE_GAP)).child(note))
+    let dot = remote
+        .as_ref()
+        .map(|remote| remote_dot(remote, dot_color, theme));
+    let counts = match &remote {
+        Some(Remote::Apart(counts)) => Some(
+            div()
+                .ml(px(NOTE_GAP / 2.))
+                .opacity(0.8)
+                .child(counts.clone()),
+        ),
+        _ => None,
+    };
+    let age = idle_age(graph, name).map(|age| div().ml(px(NOTE_GAP)).opacity(0.7).child(age));
+    let label = match faded {
+        false => tag(shown, color, filled, theme),
+        true => tag(shown, color.opacity(0.45), false, theme)
+            .italic()
+            .text_color(theme.secondary),
+    };
+    label
+        .when(remote == Some(Remote::Gone), |label| label.line_through())
+        .flex()
+        .items_center()
+        .children(dot)
+        .children(counts)
+        .children(age)
 }
 
 /// Room for a worktree's age after its name, as "12m".
@@ -1445,8 +1626,7 @@ pub fn render(
             // A worktree on a row of its own carries its branch's label there.
             if let Some(name) = own_row_branch(graph, &layout.detached, i) {
                 let target = label_target(graph, name, String::new());
-                let (note, badge) = (stale_note(graph, name), sync_badge(graph, name));
-                let tag = branch_tag(name, note, badge, color, true, theme);
+                let tag = branch_tag(graph, name, name, color, true, theme);
                 let tag = with_current_lines(tag, picked_branches.contains(&name), theme);
                 let tag = with_pair(tag, graph, name, &paired, theme);
                 content = content.child(
@@ -1479,6 +1659,7 @@ pub fn render(
             .refs
             .iter()
             .filter(|name| !elsewhere.contains(&name.as_str()))
+            .filter(|name| !beside_local(graph, node, name))
             .map(|name| {
                 let commit = match &node.tip {
                     Revision::Commit(id) => id.clone(),
@@ -1488,8 +1669,7 @@ pub fn render(
                 // A branch checked out in a worktree is filled, as its tag in
                 // the worktree list is.
                 let checked_out = matches!(target, Target::Worktree { .. });
-                let (note, badge) = (stale_note(graph, name), sync_badge(graph, name));
-                let tag = branch_tag(name, note, badge, color, checked_out, theme);
+                let tag = branch_tag(graph, name, name, color, checked_out, theme);
                 let tag = with_current_lines(tag, picked_branches.contains(&name.as_str()), theme);
                 let tag = with_pair(tag, graph, name, &paired, theme);
                 menu_label(tag, name, target, i, true, cx)
@@ -1537,9 +1717,15 @@ pub fn render(
             .first()
             .map(|name| {
                 let branch = worktree.branch.as_deref();
-                let note = branch.and_then(|b| stale_note(graph, b));
-                let badge = branch.and_then(|b| sync_badge(graph, b));
-                let tag = branch_tag(&label, note, badge, color, true, theme);
+                // The folder's name, with its branch's standing.
+                let tag = branch_tag(
+                    graph,
+                    branch.unwrap_or_default(),
+                    &label,
+                    color,
+                    true,
+                    theme,
+                );
                 menu_label(tag, name, worktree_target(graph, w), w, false, cx)
             })
             .into_iter()
@@ -2764,6 +2950,24 @@ mod tests {
             layout.nodes[2].2 < layout.nodes[1].2,
             "the short branch is nearer the main row"
         );
+    }
+
+    #[test]
+    fn a_stash_on_a_branch_sits_one_row_above_it() {
+        // main, and a branch off it whose tip has a stash: the stash takes a
+        // row between the main row and the branch's, not one above main.
+        let mut tip = node(1, &[0], 2, 1);
+        tip.refs = vec!["rewrite".to_string()];
+        tip.stashes = vec!["stash@{0}".to_string()];
+        let graph = graph(vec![node(0, &[], 3, 0), tip]);
+        let layout = layout(&graph, WorktreeOrder::LastCommit);
+        let [stash] = &layout.stashes[..] else {
+            panic!("one stash")
+        };
+        let main_y = layout.nodes[0].2;
+        let branch_y = layout.nodes[1].2;
+        assert!(main_y < stash.y && stash.y < branch_y, "between them");
+        assert_eq!(branch_y - stash.y, style().row_height, "right above");
     }
 
     #[test]

@@ -902,6 +902,10 @@ impl RepoView {
                                             this.select_file(Some(index), cx);
                                         }
                                     }))
+                                    .on_mouse_down(
+                                        MouseButton::Right,
+                                        super::this_file_menu(index, cx),
+                                    )
                                     .child(
                                         div()
                                             .w(px(10.))

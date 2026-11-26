@@ -190,6 +190,12 @@ pub fn build(
     now: i64,
 ) -> Result<WorkflowGraph, CoreError> {
     let remotes = remote_names(repo_path)?;
+    if git::run(repo_path, &["rev-list", "-n", "1", "--all"])?
+        .trim()
+        .is_empty()
+    {
+        return unborn(repo_path, remotes);
+    }
     let channels = crate::channels::channel_patterns(repo_path);
     let (mut tips, mut branches, main_worktree) =
         tips(repo_path, attention, now, &remotes, &channels)?;
@@ -409,7 +415,7 @@ pub fn build(
                 if !tip.detached {
                     nodes[node_of[i]].refs.push(tip.name.clone());
                 }
-                let (added, removed, touched) = worktree_stats(path)?;
+                let (added, removed, touched) = worktree_stats(path, Some("HEAD"))?;
                 // Its last work: the newest commit, or a change since.
                 let time = log[i].0.time.max(touched);
                 nodes.push(GraphNode {
@@ -906,6 +912,47 @@ fn main_branch(repo_path: &str) -> String {
 
 type Worktrees = (Vec<(String, String, Option<String>)>, Option<String>);
 
+/// A repository with no commits yet: its worktree alone, on the branch its
+/// first commit will start, so the first changes can be staged and
+/// committed. A bare one shows nothing.
+fn unborn(repo_path: &str, remotes: Vec<String>) -> Result<WorkflowGraph, CoreError> {
+    let (_, main_worktree) = worktrees(repo_path)?;
+    let main = git::run(repo_path, &["symbolic-ref", "--short", "HEAD"])
+        .map(|name| name.trim().to_string())
+        .unwrap_or_else(|_| "main".to_string());
+    let mut nodes = Vec::new();
+    if let Some(path) = &main_worktree {
+        let (added, removed, touched) = worktree_stats(path, None)?;
+        nodes.push(GraphNode {
+            key: format!("worktree:{path}"),
+            kind: NodeKind::Uncommitted,
+            lane: 0,
+            commits: Vec::new(),
+            parents: Vec::new(),
+            first_time: touched,
+            last_time: touched,
+            refs: vec![main.clone()],
+            branch: Some(main.clone()),
+            tags: Vec::new(),
+            stashes: Vec::new(),
+            added,
+            removed,
+            base: None,
+            tip: Revision::Worktree(path.clone()),
+            channel: false,
+        });
+    }
+    Ok(WorkflowGraph {
+        lane_count: 1,
+        on_main: vec![false; nodes.len()],
+        nodes,
+        main,
+        remotes,
+        main_worktree,
+        ..WorkflowGraph::default()
+    })
+}
+
 /// Path, HEAD and branch of each usable worktree, the main one first; and
 /// the main worktree's path, unless the repository is bare.
 fn worktrees(repo_path: &str) -> Result<Worktrees, CoreError> {
@@ -943,11 +990,17 @@ fn worktrees(repo_path: &str) -> Result<Worktrees, CoreError> {
 /// Work inside submodules is left out: git would look into each of them
 /// on every refresh, and their lines are not the worktree's. A submodule
 /// moved to another commit still counts.
-fn worktree_stats(path: &str) -> Result<(u32, u32, i64), CoreError> {
-    let raw = git::run(
-        path,
-        &["diff", "--numstat", "--ignore-submodules=dirty", "HEAD"],
-    )?;
+fn worktree_stats(path: &str, base: Option<&str>) -> Result<(u32, u32, i64), CoreError> {
+    let diff = |args: &[&str]| {
+        let mut all = vec!["diff", "--numstat", "--ignore-submodules=dirty"];
+        all.extend(args);
+        git::run(path, &all)
+    };
+    // With no commits yet, what is staged and what is not, from nothing.
+    let raw = match base {
+        Some(base) => diff(&[base])?,
+        None => diff(&["--cached"])? + &diff(&[])?,
+    };
     let (mut added, removed) = numstat(&raw);
     // When the changes were last touched: the newest of their files.
     let mut touched = 0;
@@ -1635,6 +1688,22 @@ mod tests {
                 .unwrap()
                 .shown
         );
+    }
+
+    #[test]
+    fn a_repository_without_commits_shows_its_worktree() {
+        let fixture = Fixture::new();
+        fs::write(fixture.dir.path().join("a.txt"), "1\n2\n").unwrap();
+        let graph = fixture.graph();
+        assert_eq!(graph.main, "master");
+        let [node] = &graph.nodes[..] else {
+            panic!("one node: {:?}", graph.nodes);
+        };
+        assert_eq!(node.kind, NodeKind::Uncommitted);
+        assert_eq!(node.branch.as_deref(), Some("master"));
+        assert_eq!((node.added, node.base.as_deref()), (2, None));
+        let commits = crate::range_commits(&fixture.path(), None, &node.tip).unwrap();
+        assert!(commits.is_empty());
     }
 
     #[test]

@@ -45,6 +45,13 @@ pub enum Target {
     Group {
         remote: bool,
     },
+    /// A changed file: its path in the repository, and where it is on
+    /// disk in the worktree, if it is there.
+    File {
+        name: String,
+        path: String,
+        exists: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -54,6 +61,10 @@ pub enum Command {
     CopyShortHash,
     CopyMessage,
     CopyPath,
+    /// A file's path in the repository, against `CopyPath`'s full one.
+    CopyRelativePath,
+    /// Opens a file in its default app.
+    Open,
     RevealInFinder,
     /// Opens with one of the recent commands.
     OpenWithRecent(usize),
@@ -104,7 +115,7 @@ pub fn attention_name(target: &Target) -> String {
         Target::Commit { commit, .. } => commit.clone(),
         Target::Remote { remote, branch, .. } => format!("{remote}/{branch}"),
         Target::Tag { name, .. } | Target::Stash { name, .. } => name.clone(),
-        Target::Group { .. } => String::new(),
+        Target::Group { .. } | Target::File { .. } => String::new(),
     }
 }
 
@@ -299,6 +310,24 @@ pub fn commands(
                 actions,
                 copied,
                 vec![danger(Command::DropStash, "Drop…")],
+            ])
+        }
+        // A file opens, shows in Finder, or is copied by its name or paths.
+        Target::File { exists, .. } => {
+            let open = match exists {
+                true => vec![
+                    text(Command::Open, "Open"),
+                    text(Command::RevealInFinder, "Reveal in Finder"),
+                ],
+                false => Vec::new(),
+            };
+            grouped(vec![
+                open,
+                vec![
+                    text(Command::CopyName, "Copy Name"),
+                    text(Command::CopyRelativePath, "Copy Path"),
+                    text(Command::CopyPath, "Copy Full Path"),
+                ],
             ])
         }
         // A group's branches all show, all hide, or follow the filters.
@@ -816,5 +845,32 @@ mod tests {
             .collect();
         assert!(labels.contains(&"Open with subl".to_string()));
         assert!(!labels.iter().any(|label| label.contains("Terminal")));
+    }
+
+    #[test]
+    fn a_file_opens_only_when_it_is_there() {
+        let labels = |exists: bool| -> Vec<String> {
+            let file = Target::File {
+                name: "src/main.rs".to_string(),
+                path: "/repo/src/main.rs".to_string(),
+                exists,
+            };
+            commands(&file, "main", None, &[], true, false, &[])
+                .into_iter()
+                .map(|item| item.map_or("—".to_string(), |(_, label)| label.to_string()))
+                .collect()
+        };
+        assert_eq!(
+            labels(true),
+            [
+                "Open",
+                "Reveal in Finder",
+                "—",
+                "Copy Name",
+                "Copy Path",
+                "Copy Full Path"
+            ]
+        );
+        assert_eq!(labels(false), ["Copy Name", "Copy Path", "Copy Full Path"]);
     }
 }

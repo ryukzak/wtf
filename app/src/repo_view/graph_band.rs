@@ -434,6 +434,14 @@ impl RepoView {
         cx.notify();
     }
 
+    /// Whether the repository has no commits yet: its graph holds nothing
+    /// but its worktree.
+    pub(super) fn no_commits(&self) -> bool {
+        !self.graph.nodes.is_empty()
+            && self.graph.nodes.iter().all(|node| node.parents.is_empty())
+            && self.graph.main_node.is_none()
+    }
+
     /// The graph's layout, made again only when the graph or what shapes it
     /// changes, not on every frame.
     pub(super) fn graph_layout(&self) -> Rc<graph_view::Layout> {
@@ -450,7 +458,13 @@ impl RepoView {
         {
             return layout.clone();
         }
-        let layout = Rc::new(graph_view::layout(&self.graph, self.worktree_order));
+        // A repository without commits has a worktree on nothing, which the
+        // graph cannot draw: it lays out empty.
+        let layout = match self.no_commits() {
+            true => graph_view::layout(&WorkflowGraph::default(), self.worktree_order),
+            false => graph_view::layout(&self.graph, self.worktree_order),
+        };
+        let layout = Rc::new(layout);
         *cache = Some((key, layout.clone()));
         layout
     }
@@ -463,6 +477,16 @@ impl RepoView {
     ) -> AnyElement {
         if let Some(error) = &self.graph_error {
             return placeholder("Cannot read the repository", Some(error.clone()), theme);
+        }
+        if self.no_commits() {
+            let next = "Stage your changes and commit them below to make the first one.";
+            return div()
+                .flex_none()
+                .h(px(self.graph_height.unwrap_or(MIN_PANEL_HEIGHT)))
+                .border_b_1()
+                .border_color(theme.separator)
+                .child(placeholder("No commits yet", Some(next.to_string()), theme))
+                .into_any_element();
         }
         let layout = self.graph_layout();
         // When the graph grows or shrinks, as attention changes, the view keeps

@@ -9,6 +9,8 @@ pub enum Kind {
     /// A command run on a worktree; its entry's `run` is the command.
     Shell,
     Branch,
+    /// A branch the graph leaves out, a remote one say; picking it shows it.
+    Hidden,
     Commit,
     /// A palette command; its entry's `node` is its place in the list.
     Command,
@@ -74,9 +76,24 @@ pub fn entries(graph: &WorkflowGraph, names: WorktreeNames) -> Vec<Entry> {
         }
     }
     commits.sort_by_key(|entry| std::cmp::Reverse(entry.time));
+    // The graph's branches come newest first.
+    let hidden = graph
+        .branches
+        .iter()
+        .filter(|branch| !branch.shown)
+        .map(|branch| Entry {
+            kind: Kind::Hidden,
+            label: branch.name.clone(),
+            detail: branch.author.clone(),
+            node: 0,
+            commit: None,
+            time: branch.time,
+            run: None,
+        });
     worktrees
         .into_iter()
         .chain(branches)
+        .chain(hidden)
         .chain(commits)
         .collect()
 }
@@ -116,15 +133,30 @@ fn score(entry: &Entry, query: &str) -> Option<usize> {
 }
 
 /// The entries matching `query`: worktrees, then branches, then commits,
-/// each kind best match first, keeping the given order among equals.
+/// each kind best match first, keeping the given order among equals. A
+/// branch as GitHub names one, `owner:branch`, matches by its branch too.
 pub fn filter<'a>(entries: &'a [Entry], query: &str) -> Vec<&'a Entry> {
     let query = query.trim().to_lowercase();
     if query.is_empty() {
         return entries.iter().collect();
     }
+    let branch = query
+        .split_once(':')
+        .map(|(_, branch)| branch.trim())
+        .filter(|branch| !branch.is_empty());
     let mut found: Vec<(usize, &Entry)> = entries
         .iter()
-        .filter_map(|entry| score(entry, &query).map(|score| (score, entry)))
+        .filter_map(|entry| {
+            let whole = score(entry, &query);
+            let named = branch
+                .filter(|_| matches!(entry.kind, Kind::Branch | Kind::Hidden))
+                .and_then(|branch| score(entry, branch));
+            whole
+                .into_iter()
+                .chain(named)
+                .min()
+                .map(|score| (score, entry))
+        })
         .collect();
     found.sort_by_key(|(score, entry)| (entry.kind as usize, *score));
     found.into_iter().map(|(_, entry)| entry).collect()
@@ -205,6 +237,17 @@ mod tests {
         );
         assert!(filter(&entries, "zzz").is_empty());
         assert_eq!(filter(&entries, "  ").len(), 4);
+    }
+
+    #[test]
+    fn a_github_branch_name_finds_the_remote_branch() {
+        let entries = [
+            entry(Kind::Hidden, "origin/v2512-fix/8921-tenant-portal-rpc", ""),
+            entry(Kind::Hidden, "origin/v2512-fix/1-other", ""),
+        ];
+        let found = filter(&entries, "insansara: v2512-fix/8921-tenant-portal-rpc");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].label, "origin/v2512-fix/8921-tenant-portal-rpc");
     }
 
     #[test]

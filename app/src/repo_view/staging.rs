@@ -31,8 +31,23 @@ impl RepoView {
         .detach();
     }
 
+    /// The rows of the hunk a row is in, as its header spans them; the
+    /// whole file where the diff has no hunk headers.
+    pub(super) fn hunk_of(&self, file: usize, row: usize) -> std::ops::Range<usize> {
+        self.stacked
+            .iter()
+            .find_map(|item| match *item {
+                StackItem::Hunk(f, start, end) if f == file && (start..end).contains(&row) => {
+                    Some(start..end)
+                }
+                _ => None,
+            })
+            .unwrap_or(0..usize::MAX)
+    }
+
     /// A click picks one line, Shift-click a range and Cmd-click toggles one;
-    /// picking in another file starts over.
+    /// picking stays inside one hunk: in another file or hunk it starts
+    /// over, and a range ends at the hunk's edge.
     pub(super) fn select_line(
         &mut self,
         file: usize,
@@ -40,8 +55,19 @@ impl RepoView {
         modifiers: Modifiers,
         cx: &mut Context<Self>,
     ) {
+        let hunk = self.hunk_of(file, row);
         let rows = match &mut self.line_selection {
-            Some((f, rows)) if *f == file => rows,
+            Some((f, rows)) if *f == file && rows.iter().all(|r| hunk.contains(r)) => rows,
+            // Shift-click in another hunk: from the edge of the anchor's.
+            Some((f, _)) if *f == file && modifiers.shift => {
+                let anchor = self.line_anchor.unwrap_or(row);
+                let theirs = self.hunk_of(file, anchor);
+                let row = row.clamp(theirs.start, theirs.end.saturating_sub(1));
+                let picked = (anchor.min(row)..=anchor.max(row)).collect();
+                self.line_selection = Some((file, picked));
+                cx.notify();
+                return;
+            }
             _ => {
                 self.line_selection = Some((file, vec![row]));
                 self.line_anchor = Some(row);
@@ -69,6 +95,88 @@ impl RepoView {
             self.line_selection = None;
         }
         cx.notify();
+    }
+
+    /// A press on a line picks it as a click does, and starts a drag that
+    /// picks the lines from it to wherever the mouse goes; with ⌘ the lines
+    /// picked before stay picked, with ⇧ the drag runs from the last line
+    /// picked.
+    pub(super) fn press_line(
+        &mut self,
+        file: usize,
+        row: usize,
+        modifiers: Modifiers,
+        cx: &mut Context<Self>,
+    ) {
+        // With ⌘, the lines picked before stay: those in this hunk.
+        let hunk = self.hunk_of(file, row);
+        let before = match &self.line_selection {
+            Some((f, rows)) if *f == file && modifiers.platform => {
+                rows.iter().copied().filter(|r| hunk.contains(r)).collect()
+            }
+            _ => Vec::new(),
+        };
+        let anchor = match self.line_anchor {
+            Some(anchor) if modifiers.shift => anchor,
+            _ => row,
+        };
+        self.select_line(file, row, modifiers, cx);
+        self.line_drag = Some((file, anchor, before, false));
+    }
+
+    /// The mouse over a line while a drag picks lines: the lines from where
+    /// it started to this one. Released, the drag is over.
+    pub(super) fn drag_line(
+        &mut self,
+        file: usize,
+        row: usize,
+        pressed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((from_file, anchor, _, _)) = &self.line_drag else {
+            return;
+        };
+        if !pressed {
+            self.line_drag = None;
+            return;
+        }
+        // Dragged out of its hunk, it stops at the hunk's edge.
+        let hunk = self.hunk_of(*from_file, *anchor);
+        let row = row.clamp(hunk.start, hunk.end.saturating_sub(1));
+        let Some((from_file, anchor, before, moved)) = &mut self.line_drag else {
+            return;
+        };
+        // Over its first line still, it is a click so far.
+        if *from_file != file || (!*moved && row == *anchor) {
+            return;
+        }
+        *moved = true;
+        let mut rows = before.clone();
+        for line in (*anchor).min(row)..=(*anchor).max(row) {
+            if !rows.contains(&line) {
+                rows.push(line);
+            }
+        }
+        if self.line_selection.as_ref().map(|(_, r)| r) != Some(&rows) {
+            self.line_selection = Some((file, rows));
+            cx.notify();
+        }
+    }
+
+    /// Copies the picked lines' code, one a line: the new side's when any
+    /// picked line has one, else the removed lines'. False with none picked.
+    pub(super) fn copy_picked_lines(&self, cx: &mut Context<Self>) -> bool {
+        let Some((file, rows)) = &self.line_selection else {
+            return false;
+        };
+        let Some(Ok(diff)) = self.stacked_diffs.get(*file) else {
+            return false;
+        };
+        let Some(text) = picked_text(self.shown_rows(diff), rows) else {
+            return false;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        true
     }
 
     /// Stages, or unstages, just the picked lines of their file.
@@ -240,5 +348,64 @@ impl RepoView {
         self.load_files(keep, cx);
         self.start_refresh(cx);
         cx.notify();
+    }
+}
+
+/// The code of picked diff rows, one a line, in order: the new side's when
+/// any picked row has one, else the removed lines'; none with nothing.
+fn picked_text(shown: &[wtf_core::DiffRow], rows: &[usize]) -> Option<String> {
+    let mut rows = rows.to_vec();
+    rows.sort_unstable();
+    let picked: Vec<&wtf_core::DiffRow> = rows.iter().filter_map(|&r| shown.get(r)).collect();
+    let new = picked.iter().any(|row| row.right.is_some());
+    let lines: Vec<&str> = picked
+        .iter()
+        .filter_map(|row| match new {
+            true => row.right.as_ref(),
+            false => row.left.as_ref(),
+        })
+        .map(|side| side.text.as_str())
+        .collect();
+    (!lines.is_empty()).then(|| lines.join("\n") + "\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wtf_core::{DiffRow, DiffSide};
+
+    fn side(text: &str) -> Option<DiffSide> {
+        Some(DiffSide {
+            line_number: 1,
+            text: text.to_string(),
+            changes: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn picked_lines_copy_the_new_code_or_else_the_removed() {
+        let rows = vec![
+            DiffRow {
+                left: side("a"),
+                right: side("a"),
+            },
+            DiffRow {
+                left: side("old"),
+                right: None,
+            },
+            DiffRow {
+                left: side("b"),
+                right: side("B"),
+            },
+            DiffRow {
+                left: None,
+                right: side("added"),
+            },
+        ];
+        // Picked in any order, copied in the diff's.
+        assert_eq!(picked_text(&rows, &[3, 0, 1, 2]).unwrap(), "a\nB\nadded\n");
+        // Removed lines alone: theirs.
+        assert_eq!(picked_text(&rows, &[1]).unwrap(), "old\n");
+        assert_eq!(picked_text(&rows, &[]), None);
     }
 }

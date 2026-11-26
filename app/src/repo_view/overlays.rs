@@ -26,6 +26,9 @@ impl RepoView {
             self.attention_group(section, command, cx);
             return;
         }
+        if let Target::File { name, path, .. } = &target {
+            return self.file_command(name, path, command, cx);
+        }
         let repo = self.repo_path.clone().unwrap_or_default();
         let (name, path, commit) = match &target {
             Target::Branch { name, commit, .. } => (Some(name.clone()), None, commit.clone()),
@@ -43,7 +46,7 @@ impl RepoView {
                 commit,
                 ..
             } => (branch.clone(), Some(path.clone()), commit.clone()),
-            Target::Group { .. } => return,
+            Target::Group { .. } | Target::File { .. } => return,
         };
         let copy = |text: String, cx: &mut Context<Self>| {
             cx.write_to_clipboard(ClipboardItem::new_string(text))
@@ -58,6 +61,8 @@ impl RepoView {
                 }
             }
             Command::CopyPath => copy(path.unwrap_or_default(), cx),
+            // Files only, handled above.
+            Command::CopyRelativePath | Command::Open => {}
             Command::OpenWithRecent(k) => {
                 if let (Some(path), Some(command)) = (path, self.open_with.get(k).cloned()) {
                     self.run_in_terminal(popups::open_with(&command, &path), window, cx);
@@ -345,7 +350,154 @@ impl RepoView {
     pub(super) fn open_prune(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.prune = Some(self.prune_items());
         self.prune_focus.focus(window);
+        self.measure_prune_worktrees(cx);
         cx.notify();
+    }
+
+    /// The folders of the worktrees the prune dialog offers.
+    fn prune_paths(&self) -> Vec<(String, String)> {
+        self.prune
+            .iter()
+            .flatten()
+            .filter(|item| item.kind == PruneKind::Worktree)
+            .filter_map(|item| match &self.prune_worktree(&item.name)?.tip {
+                Revision::Worktree(path) => Some((item.name.clone(), path.clone())),
+                Revision::Commit(_) => None,
+            })
+            .collect()
+    }
+
+    /// Measures each offered worktree's folder on disk, one after another,
+    /// for the dialog to say what deleting it frees.
+    fn measure_prune_worktrees(&mut self, cx: &mut Context<Self>) {
+        let paths: Vec<String> = self
+            .prune_paths()
+            .into_iter()
+            .map(|(_, path)| path)
+            .filter(|path| !self.prune_sizes.contains_key(path))
+            .collect();
+        cx.spawn(async move |this, cx| {
+            for path in paths {
+                let measured = path.clone();
+                let size = cx
+                    .background_executor()
+                    .spawn(async move { folder_size(&measured) })
+                    .await;
+                let Some(size) = size else {
+                    continue;
+                };
+                if this
+                    .update(cx, |this, cx| {
+                        this.prune_sizes.insert(path, size);
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// The size on disk of a ticked worktree's folder, once measured.
+    fn prune_size(&self, name: &str) -> Option<u64> {
+        let path = match &self.prune_worktree(name)?.tip {
+            Revision::Worktree(path) => path,
+            Revision::Commit(_) => return None,
+        };
+        self.prune_sizes.get(path).copied()
+    }
+
+    /// Watches the folders a prune removes in the terminal; once they are
+    /// gone, or it gives up waiting, says how much was freed.
+    fn watch_prune(&mut self, folders: Vec<(String, u64)>, cx: &mut Context<Self>) {
+        if folders.is_empty() {
+            return;
+        }
+        self.prune_watch = Some(cx.spawn(async move |this, cx| {
+            let gone = |folders: &[(String, u64)]| {
+                folders
+                    .iter()
+                    .filter(|(path, _)| !std::path::Path::new(path).exists())
+                    .map(|(_, size)| *size)
+                    .collect::<Vec<u64>>()
+            };
+            // A few minutes at most: what is still there by then stays.
+            for _ in 0..PRUNE_WAIT_SECONDS {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                if gone(&folders).len() == folders.len() {
+                    break;
+                }
+            }
+            let freed = gone(&folders);
+            this.update(cx, |this, cx| {
+                this.prune_watch = None;
+                let text = match freed.len() {
+                    0 => "Prune removed no worktree folder".to_string(),
+                    n => format!(
+                        "Prune freed {} ({n} worktree{})",
+                        human_size(freed.iter().sum()),
+                        if n == 1 { "" } else { "s" }
+                    ),
+                };
+                this.show_notice(text, cx);
+            })
+            .ok();
+        }));
+    }
+
+    /// A notice at the foot of the window, for a while.
+    pub(super) fn show_notice(&mut self, text: String, cx: &mut Context<Self>) {
+        self.notice = Some(text);
+        self.notice_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(NOTICE_TIME).await;
+            this.update(cx, |this, cx| {
+                this.notice = None;
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    pub(super) fn notice_view(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let text = self.notice.clone()?;
+        let panel = div()
+            .id("notice")
+            .occlude()
+            .flex()
+            .items_center()
+            .gap(px(12.))
+            .px(px(14.))
+            .py(px(8.))
+            .rounded(px(8.))
+            .map(|panel| floating(panel, theme))
+            .text_sm()
+            .child(text)
+            .child(
+                div()
+                    .id("notice-close")
+                    .px(px(4.))
+                    .text_color(theme.secondary)
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.notice = None;
+                        cx.notify();
+                    }))
+                    .child("×"),
+            );
+        Some(
+            div()
+                .absolute()
+                .bottom(px(24.))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(panel)
+                .into_any_element(),
+        )
     }
 
     /// What the prune dialog offers, in its sections' order: worktrees with
@@ -431,6 +583,18 @@ impl RepoView {
             return;
         };
         let ticked: Vec<PruneItem> = list.into_iter().filter(|item| item.on).collect();
+        // The worktree folders going, with their sizes, to say what is freed.
+        let folders: Vec<(String, u64)> = ticked
+            .iter()
+            .filter(|item| item.kind == PruneKind::Worktree)
+            .filter_map(|item| {
+                let size = self.prune_size(&item.name).unwrap_or(0);
+                match &self.prune_worktree(&item.name)?.tip {
+                    Revision::Worktree(path) => Some((path.clone(), size)),
+                    Revision::Commit(_) => None,
+                }
+            })
+            .collect();
         let mut lines: Vec<String> = ticked
             .iter()
             .filter(|item| item.kind != PruneKind::Stash)
@@ -464,6 +628,7 @@ impl RepoView {
         self.focus.focus(window);
         if !lines.is_empty() {
             self.run_in_terminal(lines.join(" ; "), window, cx);
+            self.watch_prune(folders, cx);
         }
         cx.notify();
     }
@@ -551,11 +716,21 @@ impl RepoView {
                     .prune_worktree(name)
                     .filter(|_| kind == PruneKind::Worktree)
                 {
-                    Some(node) => (
-                        graph_view::worktree_label(node, WorktreeNames::Folder),
-                        Some(name.clone()),
-                        note,
-                    ),
+                    // A worktree says how much room its folder takes.
+                    Some(node) => {
+                        let size = self
+                            .prune_size(name)
+                            .map_or("measuring…".to_string(), human_size);
+                        let note = match note.is_empty() {
+                            true => size,
+                            false => format!("{size} · {note}"),
+                        };
+                        (
+                            graph_view::worktree_label(node, WorktreeNames::Folder),
+                            Some(name.clone()),
+                            note,
+                        )
+                    }
                     None => (name.clone(), None, note),
                 }
             }
@@ -614,6 +789,16 @@ impl RepoView {
     ) -> Option<AnyElement> {
         let list = self.prune.as_ref()?;
         let ticked = list.iter().filter(|item| item.on).count();
+        // What deleting frees: the ticked worktrees' folders, as measured.
+        let freed: u64 = list
+            .iter()
+            .filter(|item| item.on && item.kind == PruneKind::Worktree)
+            .filter_map(|item| self.prune_size(&item.name))
+            .sum();
+        let delete_label = match freed {
+            0 => format!("Delete {ticked}"),
+            bytes => format!("Delete {ticked} · frees {}", human_size(bytes)),
+        };
         let now = now_seconds();
         // A heading for each kind, there with none too, and under it one
         // for each status; each folds with a click, as the attention
@@ -779,7 +964,7 @@ impl RepoView {
                         ))
                         .when(ticked > 0, |buttons| {
                             buttons.child(
-                                button("prune-run", format!("Delete {ticked}"))
+                                button("prune-run", delete_label.clone())
                                     .bg(theme.error)
                                     .border_color(theme.error)
                                     .text_color(theme.tag_head_text)
@@ -924,6 +1109,9 @@ impl RepoView {
             self.remember_palette_run("sh", command);
             return;
         }
+        if entry.kind == goto::Kind::Hidden {
+            return self.show_hidden_branch(&entry.label, cx);
+        }
         match entry.commit {
             Some(commit) => self.select_commit(entry.node, commit, cx),
             None => self.select_and_reveal(entry.node, cx),
@@ -1036,6 +1224,7 @@ impl RepoView {
                 goto::Kind::Worktree => ("▣", "worktree · ⌘↩ open with"),
                 goto::Kind::Shell => ("$", "run in terminal"),
                 goto::Kind::Branch => ("⎇", "branch"),
+                goto::Kind::Hidden => ("⎇", "hidden branch · shows it"),
                 goto::Kind::Commit => ("●", "commit"),
                 goto::Kind::Command => ("›", ""),
             };
@@ -1272,6 +1461,44 @@ impl RepoView {
                 let line = popups::add_worktree_at(&repo, &path, &input, &commit);
                 self.run_in_terminal(line, window, cx);
             }
+        }
+    }
+
+    /// The menu for a changed file: its path in the repository and where it
+    /// is in the worktree the diff is of, or the tab's own.
+    pub(super) fn file_target(&self, index: usize) -> Option<Target> {
+        let name = self.files.get(index)?.path().to_string();
+        let root = match &self.range {
+            Some((_, Revision::Worktree(path))) => Some(path.clone()),
+            _ => self
+                .current_worktree_path()
+                .map(str::to_string)
+                .or_else(|| self.repo_path.clone()),
+        }?;
+        let path = Path::new(&root).join(&name);
+        Some(Target::File {
+            exists: path.exists(),
+            path: path.to_string_lossy().into_owned(),
+            name,
+        })
+    }
+
+    fn file_command(&mut self, name: &str, path: &str, command: Command, cx: &mut Context<Self>) {
+        let copy = |text: String, cx: &mut Context<Self>| {
+            cx.write_to_clipboard(ClipboardItem::new_string(text))
+        };
+        let open = |args: &[&str]| std::process::Command::new("open").args(args).spawn();
+        let opened = match command {
+            Command::CopyName => return copy(file_name(name), cx),
+            Command::CopyRelativePath => return copy(name.to_string(), cx),
+            Command::CopyPath => return copy(path.to_string(), cx),
+            Command::Open => open(&[path]),
+            Command::RevealInFinder => open(&["-R", path]),
+            _ => return,
+        };
+        if let Err(error) = opened {
+            self.error_message = Some(format!("Cannot open {name}: {error}"));
+            cx.notify();
         }
     }
 
@@ -1758,6 +1985,15 @@ fn copy_hint(target: &Target, command: Command) -> Option<String> {
             commit,
             ..
         } => (branch.clone(), Some(path.clone()), commit.clone(), None),
+        Target::File { name, path, .. } => {
+            let text = match command {
+                Command::CopyName => file_name(name),
+                Command::CopyRelativePath => name.clone(),
+                Command::CopyPath => popups::tilde(path),
+                _ => return None,
+            };
+            return Some(cut_short(text));
+        }
         Target::Group { .. } => return None,
     };
     let text = match command {
@@ -1769,11 +2005,21 @@ fn copy_hint(target: &Target, command: Command) -> Option<String> {
         Command::CopyPath => popups::tilde(&path?),
         _ => return None,
     };
+    Some(cut_short(text))
+}
+
+/// A copy hint cut to fit the menu.
+fn cut_short(text: String) -> String {
     let cut = 36;
-    Some(match text.chars().count() > cut {
+    match text.chars().count() > cut {
         true => format!("{}…", text.chars().take(cut - 1).collect::<String>()),
         false => text,
-    })
+    }
+}
+
+/// The last part of a path in the repository.
+fn file_name(path: &str) -> String {
+    path.rsplit('/').next().unwrap_or(path).to_string()
 }
 
 fn menu_label(label: &popups::Label, hint: Option<String>, theme: &Theme) -> AnyElement {
@@ -1868,6 +2114,37 @@ pub(super) struct PruneItem {
     pub on: bool,
 }
 
+/// How long a prune is watched for its folders to go.
+const PRUNE_WAIT_SECONDS: u32 = 300;
+/// How long a notice stays.
+const NOTICE_TIME: Duration = Duration::from_secs(10);
+
+/// A folder's size on disk, as `du` counts it, in bytes.
+fn folder_size(path: &str) -> Option<u64> {
+    let out = std::process::Command::new("du")
+        .args(["-sk", path])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let kilobytes: u64 = text.split_whitespace().next()?.parse().ok()?;
+    Some(kilobytes * 1024)
+}
+
+/// A size as people read it: `840 KB`, `312 MB`, `1.2 GB`.
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    let mut size = bytes as f64 / 1024.;
+    let mut unit = 0;
+    while size >= 1024. && unit + 1 < UNITS.len() {
+        size /= 1024.;
+        unit += 1;
+    }
+    match size < 10. && unit > 0 {
+        true => format!("{size:.1} {}", UNITS[unit]),
+        false => format!("{size:.0} {}", UNITS[unit]),
+    }
+}
+
 /// A stash's place in the list, from its name: 2 for `stash@{2}`.
 fn stash_index(name: &str) -> usize {
     name.trim_start_matches("stash@{")
@@ -1878,7 +2155,14 @@ fn stash_index(name: &str) -> usize {
 
 #[cfg(test)]
 mod prune_tests {
-    use super::stash_words;
+    use super::{human_size, stash_words};
+
+    #[test]
+    fn sizes_read_as_people_say_them() {
+        assert_eq!(human_size(840 * 1024), "840 KB");
+        assert_eq!(human_size(312 * 1024 * 1024), "312 MB");
+        assert_eq!(human_size(1_288_490_189), "1.2 GB");
+    }
 
     #[test]
     fn stashes_read_without_git_s_lead() {

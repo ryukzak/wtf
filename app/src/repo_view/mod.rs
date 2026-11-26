@@ -411,8 +411,8 @@ pub struct RepoView {
     stash_view: Option<wtf_core::Stash>,
     /// A stash to scroll the graph to once a rebuild shows its marker.
     reveal_stash: bool,
-    /// The staging view's line under the mouse, which shows its buttons.
-    hovered_line: Cell<Option<(usize, usize)>>,
+    /// A branch shown from Go To, selected once the graph draws it.
+    reveal_branch: Option<String>,
     /// Code colors of the diffs shown, by file, appearance and view.
     syntax: RefCell<HashMap<ColorKey, Rc<syntax::Colors>>>,
     /// Colors being made, and how many times the made ones were dropped:
@@ -491,6 +491,17 @@ pub struct RepoView {
     /// Diff rows picked for staging, all in one file.
     line_selection: Option<(usize, Vec<usize>)>,
     line_anchor: Option<usize>,
+    /// Lines being picked by dragging: the file, the line the drag runs
+    /// from, the lines picked before it that stay, and whether it has left
+    /// its first line yet.
+    line_drag: Option<(usize, usize, Vec<usize>, bool)>,
+    /// Worktree folders' sizes on disk, by path, for the prune dialog.
+    prune_sizes: HashMap<String, u64>,
+    /// Watches the folders a prune removes, to say how much it freed.
+    prune_watch: Option<Task<()>>,
+    /// A notice at the foot of the window, and its timer.
+    notice: Option<String>,
+    notice_task: Option<Task<()>>,
     /// The commit box: what is typed in it and the model's part in it.
     draft: CommitDraft,
     /// The drafts of worktrees not selected, kept for their return.
@@ -672,7 +683,7 @@ impl RepoView {
             outside_graph: false,
             stash_view: None,
             reveal_stash: false,
-            hovered_line: Cell::new(None),
+            reveal_branch: None,
             syntax: RefCell::new(HashMap::new()),
             syntax_making: RefCell::new(HashSet::new()),
             syntax_generation: Cell::new(0),
@@ -714,6 +725,11 @@ impl RepoView {
             submodules_inside: Vec::new(),
             line_selection: None,
             line_anchor: None,
+            line_drag: None,
+            prune_sizes: HashMap::new(),
+            prune_watch: None,
+            notice: None,
+            notice_task: None,
             draft: CommitDraft::default(),
             drafts: HashMap::new(),
             commit_focus: cx.focus_handle(),
@@ -1209,6 +1225,30 @@ impl RepoView {
         );
     }
 
+    /// Shows a branch the graph leaves out, as ticking it in the attention
+    /// panel would, and selects it once the graph draws it. One with no
+    /// history in common with the main branch is shown on its own.
+    fn show_hidden_branch(&mut self, name: &str, cx: &mut Context<Self>) {
+        if self
+            .graph
+            .branches
+            .iter()
+            .any(|branch| branch.name == name && branch.unrelated)
+        {
+            return self.show_unrelated(name, cx);
+        }
+        self.reveal_branch = Some(name.to_string());
+        self.change_attention(
+            |attention| {
+                attention.hidden.retain(|hidden| hidden != name);
+                if !attention.pinned.iter().any(|pinned| pinned == name) {
+                    attention.pinned.push(name.to_string());
+                }
+            },
+            cx,
+        );
+    }
+
     fn toggle_branch(&mut self, name: &str, cx: &mut Context<Self>) {
         // The main branch is always shown; one with no history in common with
         // it cannot be.
@@ -1368,6 +1408,29 @@ impl RepoView {
                 }
                 _ if asked.elapsed() > STASH_WAIT => self.awaiting_stash = None,
                 _ => {}
+            }
+        }
+
+        // A branch shown from Go To is selected once drawn. A graph built
+        // before it was asked for keeps it waiting.
+        if let Some(name) = self.reveal_branch.clone() {
+            let node = self
+                .graph
+                .nodes
+                .iter()
+                .position(|node| node.refs.contains(&name));
+            let built = self
+                .graph
+                .branches
+                .iter()
+                .any(|branch| branch.name == name && branch.shown);
+            if let Some(node) = node {
+                self.outside_graph = false;
+                selected = vec![node];
+                self.reveal.set(Some(node));
+            }
+            if node.is_some() || built {
+                self.reveal_branch = None;
             }
         }
 
@@ -2776,6 +2839,18 @@ impl Render for RepoView {
                 ]
                 .iter()
                 .any(|focus| focus.is_focused(window));
+                // ⌘C copies picked diff lines' code, while no text field has
+                // the keys.
+                let editing = typing || this.commit_focus.is_focused(window);
+                if keystroke.key == "c"
+                    && keystroke.modifiers.platform
+                    && !keystroke.modifiers.shift
+                    && !editing
+                    && this.copy_picked_lines(cx)
+                {
+                    cx.stop_propagation();
+                    return;
+                }
                 // Arrows move about the graph while nothing else has the keys;
                 // ⌥← and ⌥→ through the selected node's commits.
                 let modifiers = keystroke.modifiers;
@@ -2922,6 +2997,7 @@ impl Render for RepoView {
                 )
             })
             .children(self.context_menu_view(&theme, cx))
+            .children(self.notice_view(&theme, cx))
             .children(self.dropdown_view(&theme, cx))
             .children(self.prompt_view(&theme, window, cx))
             .children(self.goto_view(&theme, window, cx))
@@ -3807,6 +3883,19 @@ impl RepoView {
         .line_height(px(diff_view::row_height()))
         .into_any_element()
     }
+}
+
+/// Right-click on a changed file, in the diff or the file tree: its menu.
+fn this_file_menu(
+    index: usize,
+    cx: &mut Context<RepoView>,
+) -> impl Fn(&MouseDownEvent, &mut Window, &mut gpui::App) + 'static {
+    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+        if let Some(target) = this.file_target(index) {
+            this.open_context_menu(target, event.position, cx);
+        }
+        cx.stop_propagation();
+    })
 }
 
 #[cfg(test)]

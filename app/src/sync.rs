@@ -14,8 +14,9 @@ pub fn options(push: bool) -> &'static [SyncOption] {
     }
 }
 
-/// Fetching alone is the Fetch button's: Pull always pulls.
-pub const PULL: [SyncOption; 4] = [
+/// Pulls, then fetches that change no branch, after them so a choice of
+/// pull kept from before stays where it was.
+pub const PULL: [SyncOption; 7] = [
     SyncOption {
         args: &["pull"],
         about: "Retrieves changes from the remote and merges them into the current branch",
@@ -31,6 +32,18 @@ pub const PULL: [SyncOption; 4] = [
     SyncOption {
         args: &["pull", "--rebase", "--autostash"],
         about: "Stashes any uncommitted changes before running pull --rebase",
+    },
+    SyncOption {
+        args: &["fetch"],
+        about: "Retrieves changes from the branch's remote without changing any branch",
+    },
+    SyncOption {
+        args: &["fetch", "--all"],
+        about: "Retrieves changes from every remote without changing any branch",
+    },
+    SyncOption {
+        args: &["fetch", "--all", "--prune"],
+        about: "Retrieves from every remote and drops remote branches deleted there",
     },
 ];
 

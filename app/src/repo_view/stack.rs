@@ -457,7 +457,7 @@ impl RepoView {
         };
         // Sublime Merge's buttons: on sections for all files, on headers for one.
         // Shorter than a row, so buttons on rows next to each other never touch.
-        let button = |id: SharedString, label: &'static str| {
+        let button = |id: SharedString, label: &str| {
             div()
                 .id(id)
                 .flex()
@@ -473,11 +473,11 @@ impl RepoView {
                 .text_size(px(crate::preferences::code_size() * 0.95))
                 .hover(|button| button.bg(theme.selection))
                 .cursor_pointer()
-                .child(label)
+                .child(label.to_string())
         };
         // Section and file headers are two rows tall: their buttons get
         // room to match.
-        let tall = |id: SharedString, label: &'static str| {
+        let tall = |id: SharedString, label: &str| {
             button(id, label)
                 .h(px(1.4 * diff_view::row_height()))
                 .px(px(12.))
@@ -592,6 +592,7 @@ impl RepoView {
                     .text_size(px(crate::preferences::code_size() * 1.1))
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| this.toggle_fold(index, cx)))
+                    .on_mouse_down(MouseButton::Right, this_file_menu(index, cx))
                     .child(chevron(!folded, theme.secondary, preferences::code_size()))
                     .child(
                         div()
@@ -625,7 +626,8 @@ impl RepoView {
                         )
                     })
                     .children(staged.map(|staged| {
-                        let label = if staged { "Unstage File" } else { "Stage File" };
+                        // The header says what: the buttons just what they do.
+                        let label = if staged { "Unstage" } else { "Stage" };
                         let lines = match &self.line_selection {
                             Some((file, rows)) if *file == index => rows.len(),
                             _ => 0,
@@ -660,7 +662,7 @@ impl RepoView {
                                 buttons.child(
                                     button(
                                         SharedString::from(format!("discard-{index}")),
-                                        "Discard File",
+                                        "Discard",
                                     )
                                     .text_color(theme.error)
                                     .on_click(cx.listener(
@@ -700,14 +702,20 @@ impl RepoView {
                 let fit = self.fit(self.wrap_cols, part);
                 let colors = self.diff_colors(Some(file), theme, cx);
                 match &self.stacked_diffs[file] {
-                    Ok(diff) if self.worktree_split.is_some() && self.stash_view.is_none() => {
-                        // Lines are picked for staging: a bar marks the selection.
-                        let selected = matches!(&self.line_selection, Some((f, rows)) if *f == file && rows.contains(&index));
-                        let staged = self.worktree_split.is_some_and(|split| file >= split);
+                    // Lines of any diff are picked: to copy, and in a worktree
+                    // to stage or discard from their hunk's header.
+                    Ok(diff) => {
+                        let picked = |row: usize| matches!(&self.line_selection, Some((f, rows)) if *f == file && rows.contains(&row));
+                        let selected = picked(index);
+                        // Picked lines are framed, as one box per run: its
+                        // top on the run's first line, its bottom on the last
+                        // part of its last line.
+                        let parts = self.wrap_cols.map_or(1, |cols| {
+                            diff_view::parts(&self.shown_rows(diff)[index], cols)
+                        });
+                        let top = selected && part == 0 && (index == 0 || !picked(index - 1));
+                        let bottom = selected && part + 1 == parts && !picked(index + 1);
                         let group = SharedString::from(format!("line-{file}-{index}-{part}"));
-                        let changed = diff_view::is_change(&self.shown_rows(diff)[index]);
-                        let label = if staged { "Unstage Line" } else { "Stage Line" };
-                        let hovered = self.hovered_line.get() == Some((file, index));
                         div()
                             .id(group.clone())
                             .group(group.clone())
@@ -715,27 +723,20 @@ impl RepoView {
                             .flex()
                             .w_full()
                             .cursor_pointer()
-                            .on_hover(cx.listener(move |this, over: &bool, _, cx| {
-                                let line = Some((file, index));
-                                match over {
-                                    true => this.hovered_line.set(line),
-                                    false if this.hovered_line.get() == line => {
-                                        this.hovered_line.set(None)
-                                    }
-                                    false => return,
-                                }
-                                cx.notify();
-                            }))
-                            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                                this.select_line(file, index, event.modifiers(), cx)
-                            }))
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .w(px(3.))
-                                    .h_full()
-                                    .when(selected, |bar| bar.bg(theme.accent)),
+                            // Pressed, a line is picked; dragged over others,
+                            // they are picked too.
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                    this.press_line(file, index, event.modifiers, cx)
+                                }),
                             )
+                            .on_mouse_move(cx.listener(
+                                move |this, event: &MouseMoveEvent, _, cx| {
+                                    let pressed = event.pressed_button == Some(MouseButton::Left);
+                                    this.drag_line(file, index, pressed, cx)
+                                },
+                            ))
                             .child(
                                 diff_view::row(
                                     &self.shown_rows(diff)[index],
@@ -746,81 +747,60 @@ impl RepoView {
                                 )
                                 .flex_1(),
                             )
-                            // A changed line offers its own buttons while the
-                            // mouse is over it, drawn over its first line;
-                            // other lines carry nothing.
-                            .when(changed && hovered && part == 0, |line| {
-                                line.child(
+                            // The frame over a picked line, drawn over the
+                            // line's own colors: one per side when
+                            // split, across the line when unified.
+                            .when(selected, |line| {
+                                let frame = || {
                                     div()
                                         .absolute()
-                                        .top(px(2.))
-                                        .right(px(8.))
-                                        .flex()
-                                        .gap(px(6.))
-                                        // Solid under the buttons, whose hover
-                                        // tint is see-through, so the line's
-                                        // text never shows through them.
-                                        .rounded(px(4.))
-                                        .bg(theme.background)
-                                        .when(!staged, |buttons| {
-                                            buttons.child(
-                                                button(
-                                                    SharedString::from(format!(
-                                                        "discard-line-{file}-{index}"
-                                                    )),
-                                                    "Discard",
-                                                )
-                                                .h(px(diff_view::row_height() - 4.))
-                                                .bg(theme.background)
-                                                .text_color(theme.error)
-                                                .on_click(cx.listener(
-                                                    move |this, _, window, cx| {
-                                                        cx.stop_propagation();
-                                                        this.discard_rows(
-                                                            file,
-                                                            vec![index],
-                                                            window,
-                                                            cx,
-                                                        )
-                                                    },
-                                                )),
-                                            )
-                                        })
-                                        .child(
-                                            button(
-                                                SharedString::from(format!(
-                                                    "stage-line-{file}-{index}"
-                                                )),
-                                                label,
-                                            )
-                                            .h(px(diff_view::row_height() - 4.))
-                                            .bg(theme.background)
-                                            .on_click(
-                                                cx.listener(move |this, _, window, cx| {
-                                                    cx.stop_propagation();
-                                                    this.keep_keys(window, cx);
-                                                    this.stage_rows(file, vec![index], staged, cx)
-                                                }),
-                                            ),
-                                        ),
-                                )
+                                        .top_0()
+                                        .bottom_0()
+                                        .border_l_2()
+                                        .border_r_2()
+                                        .when(top, |f| f.border_t_2().rounded_t(px(3.)))
+                                        .when(bottom, |f| f.border_b_2().rounded_b(px(3.)))
+                                        .border_color(theme.accent.opacity(0.85))
+                                };
+                                match self.one_column.get() {
+                                    true => line.child(frame().left_0().right_0()),
+                                    false => line
+                                        .child(frame().left_0().w(gpui::relative(0.5)))
+                                        .child(frame().left(gpui::relative(0.5)).right_0()),
+                                }
                             })
                             .into_any_element()
                     }
-                    Ok(diff) => diff_view::row(
-                        &self.shown_rows(diff)[index],
-                        theme,
-                        colors.as_deref(),
-                        fit,
-                        self.one_column.get(),
-                    )
-                    .into_any_element(),
                     Err(_) => row().into_any_element(),
                 }
             }
             &StackItem::Hunk(file, start, end) => {
                 let staged = self.worktree_split.is_some_and(|split| file >= split);
-                let label = if staged { "Unstage Hunk" } else { "Stage Hunk" };
+                // Lines picked in the hunk: its buttons take just those.
+                let picked: Vec<usize> = match &self.line_selection {
+                    Some((f, rows)) if *f == file => rows
+                        .iter()
+                        .copied()
+                        .filter(|row| (start..end).contains(row))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                // The whole hunk goes by the plain verb; picked lines say how
+                // many.
+                let what = match picked.len() {
+                    0 => String::new(),
+                    1 => " Line".to_string(),
+                    n => format!(" {n} Lines"),
+                };
+                let label = match staged {
+                    true => format!("Unstage{what}"),
+                    false => format!("Stage{what}"),
+                };
+                let rows = match picked.is_empty() {
+                    true => (start..end).collect::<Vec<usize>>(),
+                    false => picked,
+                };
+                let discarded = rows.clone();
                 // The hunk's first lines on each side, as `@@` headers show them.
                 let lines = match &self.stacked_diffs[file] {
                     Ok(diff) => {
@@ -851,23 +831,23 @@ impl RepoView {
                         hunk.child(
                             button(
                                 SharedString::from(format!("discard-hunk-{file}-{start}")),
-                                "Discard Hunk",
+                                &format!("Discard{what}"),
                             )
                             .text_color(theme.error)
                             .on_click(cx.listener(
                                 move |this, _, window, cx| {
-                                    this.discard_rows(file, (start..end).collect(), window, cx)
+                                    this.discard_rows(file, discarded.clone(), window, cx)
                                 },
                             )),
                         )
                     })
                     .when(self.stash_view.is_none(), |hunk| {
                         hunk.child(
-                            button(SharedString::from(format!("hunk-{file}-{start}")), label)
+                            button(SharedString::from(format!("hunk-{file}-{start}")), &label)
                                 .text_color(theme.foreground)
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.keep_keys(window, cx);
-                                    this.stage_rows(file, (start..end).collect(), staged, cx)
+                                    this.stage_rows(file, rows.clone(), staged, cx)
                                 })),
                         )
                     })

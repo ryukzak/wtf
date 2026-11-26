@@ -566,6 +566,11 @@ pub fn range_commits(
     tip: &Revision,
 ) -> Result<Vec<Commit>, CoreError> {
     let (dir, rev) = locate(repo_path, tip);
+    // A worktree with no commits yet has none to list.
+    let unborn = || run(dir, &["rev-parse", "--verify", "-q", rev]).is_err();
+    if matches!(tip, Revision::Worktree(_)) && unborn() {
+        return Ok(Vec::new());
+    }
     let mut args = vec![
         "log".to_string(),
         "--topo-order".into(),
