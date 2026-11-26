@@ -119,11 +119,45 @@ pub fn shown(diff: &FileDiff, one: bool) -> &[DiffRow] {
     }
 }
 
+/// Which code of a row text is selected in: a side of a split diff, or
+/// the one line a unified row shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pane {
+    Left,
+    Right,
+    Unified,
+}
+
+/// The line of `row` that `pane` shows, if any.
+pub fn pane_side(row: &DiffRow, pane: Pane) -> Option<&DiffSide> {
+    match pane {
+        Pane::Left => row.left.as_ref(),
+        Pane::Right => row.right.as_ref(),
+        Pane::Unified => row.right.as_ref().or(row.left.as_ref()),
+    }
+}
+
+/// Text selected in a row: in which pane, and which bytes of its line.
+pub type Selected = Option<(Pane, std::ops::Range<usize>)>;
+
 /// A diff row, its code colored by `colors` when its file has them; in
-/// `one` column, a row of the unified rows.
-pub fn row(row: &DiffRow, theme: &Theme, colors: Option<&Colors>, fit: Fit, one: bool) -> Div {
+/// `one` column, a row of the unified rows. `selected` text is marked.
+pub fn row(
+    row: &DiffRow,
+    theme: &Theme,
+    colors: Option<&Colors>,
+    fit: Fit,
+    one: bool,
+    selected: Selected,
+) -> Div {
+    let in_pane = |pane: Pane| {
+        selected
+            .clone()
+            .filter(|(at, _)| *at == pane)
+            .map(|(_, range)| range)
+    };
     if one {
-        return unified_row(row, theme, colors, fit);
+        return unified_row(row, theme, colors, fit, in_pane(Pane::Unified));
     }
     div()
         .flex()
@@ -136,6 +170,7 @@ pub fn row(row: &DiffRow, theme: &Theme, colors: Option<&Colors>, fit: Fit, one:
             theme.deleted,
             theme.deleted_char,
             fit,
+            in_pane(Pane::Left),
         ))
         .child(div().w(px(1.)).h_full().bg(theme.separator))
         .child(side(
@@ -145,12 +180,19 @@ pub fn row(row: &DiffRow, theme: &Theme, colors: Option<&Colors>, fit: Fit, one:
             theme.inserted,
             theme.inserted_char,
             fit,
+            in_pane(Pane::Right),
         ))
 }
 
 /// A row of one column: an old line, a new one, or one both sides share,
 /// its numbers on the left, old then new, as `git diff` reads.
-fn unified_row(row: &DiffRow, theme: &Theme, colors: Option<&Colors>, fit: Fit) -> Div {
+fn unified_row(
+    row: &DiffRow,
+    theme: &Theme,
+    colors: Option<&Colors>,
+    fit: Fit,
+    selected: Option<std::ops::Range<usize>>,
+) -> Div {
     let (side, code, line, char, old, new) = match (&row.left, &row.right) {
         (Some(left), None) => (
             left,
@@ -186,6 +228,8 @@ fn unified_row(row: &DiffRow, theme: &Theme, colors: Option<&Colors>, fit: Fit) 
             .pr(px(8.))
             .text_right()
             .text_color(theme.secondary)
+            // Lines are picked from their numbers; the code selects text.
+            .cursor_pointer()
             .when(first, |gutter| gutter.children(n.map(|n| n.to_string())))
     };
     // The code as a side of its own, its number left out: both are drawn
@@ -198,6 +242,7 @@ fn unified_row(row: &DiffRow, theme: &Theme, colors: Option<&Colors>, fit: Fit) 
         char,
         fit,
         false,
+        selected,
     );
     div()
         .flex()
@@ -282,8 +327,42 @@ fn side(
     line: Hsla,
     char: Hsla,
     fit: Fit,
+    selected: Option<std::ops::Range<usize>>,
 ) -> AnyElement {
-    side_cell(side, code, theme, line, char, fit, true)
+    side_cell(side, code, theme, line, char, fit, true, selected)
+}
+
+/// `highlights`, covering a line end to end, with the `selected` bytes'
+/// background the selection's.
+fn with_selection(
+    highlights: Vec<(std::ops::Range<usize>, HighlightStyle)>,
+    selected: Option<std::ops::Range<usize>>,
+    color: Hsla,
+) -> Vec<(std::ops::Range<usize>, HighlightStyle)> {
+    let Some(selected) = selected.filter(|range| range.start < range.end) else {
+        return highlights;
+    };
+    highlights
+        .into_iter()
+        .flat_map(|(range, style)| {
+            let inside = range.start.max(selected.start)..range.end.min(selected.end);
+            if inside.start >= inside.end {
+                return vec![(range, style)];
+            }
+            let marked = HighlightStyle {
+                background_color: Some(color),
+                ..style
+            };
+            [
+                (range.start..inside.start, style),
+                (inside.clone(), marked),
+                (inside.end..range.end, style),
+            ]
+            .into_iter()
+            .filter(|(range, _)| range.start < range.end)
+            .collect()
+        })
+        .collect()
 }
 
 /// A side's code, tinted as `line` when changed, after its line number
@@ -296,6 +375,7 @@ fn side_cell(
     char: Hsla,
     fit: Fit,
     numbered: bool,
+    selected: Option<std::ops::Range<usize>>,
 ) -> AnyElement {
     let cell = div().flex().flex_1().min_w_0().h_full().overflow_hidden();
     let Some(side) = side else {
@@ -306,7 +386,11 @@ fn side_cell(
         Fit::Scroll { shown, .. } => side.text.chars().count() > shown,
         Fit::Wrap { .. } => false,
     };
-    let highlights = highlights(side, code, theme, char);
+    let highlights = with_selection(
+        highlights(side, code, theme, char),
+        selected,
+        theme.selection,
+    );
     // Wrapped, a row shows a piece of its line, the number on the first.
     let (text, highlights, number, shift) = match fit {
         Fit::Scroll { x, .. } => (side.text.clone(), highlights, true, x),
@@ -345,6 +429,7 @@ fn side_cell(
                     .pr(px(8.))
                     .text_right()
                     .text_color(theme.secondary)
+                    .cursor_pointer()
                     .when(number, |gutter| gutter.child(side.line_number.to_string())),
             )
         })

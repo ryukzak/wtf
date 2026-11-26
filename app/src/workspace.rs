@@ -1,9 +1,9 @@
 use std::path::Path;
 
 use gpui::{
-    Action, AnyElement, App, Bounds, ClickEvent, Context, Entity, ExternalPaths, MouseButton,
-    SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div, point,
-    prelude::*, px, size,
+    Action, AnyElement, App, Bounds, ClickEvent, Context, DragMoveEvent, Entity, ExternalPaths,
+    MouseButton, SharedString, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div,
+    point, prelude::*, px, size,
 };
 
 use crate::recent;
@@ -37,7 +37,9 @@ pub struct OpenPath {
     pub path: String,
 }
 
-pub const TAB_BAR_HEIGHT: f32 = 36.;
+pub const TAB_BAR_HEIGHT: f32 = 42.;
+/// Tabs stand on the bar's bottom edge.
+const TAB_HEIGHT: f32 = 34.;
 /// Room on the left of the tab bar for the window's traffic lights.
 const TRAFFIC_LIGHTS: f32 = 80.;
 const MAX_TAB_WIDTH: f32 = 200.;
@@ -50,6 +52,9 @@ pub struct Workspace {
     closed: Vec<String>,
     /// A press landed on a tab or button, not on the bar's empty part.
     tab_pressed: bool,
+    /// While a tab is dragged: which, the tab it is over, and the gap
+    /// between tabs it would go to, the gap before tab `n` being `n`.
+    drop_at: Option<(usize, usize, usize)>,
     /// Whether the window was last set to hold still, so moves of the mouse
     /// need not tell macOS again.
     held_still: bool,
@@ -91,13 +96,20 @@ impl Render for TabPreview {
 
 /// Opens a window with a tab for each path, or one empty tab.
 pub fn open_window(paths: Vec<String>, cx: &mut App) {
-    open_window_at(paths, 0, None, cx);
+    let tabs = paths
+        .into_iter()
+        .map(|path| crate::session::Tab {
+            path,
+            panels: Vec::new(),
+        })
+        .collect();
+    open_window_at(tabs, 0, None, cx);
 }
 
-/// Opens a window on `paths`, with the `active` one in front, where
+/// Opens a window on `tabs`, with the `active` one in front, where
 /// `place` says, or where a new window goes.
 pub fn open_window_at(
-    paths: Vec<String>,
+    tabs: Vec<crate::session::Tab>,
     active: usize,
     place: Option<WindowBounds>,
     cx: &mut App,
@@ -112,12 +124,13 @@ pub fn open_window_at(
         titlebar: Some(TitlebarOptions {
             title: Some("wtf".into()),
             appears_transparent: true,
-            traffic_light_position: Some(point(px(12.), px(12.))),
+            // Level with the tab titles: the buttons are 14pt tall.
+            traffic_light_position: Some(point(px(12.), px(TAB_BAR_HEIGHT - TAB_HEIGHT / 2. - 7.))),
         }),
         ..Default::default()
     };
     let opened = cx.open_window(options, |window, cx| {
-        cx.new(|cx| Workspace::new(paths, active, window, cx))
+        cx.new(|cx| Workspace::new(tabs, active, window, cx))
     });
     if let Err(error) = opened {
         eprintln!("cannot open a window: {error}");
@@ -125,7 +138,12 @@ pub fn open_window_at(
 }
 
 impl Workspace {
-    fn new(paths: Vec<String>, active: usize, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        saved: Vec<crate::session::Tab>,
+        active: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         // Moved or resized, the window is drawn again, which saves its place.
         cx.observe_window_bounds(window, |_, _, cx| cx.notify())
             .detach();
@@ -137,19 +155,23 @@ impl Workspace {
             }
         })
         .detach();
-        let mut paths: Vec<Option<String>> = paths.into_iter().map(Some).collect();
-        if paths.is_empty() {
-            paths.push(None);
-        }
-        let tabs = paths
+        let mut tabs: Vec<Entity<RepoView>> = saved
             .into_iter()
-            .map(|path| Self::new_tab(path, window, cx))
+            .map(|saved| {
+                let tab = Self::new_tab(Some(saved.path), window, cx);
+                tab.update(cx, |tab, cx| tab.restore_panels(&saved.panels, cx));
+                tab
+            })
             .collect();
+        if tabs.is_empty() {
+            tabs.push(Self::new_tab(None, window, cx));
+        }
         let mut workspace = Self {
             tabs,
             active: 0,
             closed: Vec::new(),
             tab_pressed: false,
+            drop_at: None,
             held_still: false,
             sync_menu: None,
             sync_menu_closed: None,
@@ -261,7 +283,6 @@ impl Workspace {
             .flex()
             .flex_none()
             .items_end()
-            .gap(px(2.))
             .h(px(TAB_BAR_HEIGHT))
             // Full screen hides the traffic lights, so tabs start at the edge.
             .pl(px(match window.is_fullscreen() {
@@ -272,7 +293,7 @@ impl Workspace {
             .bg(theme.graph_background)
             .border_b_1()
             .border_color(theme.separator)
-            .text_xs()
+            .text_size(px(13.))
             // The empty part of the bar moves the window, as a title bar does;
             // a press on a tab or button is theirs, so a tab can be dragged.
             // The window is movable only for that move: macOS would else
@@ -297,12 +318,14 @@ impl Workspace {
             let view = tab.read(cx);
             let title = view.tab_title().unwrap_or_else(|| "New Tab".to_string());
             let active = index == self.active;
+            // A thin divider parts two inactive tabs, as in Safari.
+            let divided = index > 0 && !active && index - 1 != self.active;
             let group = SharedString::from(format!("tab-{index}"));
             let dragged = DraggedTab {
                 index,
                 title: title.clone(),
             };
-            let highlight = theme.selection;
+            let divider = self.divider(divided, self.drops_into(index, cx), theme);
             bar = bar.child(
                 div()
                     .id(("tab", index))
@@ -311,26 +334,60 @@ impl Workspace {
                     .on_drag(dragged, |tab, _, _, cx| {
                         cx.new(|_| TabPreview(tab.title.clone()))
                     })
-                    .drag_over::<DraggedTab>(move |style, _, _, _| style.bg(highlight))
+                    .on_drag_move(cx.listener(
+                        move |this, event: &DragMoveEvent<DraggedTab>, _, cx| {
+                            // A tab dropped on another goes right after it;
+                            // the first tab's left half puts it first.
+                            let position = event.event.position;
+                            let at = event.bounds.contains(&position).then(|| {
+                                let left = position.x < event.bounds.center().x;
+                                match index == 0 && left {
+                                    true => (event.drag(cx).index, index, 0),
+                                    false => (event.drag(cx).index, index, index + 1),
+                                }
+                            });
+                            let here = this.drop_at.is_some_and(|(_, over, _)| over == index);
+                            if at.is_some() && at != this.drop_at {
+                                this.drop_at = at;
+                            } else if at.is_none() && here {
+                                this.drop_at = None;
+                            } else {
+                                return;
+                            }
+                            cx.notify();
+                        },
+                    ))
                     .on_drop(cx.listener(move |this, dragged: &DraggedTab, window, cx| {
-                        this.move_tab(dragged.index, index, window, cx)
+                        let gap = match this.drop_at.take() {
+                            Some((_, _, gap)) => gap,
+                            None => index + 1,
+                        };
+                        let to = if gap > dragged.index { gap - 1 } else { gap };
+                        this.move_tab(dragged.index, to, window, cx)
                     }))
+                    .relative()
                     .flex()
                     .items_center()
-                    .gap(px(6.))
+                    .justify_center()
                     .max_w(px(MAX_TAB_WIDTH))
-                    .h(px(TAB_BAR_HEIGHT - 6.))
-                    .px(px(10.))
+                    .h(px(TAB_HEIGHT))
+                    // Even on both sides, so the title is centred; the close
+                    // button floats over the left side, taking no room.
+                    .px(px(22.))
                     .rounded_t(px(6.))
                     .border_1()
                     .border_b_0()
                     .map(|tab| match active {
-                        true => tab.bg(theme.background).border_color(theme.separator),
+                        true => tab
+                            .bg(theme.background)
+                            .border_color(theme.separator)
+                            .font_weight(gpui::FontWeight::MEDIUM),
                         false => tab
                             .border_color(gpui::transparent_black())
-                            .text_color(theme.secondary)
+                            .text_color(theme.foreground.opacity(0.75))
                             .hover(|tab| tab.bg(theme.selection)),
                     })
+                    .children(divider)
                     .cursor_pointer()
                     // The title bar would move the window with the tab; it holds
                     // still until the mouse comes up.
@@ -349,6 +406,8 @@ impl Workspace {
                     .child(
                         div()
                             .id(("tab-close", index))
+                            .absolute()
+                            .left(px(5.))
                             .px(px(2.))
                             .rounded(px(3.))
                             .opacity(if active { 0.6 } else { 0. })
@@ -363,12 +422,15 @@ impl Workspace {
                     .child(div().truncate().child(title)),
             );
         }
+        let end = self.divider(false, self.drops_into(self.tabs.len(), cx), theme);
         bar.child(
             div()
                 .id("tab-new")
+                .relative()
+                .children(end)
                 .flex()
                 .items_center()
-                .h(px(TAB_BAR_HEIGHT - 6.))
+                .h(px(TAB_HEIGHT))
                 .px(px(8.))
                 .text_color(theme.secondary)
                 .rounded(px(4.))
@@ -401,6 +463,38 @@ impl Workspace {
                 )
             },
         )
+    }
+
+    /// Whether a dragged tab would go into the gap before tab `gap`, where
+    /// it would move.
+    fn drops_into(&self, gap: usize, cx: &App) -> bool {
+        self.drop_at.is_some_and(|(from, _, at)| {
+            cx.has_active_drag() && at == gap && gap != from && gap != from + 1
+        })
+    }
+
+    /// The line at a tab's left: a divider between inactive tabs, lit where
+    /// a dragged tab would go.
+    fn divider(&self, divided: bool, lit: bool, theme: &Theme) -> Option<gpui::Div> {
+        (divided || lit).then(|| {
+            let line = div().absolute();
+            match lit {
+                // Centred on the divider, and taller and thicker than it.
+                true => line
+                    .left(px(-1.5))
+                    .top(px(4.))
+                    .bottom(px(4.))
+                    .w(px(4.))
+                    .rounded(px(2.))
+                    .bg(theme.accent),
+                false => line
+                    .left_0()
+                    .top(px(9.))
+                    .bottom(px(9.))
+                    .border_l_1()
+                    .border_color(theme.separator),
+            }
+        })
     }
 
     /// DEBUG: which worktree Pull, Push and the commands act on, and why.
@@ -436,7 +530,7 @@ impl Workspace {
             .gap(px(4.))
             .ml(px(6.))
             .px(px(8.))
-            .h(px(TAB_BAR_HEIGHT - 12.))
+            .h(px(24.))
             .rounded(px(5.))
             .border_1()
             .border_color(theme.separator)
@@ -461,7 +555,7 @@ impl Workspace {
             .child(
                 div()
                     .text_size(px((crate::preferences::ui_size() * 1.25).round()))
-                    .line_height(px(TAB_BAR_HEIGHT - 14.))
+                    .line_height(px(22.))
                     .child("⟳"),
             )
             .when(running, |button| button.child("…"))
@@ -511,7 +605,7 @@ impl Workspace {
             .flex()
             .items_center()
             .ml(px(6.))
-            .h(px(TAB_BAR_HEIGHT - 12.))
+            .h(px(24.))
             .rounded(px(5.))
             .border_1()
             .border_color(theme.separator)
@@ -860,7 +954,10 @@ impl Render for Workspace {
                 if k == self.active {
                     front = tabs.len();
                 }
-                tabs.push(path.to_string());
+                tabs.push(crate::session::Tab {
+                    path: path.to_string(),
+                    panels: tab.read(cx).open_panels(),
+                });
             }
         }
         let saved = crate::session::Saved {

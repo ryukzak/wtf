@@ -41,6 +41,7 @@ mod overlays;
 mod search;
 mod stack;
 mod staging;
+mod text_select;
 mod time;
 mod trees;
 mod widgets;
@@ -495,6 +496,14 @@ pub struct RepoView {
     /// from, the lines picked before it that stay, and whether it has left
     /// its first line yet.
     line_drag: Option<(usize, usize, Vec<usize>, bool)>,
+    /// Code selected as text, to copy, and whether a drag is selecting it.
+    text_selection: Option<text_select::TextSelection>,
+    selecting_text: bool,
+    /// The next changes to load keep the diff's scroll: the selection only
+    /// grew under the reader.
+    keep_place: bool,
+    /// The selection being made stands in for a saved one still to come.
+    fallback: bool,
     /// Worktree folders' sizes on disk, by path, for the prune dialog.
     prune_sizes: HashMap<String, u64>,
     /// Watches the folders a prune removes, to say how much it freed.
@@ -726,6 +735,10 @@ impl RepoView {
             line_selection: None,
             line_anchor: None,
             line_drag: None,
+            text_selection: None,
+            selecting_text: false,
+            keep_place: false,
+            fallback: false,
             prune_sizes: HashMap::new(),
             prune_watch: None,
             notice: None,
@@ -894,6 +907,7 @@ impl RepoView {
         self.select_file(None, cx);
         self.attention = Attention::load(&path);
         self.restore_keys = saved_selection(&path);
+        (self.folded, self.unfolded) = saved_folds(&path);
         self.current_worktree = None;
         recent::remember(&path);
         self.update_menus(cx);
@@ -1352,8 +1366,10 @@ impl RepoView {
             .map(|&i| self.graph.nodes[i].key.clone())
             .collect();
         // The first graph of a repository opened before shows what was
-        // selected then.
-        if keys.is_empty() {
+        // selected then; one that has not got it yet, as history still
+        // loads, leaves it waiting for the next, until another is chosen.
+        let restored = keys.is_empty() || !self.restore_keys.is_empty();
+        if restored {
             keys = std::mem::take(&mut self.restore_keys);
         }
         self.graph = graph;
@@ -1373,10 +1389,24 @@ impl RepoView {
             .retain(|path, _| worktrees.contains(path.as_str()));
         self.hovered_node = None;
         self.update_menus(cx);
+        // A node goes by its first commit; one regrouped since is found by
+        // the commit it holds.
         let mut selected: Vec<usize> = keys
             .iter()
-            .filter_map(|key| self.graph.nodes.iter().position(|node| &node.key == key))
+            .filter_map(|key| {
+                let nodes = &self.graph.nodes;
+                nodes.iter().position(|node| &node.key == key).or_else(|| {
+                    nodes
+                        .iter()
+                        .position(|node| node.commits.iter().any(|commit| &commit.id == key))
+                })
+            })
             .collect();
+        selected.dedup();
+        let waiting = match restored && selected.is_empty() {
+            true => keys.clone(),
+            false => Vec::new(),
+        };
         if selected.is_empty() {
             let root = self
                 .repo_path
@@ -1446,7 +1476,20 @@ impl RepoView {
         }
         let range = self.graph.range(&selected);
         if range != self.range {
+            // The same nodes, grown or moved by new commits, as an agent at
+            // work makes them: their changes load where the reader is.
+            let same = !restored
+                && selected.len() == keys.len()
+                && selected
+                    .iter()
+                    .zip(&keys)
+                    .all(|(&i, key)| self.graph.nodes[i].key == *key);
+            self.keep_place = same;
+            // Shown while the saved one waits, it is not saved over it.
+            self.fallback = !waiting.is_empty();
             self.set_selection(selected, cx);
+            self.keep_place = false;
+            self.fallback = false;
         } else {
             self.selected_nodes = selected;
             // Uncommitted changes may have changed under the same range.
@@ -1455,6 +1498,9 @@ impl RepoView {
                 let keep = self.selected_file.map(|i| self.files[i].path().to_string());
                 self.load_files(keep, cx);
             }
+        }
+        if !waiting.is_empty() {
+            self.restore_keys = waiting;
         }
         cx.notify();
     }
@@ -1584,6 +1630,8 @@ impl RepoView {
     }
 
     fn set_selection(&mut self, selected: Vec<usize>, cx: &mut Context<Self>) {
+        // A selection made gives up one waiting to come back.
+        self.restore_keys.clear();
         // The last worktree among those selected becomes the current one.
         if let Some(path) =
             selected
@@ -1596,7 +1644,7 @@ impl RepoView {
         {
             self.current_worktree = Some(path);
         }
-        if let Some(repo) = &self.repo_path {
+        if let Some(repo) = self.repo_path.as_ref().filter(|_| !self.fallback) {
             let keys: Vec<&str> = selected
                 .iter()
                 .filter_map(|&i| self.graph.nodes.get(i))
@@ -1838,6 +1886,7 @@ impl RepoView {
         let (Some(repo_path), Some((base, tip))) = (self.repo_path.clone(), range) else {
             return;
         };
+        let keep_place = std::mem::take(&mut self.keep_place);
         self.load_totals(&repo_path, base.clone(), tip.clone(), cx);
         // A selected worktree alone shows its changes split for staging.
         let worktree = self.staging_worktree();
@@ -1878,7 +1927,7 @@ impl RepoView {
                             // Without one to keep, the first file as the tree lists them.
                             this.selected_file =
                                 kept.or_else(|| this.file_order().first().copied());
-                            this.load_stacked(kept.is_some(), cx);
+                            this.load_stacked(kept.is_some() || keep_place, cx);
                         } else {
                             match kept {
                                 Some(index) => {
@@ -2056,19 +2105,52 @@ impl RepoView {
             })
     }
 
+    /// The panels open, by name, for the session to bring back.
+    pub fn open_panels(&self) -> Vec<String> {
+        let side = self.side_panel.map(|panel| match panel {
+            SidePanel::Attention => "attention",
+            SidePanel::Files => "files",
+        });
+        let console = self.console_open.then_some("console");
+        side.into_iter().chain(console).map(str::to_string).collect()
+    }
+
+    /// Opens the panels a session saved, by name.
+    pub fn restore_panels(&mut self, panels: &[String], cx: &mut Context<Self>) {
+        for panel in panels {
+            match panel.as_str() {
+                "attention" => self.side_panel = Some(SidePanel::Attention),
+                "files" => self.side_panel = Some(SidePanel::Files),
+                "console" => {
+                    self.console_open = true;
+                    self.start_terminal(cx);
+                }
+                _ => {}
+            }
+        }
+        if let Some(panel) = self.side_panel {
+            self.last_panel = panel;
+        }
+        cx.notify();
+    }
+
+    /// The terminal dock's shell, started the first time it is wanted.
+    fn start_terminal(&mut self, cx: &mut Context<Self>) -> Entity<TerminalView> {
+        let dir = self
+            .repo_path
+            .clone()
+            .or_else(|| std::env::var("HOME").ok())
+            .unwrap_or_else(|| "/".to_string());
+        self.terminal
+            .get_or_insert_with(|| cx.new(|cx| TerminalView::new(dir, cx)))
+            .clone()
+    }
+
     /// Opens the terminal dock, starting the shell the first time.
     fn toggle_console(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.console_open = !self.console_open;
         if self.console_open {
-            let dir = self
-                .repo_path
-                .clone()
-                .or_else(|| std::env::var("HOME").ok())
-                .unwrap_or_else(|| "/".to_string());
-            let terminal = self
-                .terminal
-                .get_or_insert_with(|| cx.new(|cx| TerminalView::new(dir, cx)));
-            terminal.read(cx).focus(window);
+            self.start_terminal(cx).read(cx).focus(window);
         } else {
             self.focus.focus(window);
         }
@@ -2491,6 +2573,7 @@ impl RepoView {
                                             colors.as_deref(),
                                             this.fit(cols, part),
                                             one,
+                                            None,
                                         )
                                         .into_any_element()
                                     })
@@ -2868,7 +2951,7 @@ impl Render for RepoView {
                     && keystroke.modifiers.platform
                     && !keystroke.modifiers.shift
                     && !editing
-                    && this.copy_picked_lines(cx)
+                    && (this.copy_selected_text(cx) || this.copy_picked_lines(cx))
                 {
                     cx.stop_propagation();
                     return;
@@ -3058,6 +3141,44 @@ fn save_selection(repo: &str, keys: &[&str]) {
     }
     lines.truncate(50);
     recent::save_list(SELECTIONS, &lines);
+}
+
+/// The kept folds of each repository, as lines of the repository, then
+/// `-path` for a file folded and `+path` for one opened among many.
+const FOLDS: &str = "folds";
+
+/// A repository's files folded, and those opened among many, as saved.
+fn saved_folds(repo: &str) -> (HashSet<String>, HashSet<String>) {
+    let (mut folded, mut unfolded) = (HashSet::new(), HashSet::new());
+    let lines = recent::load_list(FOLDS);
+    let line = lines.iter().find(|line| line.split('\t').next() == Some(repo));
+    for field in line.into_iter().flat_map(|line| line.split('\t').skip(1)) {
+        if let Some(path) = field.strip_prefix('-') {
+            folded.insert(path.to_string());
+        } else if let Some(path) = field.strip_prefix('+') {
+            unfolded.insert(path.to_string());
+        }
+    }
+    (folded, unfolded)
+}
+
+/// Saves a repository's folds, the most recent first, for some
+/// repositories; folds that cannot be saved only open again.
+fn save_folds(repo: &str, folded: &HashSet<String>, unfolded: &HashSet<String>) {
+    let mut lines = recent::load_list(FOLDS);
+    lines.retain(|line| line.split('\t').next() != Some(repo));
+    let mut fields: Vec<String> = folded
+        .iter()
+        .map(|path| format!("-{path}"))
+        .chain(unfolded.iter().map(|path| format!("+{path}")))
+        .collect();
+    if !fields.is_empty() {
+        fields.sort();
+        fields.insert(0, repo.to_string());
+        lines.insert(0, fields.join("\t"));
+    }
+    lines.truncate(50);
+    recent::save_list(FOLDS, &lines);
 }
 
 /// The folders of a snapshot's files, each with whether a file in it changed.

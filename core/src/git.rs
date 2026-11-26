@@ -236,19 +236,34 @@ fn worktree_diff(worktree: &str, args: &[&str]) -> Result<Vec<ChangedFile>, Core
             .iter()
             .map(|file| format!("{}\0", file.path()))
             .collect();
+        // In a sparse checkout, files outside its cone are refused unless
+        // asked for.
         run_with_env(
             worktree,
-            &["add", "-N", "--pathspec-from-file=-", "--pathspec-file-nul"],
+            &[
+                "add",
+                "-N",
+                "--sparse",
+                "--pathspec-from-file=-",
+                "--pathspec-file-nul",
+            ],
             Some(&paths),
             &env,
         )?;
         run_with_env(worktree, args, None, &env)
     })();
     fs::remove_file(&copy).ok();
+    // Renames of untracked files are a nicety: without them, the changes
+    // still show, as they would with no untracked files.
+    let Ok(diff) = diff else {
+        let mut files = parse_raw(&run(worktree, args)?, Some(worktree));
+        files.extend(untracked);
+        return Ok(files);
+    };
     // Untracked files still new come as they always do; the others are
     // renames' new names.
     let new: HashSet<&str> = untracked.iter().map(ChangedFile::path).collect();
-    let mut files: Vec<ChangedFile> = parse_raw(&diff?, Some(worktree))
+    let mut files: Vec<ChangedFile> = parse_raw(&diff, Some(worktree))
         .into_iter()
         .filter(|file| !(file.status == "A" && new.contains(file.path())))
         .collect();
@@ -301,7 +316,7 @@ pub fn stage_lines(
     // A new file needs an entry in the index before lines can go into it.
     let untracked = file.worktree.is_some() && file.status == "A" && file.old_id == NULL_ID;
     if untracked && !unstage {
-        run(worktree, &["add", "-N", "--", path])?;
+        run(worktree, &["add", "-N", "--sparse", "--", path])?;
     }
     // Unstaging takes the index back toward HEAD, so the patch runs reversed.
     let patch = match unstage {

@@ -46,6 +46,12 @@ impl RepoView {
                 {
                     this.line_selection = None;
                 }
+                if let Some(selection) = &this.text_selection
+                    && (this.stacked_diffs.get(selection.file) != diffs.get(selection.file)
+                        || this.stacked_files.get(selection.file) != files.get(selection.file))
+                {
+                    this.text_selection = None;
+                }
                 this.stacked_diffs = diffs;
                 this.stacked_files = files;
                 this.syntax.borrow_mut().clear();
@@ -311,6 +317,9 @@ impl RepoView {
             (false, true) => self.folded.insert(path),
             (false, false) => self.folded.remove(&path),
         };
+        if let Some(repo) = &self.repo_path {
+            save_folds(repo, &self.folded, &self.unfolded);
+        }
     }
 
     /// Shows the folds; a file opened before its diff was worked out gets
@@ -722,19 +731,35 @@ impl RepoView {
                             .relative()
                             .flex()
                             .w_full()
-                            .cursor_pointer()
-                            // Pressed, a line is picked; dragged over others,
-                            // they are picked too.
+                            .cursor(gpui::CursorStyle::IBeam)
+                            // Pressed on its number, a line is picked, and
+                            // dragged over others, they are picked too; on
+                            // its code, text is selected.
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                    this.press_line(file, index, event.modifiers, cx)
+                                    match this.on_code(event.position) {
+                                        true => this.press_text(
+                                            file,
+                                            index,
+                                            part,
+                                            event.position,
+                                            event.click_count,
+                                            event.modifiers,
+                                            cx,
+                                        ),
+                                        false => {
+                                            this.text_selection = None;
+                                            this.press_line(file, index, event.modifiers, cx)
+                                        }
+                                    }
                                 }),
                             )
                             .on_mouse_move(cx.listener(
                                 move |this, event: &MouseMoveEvent, _, cx| {
                                     let pressed = event.pressed_button == Some(MouseButton::Left);
-                                    this.drag_line(file, index, pressed, cx)
+                                    this.drag_line(file, index, pressed, cx);
+                                    this.drag_text(file, index, part, event.position, pressed, cx)
                                 },
                             ))
                             .child(
@@ -744,6 +769,7 @@ impl RepoView {
                                     colors.as_deref(),
                                     fit,
                                     self.one_column.get(),
+                                    self.selected_in(file, index),
                                 )
                                 .flex_1(),
                             )

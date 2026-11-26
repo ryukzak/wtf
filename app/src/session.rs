@@ -10,9 +10,19 @@ use gpui::{App, Bounds, WindowBounds, WindowId, point, px, size};
 #[derive(Debug, Clone, PartialEq)]
 pub struct Saved {
     pub active: usize,
-    pub tabs: Vec<String>,
+    pub tabs: Vec<Tab>,
     pub bounds: Option<WindowBounds>,
 }
+
+/// A tab: its repository, and the panels it had open, such as `console`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Tab {
+    pub path: String,
+    pub panels: Vec<String>,
+}
+
+/// Parts a tab's repository from its panels; no path has it.
+const PANELS: char = '\u{1f}';
 
 /// Each open window, as last drawn, and what was last written, so the file
 /// changes only when they do.
@@ -70,7 +80,8 @@ pub fn placed(bounds: Option<WindowBounds>, cx: &App) -> Option<WindowBounds> {
 
 /// A line a window: its active tab, where it was as `@x,y,w,h,state` with
 /// state 0 windowed, 1 maximized, 2 full screen, then its repositories,
-/// tab-separated. A window with no place known leaves it out.
+/// tab-separated, each with its open panels after a `PANELS`, comma-separated.
+/// A window with no place known leaves it out.
 fn format(windows: &[Saved]) -> String {
     windows
         .iter()
@@ -94,7 +105,15 @@ fn format(windows: &[Saved]) -> String {
                 "{}{}\t{}\n",
                 saved.active,
                 place.unwrap_or_default(),
-                saved.tabs.join("\t")
+                saved
+                    .tabs
+                    .iter()
+                    .map(|tab| match tab.panels.is_empty() {
+                        true => tab.path.clone(),
+                        false => format!("{}{PANELS}{}", tab.path, tab.panels.join(",")),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\t")
             )
         })
         .collect()
@@ -108,9 +127,19 @@ fn parse(text: &str) -> Vec<Saved> {
             let bounds = fields
                 .next_if(|field| field.starts_with('@'))
                 .and_then(|field| parse_place(&field[1..]));
-            let tabs: Vec<String> = fields
+            let tabs: Vec<Tab> = fields
                 .filter(|tab| !tab.is_empty())
-                .map(str::to_string)
+                .map(|field| {
+                    let (path, panels) = field.split_once(PANELS).unwrap_or((field, ""));
+                    Tab {
+                        path: path.to_string(),
+                        panels: panels
+                            .split(',')
+                            .filter(|panel| !panel.is_empty())
+                            .map(str::to_string)
+                            .collect(),
+                    }
+                })
                 .collect();
             (!tabs.is_empty()).then_some(Saved {
                 active,
@@ -147,7 +176,16 @@ mod tests {
         let windows = vec![
             Saved {
                 active: 1,
-                tabs: vec!["/a".to_string(), "/b c".to_string()],
+                tabs: vec![
+                    Tab {
+                        path: "/a".to_string(),
+                        panels: vec!["attention".to_string(), "console".to_string()],
+                    },
+                    Tab {
+                        path: "/b c".to_string(),
+                        panels: Vec::new(),
+                    },
+                ],
                 bounds: Some(WindowBounds::Maximized(place)),
             },
             Saved {
@@ -157,7 +195,10 @@ mod tests {
             },
             Saved {
                 active: 0,
-                tabs: vec!["/d".to_string()],
+                tabs: vec![Tab {
+                    path: "/d".to_string(),
+                    panels: Vec::new(),
+                }],
                 bounds: None,
             },
         ];
@@ -167,6 +208,6 @@ mod tests {
         );
         assert!(parse("x\t/a\n").is_empty());
         // Saved before places were.
-        assert_eq!(parse("0\t/a\n")[0].tabs, ["/a"]);
+        assert_eq!(parse("0\t/a\n")[0].tabs[0].path, "/a");
     }
 }

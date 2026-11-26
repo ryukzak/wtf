@@ -488,8 +488,9 @@ impl RepoView {
     }
 
     /// The commit header's first line, kept at the top once the rest of it
-    /// scrolls away.
-    fn summary_bar(&self, theme: &Theme) -> impl IntoElement {
+    /// scrolls away: its text selects and copies as the header's does, and
+    /// a right-click on one commit's opens its menu.
+    fn summary_bar(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         // The newest commit's first line: in bold when it is the only one.
         let commits = self.header_commits();
         let (summary, bold) = match &commits[..] {
@@ -506,6 +507,8 @@ impl RepoView {
             .left_0()
             .right_0()
             .h(px(summary_bar_height()))
+            // Presses are the bar's, not the diff's under it.
+            .block_mouse_except_scroll()
             .px(px(12.))
             .py(px(HEADER_PADDING))
             .bg(theme.background)
@@ -515,14 +518,35 @@ impl RepoView {
             .text_sm()
             .line_height(rems(HEADER_LINE))
             .flex()
-            .child(
+            .items_center()
+            .child({
+                let styles = match bold {
+                    true => vec![(
+                        0..summary.len(),
+                        HighlightStyle {
+                            font_weight: Some(gpui::FontWeight::SEMIBOLD),
+                            ..Default::default()
+                        },
+                    )],
+                    false => Vec::new(),
+                };
+                let menu = match &commits[..] {
+                    [commit] => Some(Target::Commit {
+                        commit: commit.id.clone(),
+                        message: full_message(commit),
+                    }),
+                    _ => None,
+                };
+                let key = match commits.first() {
+                    Some(commit) => format!("bar-{}", commit.id),
+                    None => "bar".to_string(),
+                };
                 div()
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .when(bold, |line| line.font_weight(gpui::FontWeight::SEMIBOLD))
-                    .child(summary),
-            )
+                    .child(self.selectable_text(key, summary, styles, menu, theme, cx))
+            })
     }
 
     /// What the diff shows, above it: the selected commit's message, or the
@@ -1151,7 +1175,7 @@ impl RepoView {
                     .right_0()
                     .child(pinned)
             }))
-            .when(scrolled, |pane| pane.child(self.summary_bar(theme)))
+            .when(scrolled, |pane| pane.child(self.summary_bar(theme, cx)))
     }
 }
 
