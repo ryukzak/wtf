@@ -1929,10 +1929,10 @@ impl RepoView {
         };
         self.is_loading_diff = !refresh;
         let (file, mode) = (file.clone(), self.diff_mode);
-        let text_only = preferences::text_only_rule(&repo_path);
+        let text_diff = preferences::text_diff_rule(&repo_path);
         let load = cx
             .background_executor()
-            .spawn(async move { wtf_core::file_diff(repo_path, file, mode, &text_only) });
+            .spawn(async move { wtf_core::file_diff(repo_path, file, mode, &text_diff) });
         self.diff_task = Some(cx.spawn(async move |this, cx| {
             let result = load.await;
             this.update(cx, |this, cx| {

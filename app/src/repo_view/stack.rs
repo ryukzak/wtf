@@ -22,14 +22,14 @@ impl RepoView {
             .iter()
             .map(|file| self.many_files() && self.is_folded(file.path()))
             .collect();
-        let text_only = preferences::text_only_rule(&repo_path);
+        let text_diff = preferences::text_diff_rule(&repo_path);
         let load = cx.background_executor().spawn(async move {
             let diffs = files
                 .iter()
                 .zip(skip)
                 .map(|(file, skip)| match skip {
                     true => Err(NOT_LOADED.to_string()),
-                    false => wtf_core::file_diff(repo_path.clone(), file.clone(), mode, &text_only)
+                    false => wtf_core::file_diff(repo_path.clone(), file.clone(), mode, &text_diff)
                         .map_err(message),
                 })
                 .collect::<Vec<_>>();

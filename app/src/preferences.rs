@@ -286,7 +286,6 @@ impl Knob {
             Knob::CodeWeight => s.code_weight,
             Knob::CodeLine => s.code_line,
             Knob::TerminalLine => s.terminal_line,
-            Knob::FetchMinutes => DEFAULT_FETCH_MINUTES as f32,
             Knob::RowHeight => s.graph.row_height,
             Knob::Column => s.graph.column,
             Knob::Curve => s.graph.curve,
@@ -295,8 +294,7 @@ impl Knob {
             Knob::Beads => s.graph.beads as f32,
             Knob::Line => s.graph.line,
             Knob::HoverLine => s.graph.hover_line,
-            // A project's, read where the slider shows it.
-            Knob::IdleDays => DEFAULT_IDLE_DAYS as f32,
+            Knob::FetchMinutes | Knob::IdleDays => unreachable!("a project's: Knob::project"),
         }
     }
 
@@ -307,7 +305,6 @@ impl Knob {
             Knob::CodeWeight => s.code_weight = value,
             Knob::CodeLine => s.code_line = value,
             Knob::TerminalLine => s.terminal_line = value,
-            Knob::FetchMinutes => {}
             Knob::RowHeight => s.graph.row_height = value,
             Knob::Column => s.graph.column = value,
             Knob::Curve => s.graph.curve = value,
@@ -316,7 +313,16 @@ impl Knob {
             Knob::Beads => s.graph.beads = value as usize,
             Knob::Line => s.graph.line = value,
             Knob::HoverLine => s.graph.hover_line = value,
-            Knob::IdleDays => {}
+            Knob::FetchMinutes | Knob::IdleDays => unreachable!("a project's: Knob::project"),
+        }
+    }
+
+    /// The project setting a slider sets, when it is not one of the app's.
+    fn project(self) -> Option<ProjectSetting> {
+        match self {
+            Knob::FetchMinutes => Some(ProjectSetting::FetchMinutes),
+            Knob::IdleDays => Some(ProjectSetting::IdleDays),
+            _ => None,
         }
     }
 
@@ -413,7 +419,7 @@ pub fn appearance() -> Appearance {
 
 /// The files the structural diff leaves to the text one, built in: those
 /// that are code around data, where its structure tells nothing.
-pub const TEXT_ONLY: &str = "*.snap\n*.lock\npackage-lock.json\n*-lock.yaml\n*.min.js\n*.min.css";
+pub const TEXT_DIFF: &str = "*.snap\n*.lock\npackage-lock.json\n*-lock.yaml\n*.min.js\n*.min.css";
 
 /// Which of the app's commands the terminal prints; with `all`, every one.
 pub fn terminal_shown(all: bool) -> crate::console_view::Shown {
@@ -437,13 +443,13 @@ pub fn terminal_shown(all: bool) -> crate::console_view::Shown {
 
 /// What leaves a file of `repo` to the text diff: the project's globs,
 /// and the size in bytes past which none is diffed by structure.
-pub fn text_only_rule(repo: &str) -> wtf_core::TextOnly {
+pub fn text_diff_rule(repo: &str) -> wtf_core::TextDiff {
     let scope = Scope::Repo(repo.to_string());
     let kb: usize = ProjectSetting::TextDiffAbove
         .value(&scope)
         .parse()
         .unwrap_or(DEFAULT_TEXT_DIFF_ABOVE);
-    wtf_core::TextOnly {
+    wtf_core::TextDiff {
         patterns: ProjectSetting::TextDiff
             .value(&scope)
             .lines()
@@ -697,7 +703,7 @@ impl ProjectSetting {
         match self {
             ProjectSetting::Summary => wtf_core::SUMMARY_PROMPT.to_string(),
             ProjectSetting::Message => wtf_core::MESSAGE_PROMPT.to_string(),
-            ProjectSetting::TextDiff => TEXT_ONLY.to_string(),
+            ProjectSetting::TextDiff => TEXT_DIFF.to_string(),
             ProjectSetting::TextDiffAbove => DEFAULT_TEXT_DIFF_ABOVE.to_string(),
             ProjectSetting::IdleDays => DEFAULT_IDLE_DAYS.to_string(),
             ProjectSetting::FetchMinutes => DEFAULT_FETCH_MINUTES.to_string(),
@@ -1591,29 +1597,19 @@ impl Preferences {
         let frac = (f32::from(x - bounds.left()) - KNOB_SIZE / 2.) / travel.max(1.);
         let value = knob.at(frac.clamp(0., 1.));
         if self.knob_value(knob) != value {
-            match knob {
-                Knob::IdleDays => {
-                    ProjectSetting::IdleDays.set(&self.scope, Some(value.to_string()), cx)
-                }
-                Knob::FetchMinutes => {
-                    ProjectSetting::FetchMinutes.set(&self.scope, Some(value.to_string()), cx)
-                }
-                _ => change(|settings| knob.set(settings, value), cx),
+            match knob.project() {
+                Some(setting) => setting.set(&self.scope, Some(value.to_string()), cx),
+                None => change(|settings| knob.set(settings, value), cx),
             }
         }
         cx.notify();
     }
 
-    /// A slider's number: the app's, or the project's for idle days and
-    /// fetches.
+    /// A slider's number: the app's, or the project's.
     fn knob_value(&self, knob: Knob) -> f32 {
-        let project = |setting: ProjectSetting, default: u32| {
-            setting.value(&self.scope).parse().unwrap_or(default as f32)
-        };
-        match knob {
-            Knob::IdleDays => project(ProjectSetting::IdleDays, DEFAULT_IDLE_DAYS),
-            Knob::FetchMinutes => project(ProjectSetting::FetchMinutes, DEFAULT_FETCH_MINUTES),
-            _ => knob.get(&read()),
+        match knob.project() {
+            Some(setting) => setting.value(&self.scope).parse().unwrap_or_default(),
+            None => knob.get(&read()),
         }
     }
 

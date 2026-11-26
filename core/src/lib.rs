@@ -453,12 +453,12 @@ pub fn file_history(
 /// Files the structural diff leaves to the text one: by glob, on the file
 /// name or, with a `/`, the whole path; and past a size, in bytes.
 #[derive(Debug, Clone)]
-pub struct TextOnly {
+pub struct TextDiff {
     pub patterns: Vec<String>,
     pub max_bytes: usize,
 }
 
-impl Default for TextOnly {
+impl Default for TextDiff {
     fn default() -> Self {
         Self {
             patterns: Vec::new(),
@@ -467,7 +467,7 @@ impl Default for TextOnly {
     }
 }
 
-impl TextOnly {
+impl TextDiff {
     /// Whether `path`, with sides of `size` bytes at most, is diffed as text.
     pub fn takes(&self, path: &str, size: usize) -> bool {
         let name = path.rsplit('/').next().unwrap_or(path);
@@ -486,10 +486,10 @@ pub fn file_diff(
     repo_path: String,
     file: ChangedFile,
     mode: DiffMode,
-    text_only: &TextOnly,
+    text_diff: &TextDiff,
 ) -> Result<FileDiff, CoreError> {
     let (old, new) = git::read_blobs(&repo_path, &file)?;
-    let mode = match text_only.takes(file.path(), old.len().max(new.len())) {
+    let mode = match text_diff.takes(file.path(), old.len().max(new.len())) {
         true => DiffMode::Text,
         false => mode,
     };
@@ -500,12 +500,12 @@ pub fn file_diff(
 }
 
 #[cfg(test)]
-mod text_only_tests {
-    use super::TextOnly;
+mod text_diff_tests {
+    use super::TextDiff;
 
     #[test]
     fn some_files_are_diffed_as_text() {
-        let rule = TextOnly {
+        let rule = TextDiff {
             patterns: vec!["*.snap".into(), "docs/*.md".into()],
             max_bytes: 100,
         };

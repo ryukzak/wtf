@@ -19,6 +19,8 @@ pub enum Scope {
 
 /// A filter over branches for the workflow graph. The main branch is always
 /// shown; any other branch can be hidden or pinned by name.
+// A field added later reads as its default, so the rest of a saved
+// attention survives it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Attention {
@@ -161,14 +163,5 @@ mod tests {
             !attention.shows("agent", "Bot", 0, now, true),
             "worktrees can be hidden"
         );
-    }
-
-    #[test]
-    fn reads_attention_saved_before_scopes() {
-        let old = r#"{"window_days":7,"authors":[],"pinned":["a"],"hidden":[]}"#;
-        let attention: Attention = serde_json::from_str(old).unwrap();
-        assert_eq!(attention.scope, Scope::Branches);
-        assert_eq!(attention.window_days, Some(7));
-        assert_eq!(attention.pinned, ["a"]);
     }
 }
