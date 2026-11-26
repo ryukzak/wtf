@@ -871,9 +871,18 @@ impl RepoView {
                             }
                             TreeRow::Dir { key, label, depth } => {
                                 let collapsed = this.collapsed_dirs.contains(key);
+                                let path = match this.worktree_split {
+                                    Some(_) => key
+                                        .strip_prefix("staged:")
+                                        .or_else(|| key.strip_prefix("unstaged:"))
+                                        .unwrap_or(key),
+                                    None => key,
+                                };
+                                let menu = super::this_path_menu(path.to_string(), cx);
                                 let key = key.clone();
                                 item.pl(indent(*depth))
                                     .cursor_pointer()
+                                    .on_mouse_down(MouseButton::Right, menu)
                                     .hover(|item| item.bg(theme.selection.opacity(0.5)))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         if !this.collapsed_dirs.remove(&key) {

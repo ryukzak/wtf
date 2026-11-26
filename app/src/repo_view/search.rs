@@ -195,6 +195,10 @@ impl RepoView {
                                     open.as_deref() == Some(path.as_str()) && marked.is_none();
                                 let path = path.clone();
                                 item.cursor_pointer()
+                                    .on_mouse_down(
+                                        MouseButton::Right,
+                                        super::this_path_menu(path.clone(), cx),
+                                    )
                                     .hover(|item| item.bg(theme.selection.opacity(0.5)))
                                     .when(selected, |item| item.bg(theme.selection))
                                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -213,6 +217,10 @@ impl RepoView {
                                 let selected = marked.as_ref() == Some(&(path.clone(), *line));
                                 let (path, line) = (path.clone(), *line);
                                 item.cursor_pointer()
+                                    .on_mouse_down(
+                                        MouseButton::Right,
+                                        super::this_path_menu(path.clone(), cx),
+                                    )
                                     .pl(px(16.))
                                     .hover(|item| item.bg(theme.selection.opacity(0.5)))
                                     .when(selected, |item| item.bg(theme.selection))

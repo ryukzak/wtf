@@ -2112,7 +2112,10 @@ impl RepoView {
             SidePanel::Files => "files",
         });
         let console = self.console_open.then_some("console");
-        side.into_iter().chain(console).map(str::to_string).collect()
+        side.into_iter()
+            .chain(console)
+            .map(str::to_string)
+            .collect()
     }
 
     /// Opens the panels a session saved, by name.
@@ -3151,7 +3154,9 @@ const FOLDS: &str = "folds";
 fn saved_folds(repo: &str) -> (HashSet<String>, HashSet<String>) {
     let (mut folded, mut unfolded) = (HashSet::new(), HashSet::new());
     let lines = recent::load_list(FOLDS);
-    let line = lines.iter().find(|line| line.split('\t').next() == Some(repo));
+    let line = lines
+        .iter()
+        .find(|line| line.split('\t').next() == Some(repo));
     for field in line.into_iter().flat_map(|line| line.split('\t').skip(1)) {
         if let Some(path) = field.strip_prefix('-') {
             folded.insert(path.to_string());
@@ -3493,6 +3498,7 @@ impl RepoView {
         let (older, newer) = steps
             .as_ref()
             .map_or((false, false), |(o, n, _, _)| (o.is_some(), n.is_some()));
+        let menu = this_path_menu(path.to_string(), cx);
         let button = |id: &'static str, label: &'static str, on: bool, older: bool| {
             div()
                 .id(id)
@@ -3524,10 +3530,12 @@ impl RepoView {
             .text_sm()
             .child(
                 div()
+                    .id("file-steps-path")
                     .flex_1()
                     .min_w_0()
                     .truncate()
                     .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .on_mouse_down(MouseButton::Right, menu)
                     .child(path.to_string()),
             )
             .children(steps.as_ref().map(|(_, _, at, of)| {
@@ -3682,6 +3690,10 @@ impl RepoView {
                                 let changed = folders.get(key).copied().unwrap_or(false);
                                 let key = key.clone();
                                 item.pl(indent(*depth))
+                                    .on_mouse_down(
+                                        MouseButton::Right,
+                                        this_path_menu(key.clone(), cx),
+                                    )
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         if !this.snapshot.open_folders.remove(&key) {
                                             this.snapshot.open_folders.insert(key.clone());
@@ -3717,6 +3729,10 @@ impl RepoView {
                                 let open_path = path.clone();
                                 item.pl(indent(*depth))
                                     .when(open, |item| item.bg(theme.selection))
+                                    .on_mouse_down(
+                                        MouseButton::Right,
+                                        this_path_menu(path.clone(), cx),
+                                    )
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.open_snapshot_file(path.clone());
                                         this.snapshot_scroll.scroll_to_item(0, ScrollStrategy::Top);
@@ -4035,6 +4051,20 @@ fn this_file_menu(
 ) -> impl Fn(&MouseDownEvent, &mut Window, &mut gpui::App) + 'static {
     cx.listener(move |this, event: &MouseDownEvent, _, cx| {
         if let Some(target) = this.file_target(index) {
+            this.open_context_menu(target, event.position, cx);
+        }
+        cx.stop_propagation();
+    })
+}
+
+/// Right-click on a file or folder by its path, in the Snapshot tree, its
+/// search, or over its file: its menu.
+fn this_path_menu(
+    path: String,
+    cx: &mut Context<RepoView>,
+) -> impl Fn(&MouseDownEvent, &mut Window, &mut gpui::App) + 'static {
+    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+        if let Some(target) = this.path_target(&path) {
             this.open_context_menu(target, event.position, cx);
         }
         cx.stop_propagation();

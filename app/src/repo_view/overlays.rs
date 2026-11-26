@@ -1467,7 +1467,13 @@ impl RepoView {
     /// The menu for a changed file: its path in the repository and where it
     /// is in the worktree the diff is of, or the tab's own.
     pub(super) fn file_target(&self, index: usize) -> Option<Target> {
-        let name = self.files.get(index)?.path().to_string();
+        self.path_target(self.files.get(index)?.path())
+    }
+
+    /// The menu for a file or folder by its path in the repository, as
+    /// `file_target`'s.
+    pub(super) fn path_target(&self, name: &str) -> Option<Target> {
+        let name = name.trim_end_matches('/').to_string();
         let root = match &self.range {
             Some((_, Revision::Worktree(path))) => Some(path.clone()),
             _ => self
