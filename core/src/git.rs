@@ -103,19 +103,21 @@ fn run_with_input(dir: &str, args: &[&str], input: &str) -> Result<String, CoreE
     run_with_env(dir, args, Some(input), &[])
 }
 
-/// Runs git with `input`, if any, on stdin and extra environment variables.
 /// Whether `args` read git config: `config` with a `--get…` option.
 fn reads_config<S: AsRef<OsStr>>(args: &[S]) -> bool {
     let mut words = args.iter().map(|arg| arg.as_ref().to_string_lossy());
     words.next().is_some_and(|word| word == "config") && words.any(|word| word.starts_with("--get"))
 }
 
-fn run_with_env<S: AsRef<OsStr>>(
+/// Starts git in `dir` with `input`, if any, on stdin and extra
+/// environment variables, and waits for it: its shell line, when it
+/// started and what it did.
+fn spawn_git<S: AsRef<OsStr>>(
     dir: &str,
     args: &[S],
     input: Option<&str>,
     env: &[(&str, &str)],
-) -> Result<String, CoreError> {
+) -> (String, Instant, std::io::Result<std::process::Output>) {
     use std::io::Write;
     use std::process::Stdio;
 
@@ -140,6 +142,47 @@ fn run_with_env<S: AsRef<OsStr>>(
         }
         child.wait_with_output()
     });
+    (line, started, output)
+}
+
+/// Runs a git command that answers yes, exiting with 0, or no, with 1,
+/// such as `merge-base --is-ancestor` or `merge-tree`: either is logged
+/// as done, with what it printed; anything else is an error.
+pub(crate) fn run_answer<S: AsRef<OsStr>>(
+    dir: &str,
+    args: &[S],
+    input: Option<&str>,
+    env: &[(&str, &str)],
+) -> Result<(bool, String), CoreError> {
+    let (line, started, output) = spawn_git(dir, args, input, env);
+    let output = output.map_err(|error| {
+        console::record(dir, line.clone(), false, started, error.to_string());
+        CoreError::new(error)
+    })?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    match output.status.code() {
+        Some(code @ (0 | 1)) => {
+            console::record(dir, line, true, started, String::new());
+            Ok((code == 0, stdout))
+        }
+        _ => {
+            let mut error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if error.is_empty() {
+                error = format!("{line} failed with {}", output.status);
+            }
+            console::record(dir, line, false, started, error.clone());
+            Err(CoreError::new(error))
+        }
+    }
+}
+
+fn run_with_env<S: AsRef<OsStr>>(
+    dir: &str,
+    args: &[S],
+    input: Option<&str>,
+    env: &[(&str, &str)],
+) -> Result<String, CoreError> {
+    let (line, started, output) = spawn_git(dir, args, input, env);
     let output = match output {
         Ok(output) => output,
         Err(error) => {
@@ -185,6 +228,7 @@ pub fn worktree_status(path: &str) -> Result<WorktreeStatus, CoreError> {
         staged: submodules_first(parse_raw(&staged, None)),
         unstaged,
         inside,
+        picking: crate::pick::picking(path),
     })
 }
 
@@ -512,6 +556,30 @@ fn copy_commit(
     parents: &[&str],
     message: &str,
 ) -> Result<String, CoreError> {
+    let tree = format!("{commit}^{{tree}}");
+    copy_commit_as(path, commit, &tree, parents, message)
+}
+
+/// A copy of `commit`, its author, date and message, with `tree` on
+/// `parents`: what cherry-pick makes of it.
+pub(crate) fn copy_commit_onto(
+    path: &str,
+    commit: &str,
+    tree: &str,
+    parents: &[&str],
+) -> Result<String, CoreError> {
+    let message = run(path, &["show", "-s", "--format=%B", commit])?;
+    copy_commit_as(path, commit, tree, parents, message.trim_end())
+}
+
+/// A commit of `tree` on `parents` with `message`, by `commit`'s author.
+fn copy_commit_as(
+    path: &str,
+    commit: &str,
+    tree: &str,
+    parents: &[&str],
+    message: &str,
+) -> Result<String, CoreError> {
     let author = run(
         path,
         &["show", "-s", "--format=%an%n%ae%n%ad", "--date=raw", commit],
@@ -522,8 +590,7 @@ fn copy_commit(
             "Cannot read the author of {commit}"
         )));
     };
-    let tree = format!("{commit}^{{tree}}");
-    let mut args = vec!["commit-tree", tree.as_str()];
+    let mut args = vec!["commit-tree", tree];
     for parent in parents {
         args.extend(["-p", parent]);
     }

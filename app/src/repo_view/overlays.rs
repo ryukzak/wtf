@@ -9,14 +9,264 @@ impl RepoView {
         position: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
+        let target = self.widen_to_selection(target);
+        self.pick_generation += 1;
+        self.pick_branches.clear();
+        self.pick_places.clear();
+        let picks = target.picks();
+        if !picks.is_empty() {
+            self.pick_places = self
+                .checkout_worktrees(&target)
+                .into_iter()
+                .map(|(path, place)| PickPlace {
+                    place,
+                    path: Some(path),
+                    hint: None,
+                })
+                .collect();
+            self.forecast_picks(false, picks, cx);
+        }
         self.context_menu = Some((target, position));
         cx.notify();
     }
 
-    fn run_command(&mut self, command: Command, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((target, _)) = self.context_menu.take() else {
+    /// A commit among several picked in the commit list, or in the graph's
+    /// beads, stands for all of them: the menu acts on the selection.
+    fn widen_to_selection(&self, target: Target) -> Target {
+        let Target::Commit { commit, .. } = &target else {
+            return target;
+        };
+        let picked = self.commits.iter().position(|c| c.id == *commit);
+        if self.narrowed.len() < 2 || !picked.is_some_and(|i| self.narrowed.contains(&i)) {
+            return target;
+        }
+        // The list runs newest first: oldest first is from the end.
+        let mut indices = self.narrowed.clone();
+        indices.sort_unstable_by(|a, b| b.cmp(a));
+        let commits: Vec<(String, String)> = indices
+            .iter()
+            .filter_map(|&i| self.commits.get(i))
+            .map(|c| (c.id.clone(), super::header::full_message(c)))
+            .collect();
+        Target::Commits {
+            title: format!("{} commits", commits.len()),
+            commits,
+            section: false,
+        }
+    }
+
+    /// The branches to cherry-pick onto in place of the menu: the local ones
+    /// no worktree has, channels first, then the latest, as many as fit.
+    fn open_pick_branches(
+        &mut self,
+        picks: Vec<String>,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut branches: Vec<&wtf_core::Branch> = self
+            .graph
+            .branches
+            .iter()
+            .filter(|b| !b.remote && !b.worktree && !b.unrelated && (b.shown || b.channel))
+            .collect();
+        branches.sort_by_key(|b| (!b.channel, -b.time));
+        branches.truncate(PICK_BRANCHES);
+        let branches: Vec<PickPlace> = branches
+            .into_iter()
+            .map(|b| PickPlace {
+                place: popups::Place::new(&b.name, false, false),
+                path: None,
+                hint: None,
+            })
+            .collect();
+        self.pick_generation += 1;
+        self.pick_branches = branches;
+        self.forecast_picks(true, picks.clone(), cx);
+        self.context_menu = Some((Target::PickBranches { commits: picks }, position));
+        cx.notify();
+    }
+
+    /// Works out, one place after another, what cherry-picking `picks` into
+    /// each worktree, or onto each branch, would do, for the menu's hints.
+    fn forecast_picks(&mut self, branches: bool, picks: Vec<String>, cx: &mut Context<Self>) {
+        let Some(repo) = self.repo_path.clone() else {
             return;
         };
+        let list = match branches {
+            true => &self.pick_branches,
+            false => &self.pick_places,
+        };
+        let ontos: Vec<(String, String)> = list
+            .iter()
+            .map(|pick| match &pick.path {
+                Some(path) => (path.clone(), "HEAD".to_string()),
+                None => (repo.clone(), format!("refs/heads/{}", pick.place.name)),
+            })
+            .collect();
+        let generation = self.pick_generation;
+        cx.spawn(async move |this, cx| {
+            for (k, (dir, onto)) in ontos.into_iter().enumerate() {
+                let picks = picks.clone();
+                let hint = cx
+                    .background_executor()
+                    .spawn(async move {
+                        if picks.iter().all(|c| wtf_core::has_commit(&dir, &onto, c)) {
+                            return "already there".to_string();
+                        }
+                        match wtf_core::pick_forecast(&dir, &onto, &picks) {
+                            Ok(forecast) => forecast.hint(picks.len()),
+                            Err(_) => "can't tell".to_string(),
+                        }
+                    })
+                    .await;
+                let going = this.update(cx, |this, cx| {
+                    if this.pick_generation != generation {
+                        return false;
+                    }
+                    let list = match branches {
+                        true => &mut this.pick_branches,
+                        false => &mut this.pick_places,
+                    };
+                    if let Some(pick) = list.get_mut(k) {
+                        pick.hint = Some(hint);
+                    }
+                    cx.notify();
+                    true
+                });
+                if !matches!(going, Ok(true)) {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Cherry-picks onto a branch no worktree has, in git's object store:
+    /// done when every commit applies cleanly; otherwise nothing changes and
+    /// it offers a worktree for the branch to pick in, where git stops on
+    /// the conflict.
+    fn pick_onto_branch(
+        &mut self,
+        branch: String,
+        picks: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(repo) = self.repo_path.clone() else {
+            return;
+        };
+        let task = cx.background_executor().spawn({
+            let (repo, branch, picks) = (repo.clone(), branch.clone(), picks.clone());
+            async move {
+                let merges = wtf_core::has_merges(&repo, &picks);
+                (wtf_core::pick_onto_branch(&repo, &branch, &picks), merges)
+            }
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let (result, merges) = task.await;
+            this.update_in(cx, |this, window, cx| match result {
+                Ok(wtf_core::Forecast::Clean { .. }) => this.start_refresh(cx),
+                Ok(wtf_core::Forecast::Conflicts { step, files }) => {
+                    let path = popups::worktree_path(&repo, &branch);
+                    let commit = picks.get(step).map(|c| popups::short_hash(c));
+                    let detail = format!(
+                        "{} conflicts with {branch} in {}. Nothing was changed. In a worktree \
+                         for {branch}, git stops on the conflict for you to resolve.",
+                        commit.unwrap_or_default(),
+                        files.join(", ")
+                    );
+                    let line = popups::pick_in_new_worktree(&repo, &path, &branch, &picks, merges);
+                    this.confirm(
+                        format!("Cherry-pick onto {branch} conflicts"),
+                        &detail,
+                        "Pick in New Worktree",
+                        line,
+                        window,
+                        cx,
+                    );
+                }
+                Err(error) => {
+                    this.error_message = Some(message(error));
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Over the changes of a worktree where a cherry-pick stopped: what to
+    /// do, and the ways on.
+    pub(super) fn picking_bar(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.picking {
+            return None;
+        }
+        let path = self.staging_worktree()?;
+        let button = |id: &'static str, label: &'static str, step: &'static str| {
+            let line = popups::cherry_pick_step(&path, step);
+            div()
+                .id(id)
+                .px(px(10.))
+                .py(px(2.))
+                .rounded(px(4.))
+                .border_1()
+                .border_color(theme.separator)
+                .bg(theme.background)
+                .cursor_pointer()
+                .hover(|button| button.bg(theme.selection))
+                .child(label)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.run_in_terminal(line.clone(), window, cx)
+                }))
+        };
+        Some(
+            div()
+                .flex()
+                .flex_none()
+                .flex_wrap()
+                .items_center()
+                .gap(px(8.))
+                .px(px(10.))
+                .py(px(6.))
+                .border_b_1()
+                .border_color(theme.separator)
+                .bg(theme.error.opacity(0.08))
+                .text_sm()
+                .child(
+                    div().flex_1().min_w_0().text_color(theme.foreground).child(
+                        "Cherry-pick stopped: fix the conflicts, stage them, then Continue.",
+                    ),
+                )
+                .child(button("pick-continue", "Continue", "--continue"))
+                .child(button("pick-skip", "Skip Commit", "--skip"))
+                .child(button("pick-abort", "Abort", "--abort"))
+                .into_any_element(),
+        )
+    }
+
+    fn run_command(&mut self, command: Command, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((target, position)) = self.context_menu.take() else {
+            return;
+        };
+        // A section's newest commit stands for it where one commit is meant.
+        let target = match (target, command) {
+            (
+                Target::Commits {
+                    commits,
+                    section: true,
+                    ..
+                },
+                Command::CheckoutIn(_) | Command::NewBranch | Command::NewWorktree,
+            ) => match commits.last() {
+                Some((commit, message)) => Target::Commit {
+                    commit: commit.clone(),
+                    message: message.clone(),
+                },
+                None => return,
+            },
+            (target, _) => target,
+        };
+        let picks = target.picks();
         if let Target::Group { remote } = target {
             let section = if remote {
                 Section::Remote
@@ -57,6 +307,7 @@ impl RepoView {
                 ..
             } => (branch.clone(), Some(path.clone()), commit.clone()),
             Target::Group { .. } | Target::File { .. } | Target::Facts { .. } => return,
+            Target::Commits { .. } | Target::PickBranches { .. } => (None, None, String::new()),
         };
         let copy = |text: String, cx: &mut Context<Self>| {
             cx.write_to_clipboard(ClipboardItem::new_string(text))
@@ -71,6 +322,33 @@ impl RepoView {
                 }
             }
             Command::CopyPath => copy(path.unwrap_or_default(), cx),
+            Command::CopyHashes => copy(picks.join("\n"), cx),
+            Command::CopyMessages => {
+                if let Target::Commits { commits, .. } = &target {
+                    let firsts: Vec<&str> = commits
+                        .iter()
+                        .map(|(_, message)| message.lines().next().unwrap_or_default())
+                        .collect();
+                    copy(firsts.join("\n"), cx)
+                }
+            }
+            Command::Title => {}
+            Command::CherryPick(k) => {
+                if let Some(path) = self.pick_places.get(k).and_then(|pick| pick.path.clone()) {
+                    let merges = wtf_core::has_merges(&repo, &picks);
+                    self.run_in_terminal(popups::cherry_pick(&path, &picks, merges), window, cx);
+                }
+            }
+            Command::CherryPickInto => {
+                self.open_pick_branches(picks, position, cx);
+                return;
+            }
+            Command::CherryPickOnto(k) => {
+                if let Some(pick) = self.pick_branches.get(k) {
+                    let branch = pick.place.name.clone();
+                    self.pick_onto_branch(branch, picks, window, cx);
+                }
+            }
             // Files only, handled above.
             Command::CopyRelativePath | Command::Open | Command::CopyFact(_) => {}
             Command::OpenWithRecent(k) => {
@@ -1629,7 +1907,10 @@ impl RepoView {
     fn checkout_worktrees(&self, target: &Target) -> Vec<(String, popups::Place)> {
         let name = match target {
             Target::Branch { name, .. } => Some(name),
-            Target::Stash { .. } | Target::Commit { .. } | Target::Remote { .. } => None,
+            Target::Stash { .. }
+            | Target::Commit { .. }
+            | Target::Commits { .. }
+            | Target::Remote { .. } => None,
             _ => return Vec::new(),
         };
         let current = self
@@ -1665,6 +1946,8 @@ impl RepoView {
         let main = self.graph.main.as_str();
         let mut menu = div()
             .id("context-menu")
+            // A click on an item stays in the menu, off what is under it.
+            .occlude()
             .flex()
             .flex_col()
             .min_w(px(200.))
@@ -1698,6 +1981,13 @@ impl RepoView {
             shown,
             overridden,
             &worktrees,
+            &match target {
+                Target::PickBranches { .. } => &self.pick_branches,
+                _ => &self.pick_places,
+            }
+            .iter()
+            .map(|pick| pick.place.clone())
+            .collect::<Vec<_>>(),
         );
         // A branch becomes a channel by its name, next to what attention
         // makes of it; one a wider pattern names already offers nothing.
@@ -1718,9 +2008,23 @@ impl RepoView {
             };
             items.insert(at, Some((Command::ToggleChannel, label)));
         }
+        // What a cherry-pick would do there, once worked out.
+        let pick_hint = |pick: Option<&PickPlace>| {
+            pick.map(|pick| pick.hint.clone().unwrap_or_else(|| "…".to_string()))
+        };
         for (k, item) in items.into_iter().enumerate() {
             menu = match item {
                 None => menu.child(div().h(px(1.)).my(px(4.)).bg(theme.separator)),
+                // The first line names what the menu acts on.
+                Some((Command::Title, label)) => menu.child(
+                    div()
+                        .px(px(12.))
+                        .py(px(3.))
+                        .text_xs()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(theme.secondary)
+                        .child(label.text.to_uppercase()),
+                ),
                 Some((command, label)) => menu.child(
                     div()
                         .id(("context-item", k))
@@ -1731,7 +2035,15 @@ impl RepoView {
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.run_command(command, window, cx)
                         }))
-                        .child(menu_label(&label, copy_hint(target, command), theme)),
+                        .child(menu_label(
+                            &label,
+                            match command {
+                                Command::CherryPick(k) => pick_hint(self.pick_places.get(k)),
+                                Command::CherryPickOnto(k) => pick_hint(self.pick_branches.get(k)),
+                                _ => copy_hint(target, command),
+                            },
+                            theme,
+                        )),
                 ),
             };
         }
@@ -2060,7 +2372,14 @@ fn copy_hint(target: &Target, command: Command) -> Option<String> {
             };
             return Some(cut_short(text));
         }
-        Target::Group { .. } => return None,
+        Target::Group { .. } | Target::PickBranches { .. } => return None,
+        Target::Commits { commits, .. } => {
+            let lines = |n: usize| format!("{n} line{}", if n == 1 { "" } else { "s" });
+            return match command {
+                Command::CopyHashes | Command::CopyMessages => Some(lines(commits.len())),
+                _ => None,
+            };
+        }
     };
     let text = match command {
         Command::CopyName => name?,
@@ -2094,16 +2413,23 @@ fn menu_label(label: &popups::Label, hint: Option<String>, theme: &Theme) -> Any
     } else {
         theme.foreground
     };
-    let mut row = div()
+    let row = div()
         .flex()
         .items_center()
         .justify_between()
         .gap(px(24.))
         .whitespace_nowrap()
         .child(div().text_color(color).child(label.text.clone()));
-    // What a copy takes, dimmed on the right.
-    if let Some(hint) = hint.filter(|_| label.place.is_none()) {
-        row = row.child(div().text_color(theme.secondary).child(hint));
+    // What a copy takes, or how a cherry-pick would go, on the right:
+    // conflicts in red, a clean one in green.
+    let mut right = div().flex().items_center().gap(px(10.));
+    if let Some(hint) = hint {
+        let color = match hint.as_str() {
+            "clean" => super::header::ADDED,
+            hint if hint.ends_with("conflict") || hint.ends_with("conflicts") => theme.error,
+            _ => theme.secondary,
+        };
+        right = right.child(div().text_color(color).child(hint));
     }
     // A worktree, as the graph's list shows one: its folder on a chip,
     // filled for the current one.
@@ -2113,7 +2439,7 @@ fn menu_label(label: &popups::Label, hint: Option<String>, theme: &Theme) -> Any
             .rounded(px(4.))
             .text_xs()
             .child(format!("⌂ {}", place.name));
-        row = row.child(match place.current {
+        right = right.child(match place.current {
             true => chip
                 .bg(theme.accent)
                 .text_color(gpui::white())
@@ -2121,7 +2447,7 @@ fn menu_label(label: &popups::Label, hint: Option<String>, theme: &Theme) -> Any
             false => chip.bg(theme.tag_background).text_color(theme.foreground),
         });
     }
-    row.into_any_element()
+    row.child(right).into_any_element()
 }
 
 /// A section of the prune dialog that folds: a kind, or a status in it.

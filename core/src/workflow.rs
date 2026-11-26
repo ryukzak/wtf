@@ -889,20 +889,28 @@ fn remote_names(repo_path: &str) -> Result<Vec<String>, CoreError> {
 
 /// The local branch behind `origin/HEAD`, else `main` or `master`, else `HEAD`.
 fn main_branch(repo_path: &str) -> String {
+    // A branch or `origin/HEAD` that isn't there is an answer, not a
+    // failure for the terminal to show.
     let exists = |name: &str| {
-        git::run(
+        let reference = format!("refs/heads/{name}");
+        git::run_answer(
             repo_path,
-            &["rev-parse", "--verify", "-q", &format!("refs/heads/{name}")],
+            &["rev-parse", "--verify", "-q", &reference],
+            None,
+            &[],
         )
-        .is_ok()
+        .is_ok_and(|(yes, _)| yes)
     };
-    let origin = git::run(
+    let origin = git::run_answer(
         repo_path,
-        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+        &["symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"],
+        None,
+        &[],
     );
     let origin = origin
         .ok()
-        .and_then(|name| Some(name.trim().strip_prefix("origin/")?.to_string()));
+        .filter(|(yes, _)| *yes)
+        .and_then(|(_, name)| Some(name.trim().strip_prefix("origin/")?.to_string()));
     origin
         .into_iter()
         .chain(["main".to_string(), "master".to_string()])

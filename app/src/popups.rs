@@ -56,6 +56,31 @@ pub enum Target {
     Facts {
         facts: Vec<(String, String)>,
     },
+    /// Several commits of the commit list, or a section of it, oldest first,
+    /// each with its message.
+    Commits {
+        commits: Vec<(String, String)>,
+        /// What the menu's first line says of them, such as "4 commits · fix".
+        title: String,
+        /// A section: its newest commit can be checked out and branched from.
+        section: bool,
+    },
+    /// The branches no worktree has, to cherry-pick `commits` onto.
+    PickBranches {
+        commits: Vec<String>,
+    },
+}
+
+impl Target {
+    /// The commits a cherry-pick from this menu takes, oldest first.
+    pub fn picks(&self) -> Vec<String> {
+        match self {
+            Target::Commit { commit, .. } => vec![commit.clone()],
+            Target::Commits { commits, .. } => commits.iter().map(|(id, _)| id.clone()).collect(),
+            Target::PickBranches { commits } => commits.clone(),
+            _ => Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -106,6 +131,17 @@ pub enum Command {
     ToggleChannel,
     /// One of the facts of a `Target::Facts`.
     CopyFact(usize),
+    /// Cherry-picks the menu's commits in one of the worktrees.
+    CherryPick(usize),
+    /// Offers the branches no worktree has, to cherry-pick onto.
+    CherryPickInto,
+    /// Cherry-picks onto one of those branches, without checking it out.
+    CherryPickOnto(usize),
+    /// The menu's commits' full hashes, or messages, one a line.
+    CopyHashes,
+    CopyMessages,
+    /// The menu's title line, which does nothing.
+    Title,
 }
 
 /// The name attention knows a target by: its branch, or a detached
@@ -121,7 +157,11 @@ pub fn attention_name(target: &Target) -> String {
         Target::Commit { commit, .. } => commit.clone(),
         Target::Remote { remote, branch, .. } => format!("{remote}/{branch}"),
         Target::Tag { name, .. } | Target::Stash { name, .. } => name.clone(),
-        Target::Group { .. } | Target::File { .. } | Target::Facts { .. } => String::new(),
+        Target::Group { .. }
+        | Target::File { .. }
+        | Target::Facts { .. }
+        | Target::Commits { .. }
+        | Target::PickBranches { .. } => String::new(),
     }
 }
 
@@ -212,7 +252,9 @@ fn grouped(groups: Vec<Vec<(Command, Label)>>) -> Vec<Item> {
 /// into each worktree in `places`, the current one first; then copies;
 /// then what deletes. `recent` are the last Open With commands. The main
 /// branch and the main worktree, at `main_worktree`, cannot be renamed,
-/// deleted or removed.
+/// deleted or removed. `picks` are where commits can be cherry-picked:
+/// worktrees, or branches for the branch menu.
+#[allow(clippy::too_many_arguments)]
 pub fn commands(
     target: &Target,
     main: &str,
@@ -221,6 +263,7 @@ pub fn commands(
     shown: bool,
     overridden: bool,
     places: &[Place],
+    picks: &[Place],
 ) -> Vec<Item> {
     let copies = |name: bool, commit: &str| {
         let mut items = Vec::new();
@@ -249,6 +292,23 @@ pub fn commands(
             })
             .collect::<Vec<_>>()
     };
+    // Into each worktree, then onto a branch none has.
+    let cherry_picks = |count: usize| {
+        let verb = match count {
+            1 => "Cherry-pick".to_string(),
+            n => format!("Cherry-pick {n}"),
+        };
+        let mut items: Vec<_> = picks
+            .iter()
+            .enumerate()
+            .map(|(k, place)| at(Command::CherryPick(k), verb.clone(), Some(place)))
+            .collect();
+        items.push(text(
+            Command::CherryPickInto,
+            format!("{verb} into Branch…"),
+        ));
+        items
+    };
     match target {
         Target::Commit { commit, .. } => {
             let mut actions = switches(false);
@@ -256,7 +316,39 @@ pub fn commands(
             actions.push(text(Command::NewWorktree, "New Worktree…"));
             let mut copied = copies(false, commit);
             copied.push(text(Command::CopyMessage, "Copy Message"));
-            grouped(vec![actions, copied])
+            grouped(vec![actions, cherry_picks(1), copied])
+        }
+        Target::Commits {
+            commits,
+            title,
+            section,
+        } => {
+            let mut actions = Vec::new();
+            if *section {
+                actions = switches(false);
+                actions.push(text(Command::NewBranch, "New Branch…"));
+                actions.push(text(Command::NewWorktree, "New Worktree…"));
+            }
+            grouped(vec![
+                vec![text(Command::Title, title.clone())],
+                actions,
+                cherry_picks(commits.len()),
+                vec![
+                    text(Command::CopyHashes, "Copy SHAs"),
+                    text(Command::CopyMessages, "Copy Messages"),
+                ],
+            ])
+        }
+        // Every branch, by its name; the hint says how it would go.
+        Target::PickBranches { .. } => {
+            let mut items = vec![Some(text(Command::Title, "Cherry-pick onto"))];
+            items.extend(
+                picks
+                    .iter()
+                    .enumerate()
+                    .map(|(k, place)| Some(text(Command::CherryPickOnto(k), place.name.clone()))),
+            );
+            items
         }
         Target::Branch { name, commit, leaf } => {
             let mut actions = switches(true);
@@ -519,6 +611,46 @@ pub fn stash_apply(worktree: &str, stash: &str, pop: bool) -> String {
     format!("git -C {} stash {verb} {}", quote(worktree), quote(stash))
 }
 
+/// Cherry-picks `commits`, oldest first, in the worktree at `path`; with a
+/// merge among them, each goes as its changes from its first parent.
+pub fn cherry_pick(path: &str, commits: &[String], merges: bool) -> String {
+    let mut line = format!("git -C {} cherry-pick", quote(path));
+    if merges {
+        line.push_str(" -m 1");
+    }
+    for commit in commits {
+        line.push(' ');
+        line.push_str(&quote(commit));
+    }
+    line
+}
+
+/// Goes on with a stopped cherry-pick: `--continue` with the message the
+/// commit had, `--skip` or `--abort`.
+pub fn cherry_pick_step(path: &str, step: &str) -> String {
+    format!(
+        "git -C {} -c core.editor=true cherry-pick {step}",
+        quote(path)
+    )
+}
+
+/// A worktree at `path` for `branch`, and the cherry-pick in it.
+pub fn pick_in_new_worktree(
+    repo: &str,
+    path: &str,
+    branch: &str,
+    commits: &[String],
+    merges: bool,
+) -> String {
+    format!(
+        "git -C {} worktree add {} {} && {}",
+        quote(repo),
+        quote(path),
+        quote(branch),
+        cherry_pick(path, commits, merges)
+    )
+}
+
 pub fn stash_drop(repo: &str, stash: &str) -> String {
     format!("git -C {} stash drop {}", quote(repo), quote(stash))
 }
@@ -624,6 +756,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cherry_pick_lines() {
+        let picks = ["a1".to_string(), "b2".to_string()];
+        assert_eq!(
+            cherry_pick("/w t", &picks, false),
+            "git -C '/w t' cherry-pick a1 b2"
+        );
+        assert_eq!(
+            cherry_pick("/w", &picks[..1], true),
+            "git -C /w cherry-pick -m 1 a1"
+        );
+        assert_eq!(
+            cherry_pick_step("/w", "--continue"),
+            "git -C /w -c core.editor=true cherry-pick --continue"
+        );
+        assert_eq!(
+            pick_in_new_worktree("/r", "/r-fix", "fix", &picks[..1], false),
+            "git -C /r worktree add /r-fix fix && git -C /r-fix cherry-pick a1"
+        );
+    }
+
+    #[test]
     fn remote_branches_and_tags_have_their_own_menus() {
         let remote = Target::Remote {
             remote: "origin".to_string(),
@@ -646,7 +799,7 @@ mod tests {
     }
 
     fn labels(target: &Target) -> Vec<String> {
-        commands(target, "master", Some("/repo"), &[], true, false, &[])
+        commands(target, "master", Some("/repo"), &[], true, false, &[], &[])
             .into_iter()
             .map(|item| item.map_or("—".to_string(), |(_, label)| label.to_string()))
             .collect()
@@ -676,7 +829,7 @@ mod tests {
             leaf: Some(false),
         };
         assert!(has(&labels(&unmerged), "Delete with Commits…"));
-        let left_out: Vec<String> = commands(&feature, "master", None, &[], false, false, &[])
+        let left_out: Vec<String> = commands(&feature, "master", None, &[], false, false, &[], &[])
             .into_iter()
             .flatten()
             .map(|(_, label)| label.to_string())
@@ -771,7 +924,7 @@ mod tests {
             Place::new("wtf-x", false, true),
         ];
         let items: Vec<(Command, String)> =
-            commands(&branch, "master", None, &[], true, false, &places)
+            commands(&branch, "master", None, &[], true, false, &places, &[])
                 .into_iter()
                 .flatten()
                 .map(|(command, label)| (command, label.to_string()))
@@ -794,7 +947,7 @@ mod tests {
             Place::new("wtf", true, false),
             Place::new("wtf-x", false, false),
         ];
-        let labels: Vec<String> = commands(&commit, "master", None, &[], true, false, &places)
+        let labels: Vec<String> = commands(&commit, "master", None, &[], true, false, &places, &[])
             .into_iter()
             .map(|item| item.map_or("—".to_string(), |(_, label)| label.to_string()))
             .collect();
@@ -808,6 +961,66 @@ mod tests {
                 "—",
             ]
         );
+
+        // Cherry-picks go into each worktree, then onto a branch.
+        let labels: Vec<String> =
+            commands(&commit, "master", None, &[], true, false, &places, &places)
+                .into_iter()
+                .map(|item| item.map_or("—".to_string(), |(_, label)| label.to_string()))
+                .collect();
+        assert_eq!(
+            labels[5..9],
+            [
+                "Cherry-pick · wtf",
+                "Cherry-pick · wtf-x",
+                "Cherry-pick into Branch…",
+                "—",
+            ]
+        );
+
+        // Several commits: what they are, the picks and copies; a section's
+        // newest commit can be checked out too.
+        let commits = Target::Commits {
+            commits: vec![("a1".into(), "One".into()), ("b2".into(), "Two".into())],
+            title: "2 commits".into(),
+            section: false,
+        };
+        let labels: Vec<String> = commands(
+            &commits,
+            "master",
+            None,
+            &[],
+            true,
+            false,
+            &places,
+            &places[..1],
+        )
+        .into_iter()
+        .map(|item| item.map_or("—".to_string(), |(_, label)| label.to_string()))
+        .collect();
+        assert_eq!(
+            labels,
+            [
+                "2 commits",
+                "—",
+                "Cherry-pick 2 · wtf",
+                "Cherry-pick 2 into Branch…",
+                "—",
+                "Copy SHAs",
+                "Copy Messages",
+            ]
+        );
+        let section = Target::Commits {
+            commits: vec![("a1".into(), "One".into()), ("b2".into(), "Two".into())],
+            title: "2 commits · fix".into(),
+            section: true,
+        };
+        let labels: Vec<String> =
+            commands(&section, "master", None, &[], true, false, &places, &[])
+                .into_iter()
+                .map(|item| item.map_or("—".to_string(), |(_, label)| label.to_string()))
+                .collect();
+        assert_eq!(labels[2], "Checkout · wtf");
         assert_eq!(
             switch_detached("/my repo", "abc123"),
             "git -C '/my repo' switch --detach abc123"
@@ -852,11 +1065,12 @@ mod tests {
             leaf: None,
             stale: false,
         };
-        let labels: Vec<String> = commands(&worktree, "master", None, &recent, true, false, &[])
-            .into_iter()
-            .flatten()
-            .map(|(_, label)| label.to_string())
-            .collect();
+        let labels: Vec<String> =
+            commands(&worktree, "master", None, &recent, true, false, &[], &[])
+                .into_iter()
+                .flatten()
+                .map(|(_, label)| label.to_string())
+                .collect();
         assert!(labels.contains(&"Open with subl".to_string()));
         assert!(!labels.iter().any(|label| label.contains("Terminal")));
     }
@@ -869,7 +1083,7 @@ mod tests {
                 path: "/repo/src/main.rs".to_string(),
                 exists,
             };
-            commands(&file, "main", None, &[], true, false, &[])
+            commands(&file, "main", None, &[], true, false, &[], &[])
                 .into_iter()
                 .map(|item| item.map_or("—".to_string(), |(_, label)| label.to_string()))
                 .collect()
@@ -896,7 +1110,7 @@ mod tests {
                 ("Author".to_string(), "Ann".to_string()),
             ],
         };
-        let labels: Vec<String> = commands(&facts, "main", None, &[], true, false, &[])
+        let labels: Vec<String> = commands(&facts, "main", None, &[], true, false, &[], &[])
             .into_iter()
             .map(|item| item.map_or("—".to_string(), |(_, label)| label.to_string()))
             .collect();

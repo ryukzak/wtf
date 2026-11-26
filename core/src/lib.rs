@@ -4,6 +4,7 @@ mod console;
 mod difft;
 mod git;
 mod patch;
+mod pick;
 mod project;
 mod submodule;
 mod summary;
@@ -23,6 +24,7 @@ pub use git::{
     changed_files, commit, discard, discard_lines, head_message, push, range_commits, reword,
     stage, stage_lines, stash_files, unstage, worktree_status,
 };
+pub use pick::{Forecast, has_commit, has_merges, pick_forecast, pick_onto_branch, picking};
 pub use project::{ConfigScope, project_value, project_values, set_project_values};
 pub use tools::{ToolCheck, check_tools};
 pub use workflow::{Branch, GraphNode, NodeKind, WorkflowGraph};
@@ -283,6 +285,8 @@ pub struct WorktreeStatus {
     /// Submodules with changes of their own but where the index has them:
     /// nothing for this repository to commit.
     pub inside: Vec<String>,
+    /// A cherry-pick stopped here and waits to go on, or to be undone.
+    pub picking: bool,
 }
 
 /// Fetches every remote of a repository. A background fetch is logged as

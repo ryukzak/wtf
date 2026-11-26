@@ -1321,7 +1321,7 @@ const FACTS_WIDTH: f32 = 290.;
 const FACT_NAME_WIDTH: f32 = 52.;
 
 /// Lines added and removed, as the facts count them.
-const ADDED: gpui::Hsla = gpui::Hsla {
+pub(super) const ADDED: gpui::Hsla = gpui::Hsla {
     h: 0.38,
     s: 0.55,
     l: 0.4,

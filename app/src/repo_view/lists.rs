@@ -530,11 +530,26 @@ impl RepoView {
             true => item,
             false => guide(item, covered, true, None, theme),
         };
-        // Its menu is its newest commit's: check it out, branch from it.
-        let menu = node.commits.last().map(|newest| Target::Commit {
-            commit: newest.id.clone(),
-            message: full_message(newest),
-        });
+        // Its menu acts on all its commits; what takes one, such as a
+        // checkout, takes its newest.
+        let menu = match &node.commits[..] {
+            [] => None,
+            [only] => Some(Target::Commit {
+                commit: only.id.clone(),
+                message: full_message(only),
+            }),
+            commits => Some(Target::Commits {
+                title: match &node.branch {
+                    Some(branch) => format!("{} commits · {branch}", commits.len()),
+                    None => format!("{} commits", commits.len()),
+                },
+                commits: commits
+                    .iter()
+                    .map(|c| (c.id.clone(), full_message(c)))
+                    .collect(),
+                section: true,
+            }),
+        };
         let item = match menu {
             Some(target) => item.on_mouse_down(
                 MouseButton::Right,

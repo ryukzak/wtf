@@ -350,6 +350,20 @@ type LayoutKey = (
     i64,
 );
 
+/// A worktree, or a branch no worktree has, the context menu's commits can
+/// be cherry-picked into.
+#[derive(Debug, Clone)]
+pub(super) struct PickPlace {
+    pub place: popups::Place,
+    /// The worktree's path; none for a branch, named by the place.
+    pub path: Option<String>,
+    /// How it would go, such as "clean"; none while it is worked out.
+    pub hint: Option<String>,
+}
+
+/// How many branches "Cherry-pick into Branch…" offers.
+const PICK_BRANCHES: usize = 12;
+
 pub struct RepoView {
     /// Keeps menu actions reaching the view when nothing else has focus.
     focus: FocusHandle,
@@ -531,6 +545,15 @@ pub struct RepoView {
     worktree_split: Option<usize>,
     /// Submodules of the worktree in review changed only inside.
     submodules_inside: Vec<String>,
+    /// The staged worktree has a cherry-pick stopped in it.
+    picking: bool,
+    /// Where the context menu's commits can be cherry-picked, with what
+    /// each would do once worked out.
+    pick_places: Vec<PickPlace>,
+    /// Branches no worktree has, for "Cherry-pick into Branch…".
+    pick_branches: Vec<PickPlace>,
+    /// Counts menus opened, so a forecast for one gone is dropped.
+    pick_generation: usize,
     /// Diff rows picked for staging, all in one file.
     line_selection: Option<(usize, Vec<usize>)>,
     line_anchor: Option<usize>,
@@ -788,6 +811,10 @@ impl RepoView {
             stacked_files: Vec::new(),
             worktree_split: None,
             submodules_inside: Vec::new(),
+            picking: false,
+            pick_places: Vec::new(),
+            pick_branches: Vec::new(),
+            pick_generation: 0,
             line_selection: None,
             line_anchor: None,
             line_drag: None,
@@ -2062,17 +2089,17 @@ impl RepoView {
         let load = cx.background_executor().spawn(async move {
             if let Some(stash) = stash {
                 return wtf_core::stash_files(&repo_path, &stash)
-                    .map(|(files, split)| (files, Some(split), Vec::new()));
+                    .map(|(files, split)| (files, Some(split), (Vec::new(), false)));
             }
             match worktree {
                 Some(path) => wtf_core::worktree_status(&path).map(|status| {
                     let split = status.unstaged.len();
                     let mut files = status.unstaged;
                     files.extend(status.staged);
-                    (files, Some(split), status.inside)
+                    (files, Some(split), (status.inside, status.picking))
                 }),
                 None => wtf_core::changed_files(&repo_path, base.as_deref(), &tip)
-                    .map(|files| (files, None, Vec::new())),
+                    .map(|files| (files, None, (Vec::new(), false))),
             }
         });
         self.files_task = Some(cx.spawn(async move |this, cx| {
@@ -2080,11 +2107,12 @@ impl RepoView {
             this.update(cx, |this, cx| {
                 this.files_task = None;
                 match result {
-                    Ok((files, split, inside)) => {
+                    Ok((files, split, (inside, picking))) => {
                         this.files = files;
                         this.note_wrapped_files();
                         this.worktree_split = split;
                         this.submodules_inside = inside;
+                        this.picking = picking;
                         this.error_message = None;
                         let kept = keep.and_then(|path| {
                             this.files.iter().position(|file| file.path() == path)
@@ -2679,7 +2707,10 @@ impl RepoView {
                 .on_scroll_wheel(cx.listener(Self::scroll_diff_sideways))
                 .when(
                     self.worktree_split.is_some() && self.stash_view.is_none(),
-                    |pane| pane.child(self.commit_box(theme, window, cx)),
+                    |pane| {
+                        pane.children(self.picking_bar(theme, cx))
+                            .child(self.commit_box(theme, window, cx))
+                    },
                 )
                 .child(self.under_header(
                     list.into_any_element(),
