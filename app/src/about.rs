@@ -7,8 +7,8 @@ use crate::preferences;
 use crate::theme::Theme;
 use crate::workspace::{CloseTab, CloseWindow};
 
-/// The app's icon, drawn as the Dock's is.
-const ICON: &[u8] = include_bytes!("../icon/icon.svg");
+/// The app's icon, rendered as the Dock's is: gpui draws no SVG text.
+const ICON: &[u8] = include_bytes!("../icon/icon.png");
 
 /// Where the project lives, as Cargo.toml says.
 const REPOSITORY: &str = env!("CARGO_PKG_REPOSITORY");
@@ -67,10 +67,10 @@ impl Render for About {
             .text_color(theme.foreground)
             .font_family(preferences::ui_font())
             .text_sm()
-            // The app's icon, from the same drawing the Dock's is made of.
+            // The app's icon, the same picture the Dock shows.
             .child(
                 gpui::img(std::sync::Arc::new(gpui::Image::from_bytes(
-                    gpui::ImageFormat::Svg,
+                    gpui::ImageFormat::Png,
                     ICON.to_vec(),
                 )))
                 .size(px(128.)),
