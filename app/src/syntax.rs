@@ -51,29 +51,15 @@ fn theme(dark: bool) -> &'static Theme {
 
 /// Colors a file's diff, or nothing for a file no grammar knows.
 pub fn colors(path: &str, diff: &FileDiff, dark: bool) -> Colors {
-    let extension = Path::new(path)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .unwrap_or_default();
-    let name = Path::new(path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default();
     // By extension, then by whole name, such as `Makefile`, then by a first
     // line such as a shebang.
-    let first_line = || {
-        let side = diff
-            .rows
-            .iter()
-            .find_map(|row| row.right.as_ref().or(row.left.as_ref()));
-        side.filter(|side| side.line_number == 1)
-            .map_or("", |side| side.text.as_str())
-    };
-    let Some(syntax) = SYNTAXES
-        .find_syntax_by_extension(extension)
-        .or_else(|| SYNTAXES.find_syntax_by_extension(name))
-        .or_else(|| SYNTAXES.find_syntax_by_first_line(first_line()))
-    else {
+    let first_line = diff
+        .rows
+        .iter()
+        .find_map(|row| row.right.as_ref().or(row.left.as_ref()))
+        .filter(|side| side.line_number == 1)
+        .map_or("", |side| side.text.as_str());
+    let Some(syntax) = syntax_for(path, first_line) else {
         return Colors::default();
     };
     let side = |pick: fn(&wtf_core::DiffRow) -> Option<&DiffSide>| {
@@ -111,10 +97,93 @@ pub fn colors(path: &str, diff: &FileDiff, dark: bool) -> Colors {
     }
 }
 
+/// The grammar for a file, by its extension, its whole name such as
+/// `Makefile`, or its first line such as a shebang.
+fn syntax_for(path: &str, first_line: &str) -> Option<&'static syntect::parsing::SyntaxReference> {
+    let extension = Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default();
+    let name = Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    // Grammars syntect lacks, read as the nearest it has: TypeScript as
+    // JavaScript.
+    let near = match extension {
+        "ts" | "tsx" | "mts" | "cts" => "js",
+        _ => extension,
+    };
+    SYNTAXES
+        .find_syntax_by_extension(extension)
+        .or_else(|| SYNTAXES.find_syntax_by_extension(name))
+        .or_else(|| SYNTAXES.find_syntax_by_extension(near))
+        .or_else(|| SYNTAXES.find_syntax_by_first_line(first_line))
+}
+
+/// Colors for a whole text, as a file at `path`, by byte ranges of it;
+/// none for a file no grammar knows.
+pub fn text_colors(path: &str, text: &str, dark: bool) -> Spans {
+    let first = text.lines().next().unwrap_or_default();
+    let Some(syntax) = syntax_for(path, first) else {
+        return Spans::new();
+    };
+    let mut lines = HighlightLines::new(syntax, theme(dark));
+    let mut spans = Spans::new();
+    let mut at = 0;
+    for line in text.split_inclusive('\n') {
+        // The grammars expect each line to end with its line break.
+        let owned;
+        let shown = match line.ends_with('\n') {
+            true => line,
+            false => {
+                owned = format!("{line}\n");
+                &owned
+            }
+        };
+        let Ok(styled) = lines.highlight_line(shown, &SYNTAXES) else {
+            break;
+        };
+        let mut offset = at;
+        for (style, run) in styled {
+            let end = (offset + run.len()).min(at + line.trim_end_matches('\n').len());
+            if offset < end {
+                let color = style.foreground;
+                let rgba = u32::from_be_bytes([color.r, color.g, color.b, color.a]);
+                let mut color: Hsla = gpui::rgba(rgba).into();
+                if dark {
+                    color.l = color.l.max(MIN_DARK_LIGHTNESS);
+                }
+                spans.push((offset..end, color));
+            }
+            offset += run.len();
+        }
+        at += line.len();
+    }
+    spans
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use wtf_core::DiffRow;
+
+    #[test]
+    fn colors_a_whole_text_by_its_bytes() {
+        let text = "fn main() {\n    let s = \"hi\";\n}";
+        let spans = text_colors("a.rs", text, false);
+        // Every run lies inside the text, on one line.
+        assert!(
+            spans
+                .iter()
+                .all(|(r, _)| r.end <= text.len() && !text[r.clone()].contains('\n'))
+        );
+        let string = text.find("\"hi\"").unwrap();
+        assert!(spans.iter().any(|(r, _)| r.contains(&string)));
+        assert!(text_colors("notes.unknownext", text, false).is_empty());
+        // TypeScript reads as JavaScript.
+        assert!(!text_colors("a.ts", "const s = \"hi\";", false).is_empty());
+    }
 
     #[test]
     fn colors_known_code_and_skips_the_rest() {

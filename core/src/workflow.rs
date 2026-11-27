@@ -787,7 +787,8 @@ fn tips(
             remote,
             ..Branch::default()
         };
-        branch.shown = attention.shows_branch(&branch, now);
+        // A rewrite's progress always shows, whatever the filters.
+        branch.shown = name == crate::plan::REWRITE_BRANCH || attention.shows_branch(&branch, now);
         if branch.shown {
             tips.push(Tip {
                 name: name.to_string(),
@@ -797,6 +798,15 @@ fn tips(
             });
         }
         branches.push(branch);
+    }
+    // A rewrite's progress claims its lane last: its commits are its own,
+    // and the branch it rewrites keeps its own commits under it.
+    if let Some(at) = tips
+        .iter()
+        .position(|tip| tip.name == crate::plan::REWRITE_BRANCH)
+    {
+        let tip = tips.remove(at);
+        tips.push(tip);
     }
     // The main branch first, then the newest.
     branches.sort_by_key(|branch| (branch.name != main, std::cmp::Reverse(branch.time)));
@@ -889,20 +899,28 @@ fn remote_names(repo_path: &str) -> Result<Vec<String>, CoreError> {
 
 /// The local branch behind `origin/HEAD`, else `main` or `master`, else `HEAD`.
 fn main_branch(repo_path: &str) -> String {
+    // A branch or `origin/HEAD` that isn't there is an answer, not a
+    // failure for the terminal to show.
     let exists = |name: &str| {
-        git::run(
+        let reference = format!("refs/heads/{name}");
+        git::run_answer(
             repo_path,
-            &["rev-parse", "--verify", "-q", &format!("refs/heads/{name}")],
+            &["rev-parse", "--verify", "-q", &reference],
+            None,
+            &[],
         )
-        .is_ok()
+        .is_ok_and(|(yes, _)| yes)
     };
-    let origin = git::run(
+    let origin = git::run_answer(
         repo_path,
-        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+        &["symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"],
+        None,
+        &[],
     );
     let origin = origin
         .ok()
-        .and_then(|name| Some(name.trim().strip_prefix("origin/")?.to_string()));
+        .filter(|(yes, _)| *yes)
+        .and_then(|(_, name)| Some(name.trim().strip_prefix("origin/")?.to_string()));
     origin
         .into_iter()
         .chain(["main".to_string(), "master".to_string()])
@@ -1162,6 +1180,29 @@ mod tests {
         fixture.commit(".", "b.txt", "x\ny\n", "f2");
         fixture.git(".", &["checkout", "-q", "master"]);
         fixture
+    }
+
+    #[test]
+    fn a_rewrite_has_its_own_lane_and_leaves_the_branch_its_commits() {
+        // The rewrite of feature after f1: f2 again, as a new commit, newer
+        // than everything, on the WTF-REWRITE branch.
+        let fixture = forked();
+        fixture.git(".", &["checkout", "-q", "-b", "WTF-REWRITE", "feature~1"]);
+        fixture.commit(".", "b.txt", "x\ny\nz\n", "f2 again");
+        fixture.git(".", &["checkout", "-q", "master"]);
+        let graph = fixture.graph();
+        let (_, feature) = node(&graph, "feature");
+        assert_eq!(summaries(feature), vec!["f2"]);
+        let (_, rewrite) = node(&graph, "WTF-REWRITE");
+        assert_eq!(summaries(rewrite), vec!["f2 again"]);
+        assert_ne!(rewrite.lane, feature.lane);
+        // f1 stays with feature, not taken by the newer rewrite.
+        let f1 = graph
+            .nodes
+            .iter()
+            .find(|n| summaries(n).contains(&"f1"))
+            .unwrap();
+        assert_eq!(f1.lane, feature.lane);
     }
 
     #[test]

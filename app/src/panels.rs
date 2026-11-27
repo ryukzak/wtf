@@ -12,6 +12,7 @@ pub struct Sizes {
     pub graph: Option<f32>,
     pub commits: f32,
     pub snapshot_header: Option<f32>,
+    pub commit_header: Option<f32>,
 }
 
 /// The sizes saved, each over its default in `sizes` when there is one.
@@ -40,6 +41,9 @@ fn format(sizes: Sizes) -> String {
     if let Some(header) = sizes.snapshot_header {
         text.push_str(&format!("snapshot_header={header}\n"));
     }
+    if let Some(header) = sizes.commit_header {
+        text.push_str(&format!("commit_header={header}\n"));
+    }
     text
 }
 
@@ -61,6 +65,10 @@ fn parse(text: &str, defaults: Sizes) -> Sizes {
             .get("snapshot_header")
             .copied()
             .or(defaults.snapshot_header),
+        commit_header: values
+            .get("commit_header")
+            .copied()
+            .or(defaults.commit_header),
     }
 }
 
@@ -76,10 +84,12 @@ mod tests {
             graph: None,
             commits: 300.,
             snapshot_header: None,
+            commit_header: None,
         };
         let dragged = Sizes {
             graph: Some(340.),
             commits: 420.,
+            commit_header: Some(120.),
             ..defaults
         };
         assert_eq!(parse(&format(dragged), defaults), dragged);

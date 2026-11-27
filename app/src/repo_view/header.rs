@@ -256,16 +256,87 @@ impl RepoView {
             .flex_col()
             .size_full()
             .when(self.range.is_some(), |pane| {
-                pane.child(self.commit_header(theme, window, cx))
+                pane.child(self.sized_header(theme, window, cx))
             })
             .child(div().flex_1().min_h_0().child(content))
+            .into_any_element()
+    }
+
+    /// How tall the commit header stands over the diff: its content's
+    /// height, or less when dragged shorter.
+    pub(super) fn shown_header_height(&self) -> f32 {
+        match self.commit_header_height {
+            Some(limit) => limit.min(self.header_height),
+            None => self.header_height,
+        }
+    }
+
+    /// The commit header, as tall as its content or as dragged: its bottom
+    /// edge drags, and a longer message scrolls inside. A double click on
+    /// the edge fits the content again.
+    pub(super) fn sized_header(
+        &self,
+        theme: &Theme,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let limit = self.commit_header_height;
+        let shown = self.shown_header_height();
+        div()
+            .relative()
+            .flex_none()
+            .child(
+                div()
+                    .id("commit-header-box")
+                    .when_some(limit, |header, limit| {
+                        header.max_h(px(limit)).overflow_y_scroll()
+                    })
+                    .child(self.commit_header(theme, window, cx)),
+            )
+            .child(
+                div()
+                    .id("commit-header-grip")
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .bottom(px(-5.))
+                    .h(px(10.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor(CursorStyle::ResizeUpDown)
+                    .hover(|grip| grip.bg(theme.selection))
+                    // The same grip the panels' borders have, on the edge.
+                    .child(
+                        div()
+                            .w(px(36.))
+                            .h(px(4.))
+                            .rounded(px(2.))
+                            .bg(theme.secondary),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            this.dragging = Some(Border::CommitHeader);
+                            this.header_drag = Some((f32::from(event.position.y), shown));
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                        if event.click_count() == 2 {
+                            this.commit_header_height = None;
+                            crate::panels::save(this.panel_sizes());
+                            cx.notify();
+                        }
+                    })),
+            )
             .into_any_element()
     }
 
     /// Diff rows the commit header covers before the first real one.
     pub(super) fn header_rows(&self) -> usize {
         match self.range {
-            Some(_) => (self.header_height / diff_view::row_height()).ceil() as usize,
+            Some(_) => (self.shown_header_height() / diff_view::row_height()).ceil() as usize,
             None => 0,
         }
     }
@@ -1228,14 +1299,14 @@ impl RepoView {
             .overflow_hidden()
             .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
             .child(list)
-            .when(header && scroll_y < self.header_height, |pane| {
+            .when(header && scroll_y < self.shown_header_height(), |pane| {
                 pane.child(
                     div()
                         .absolute()
                         .top(px(-scroll_y))
                         .left_0()
                         .right_0()
-                        .child(self.commit_header(theme, window, cx)),
+                        .child(self.sized_header(theme, window, cx)),
                 )
             })
             .children(pinned.map(|(pinned, push)| {
@@ -1321,7 +1392,7 @@ const FACTS_WIDTH: f32 = 290.;
 const FACT_NAME_WIDTH: f32 = 52.;
 
 /// Lines added and removed, as the facts count them.
-const ADDED: gpui::Hsla = gpui::Hsla {
+pub(super) const ADDED: gpui::Hsla = gpui::Hsla {
     h: 0.38,
     s: 0.55,
     l: 0.4,

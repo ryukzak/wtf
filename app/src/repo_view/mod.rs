@@ -38,6 +38,7 @@ mod graph_band;
 mod header;
 mod lists;
 mod overlays;
+mod plan_panel;
 mod search;
 mod stack;
 mod staging;
@@ -48,6 +49,7 @@ mod widgets;
 
 use attention_panel::*;
 use header::*;
+use plan_panel::*;
 use time::*;
 use trees::*;
 use widgets::*;
@@ -258,6 +260,8 @@ enum Border {
     Commits,
     /// The commit header over a snapshot's file.
     SnapshotHeader,
+    /// The commit header over a diff.
+    CommitHeader,
 }
 
 /// How long diff lines show.
@@ -279,6 +283,9 @@ enum SidePanel {
     /// The changed files as a tree: a table of contents for the changes, or
     /// the file a snapshot shows.
     Files,
+    /// Changes to history, worked out before they are applied: the
+    /// Rewrite tab.
+    Plan,
 }
 
 /// A row of a branch tree: a folder of branch names, or a branch.
@@ -349,6 +356,20 @@ type LayoutKey = (
     bool,
     i64,
 );
+
+/// A worktree, or a branch no worktree has, the context menu's commits can
+/// be cherry-picked into.
+#[derive(Debug, Clone)]
+pub(super) struct PickPlace {
+    pub place: popups::Place,
+    /// The worktree's path; none for a branch, named by the place.
+    pub path: Option<String>,
+    /// How it would go, such as "clean"; none while it is worked out.
+    pub hint: Option<String>,
+}
+
+/// How many branches "Cherry-pick into Branch…" offers.
+const PICK_BRANCHES: usize = 12;
 
 pub struct RepoView {
     /// Keeps menu actions reaching the view when nothing else has focus.
@@ -531,6 +552,24 @@ pub struct RepoView {
     worktree_split: Option<usize>,
     /// Submodules of the worktree in review changed only inside.
     submodules_inside: Vec<String>,
+    /// The staged worktree has a cherry-pick stopped in it.
+    picking: bool,
+    /// Where the context menu's commits can be cherry-picked, with what
+    /// each would do once worked out.
+    pick_places: Vec<PickPlace>,
+    /// Branches no worktree has, for "Cherry-pick into Branch…".
+    pick_branches: Vec<PickPlace>,
+    /// Counts menus opened, so a forecast for one gone is dropped.
+    pick_generation: usize,
+    /// Changes to history being prepared in the Rewrite tab.
+    plan: Option<PlanView>,
+    /// The middle's editor of a plan's code and messages.
+    plan_focus: FocusHandle,
+    /// Works the plan out again once typing pauses.
+    plan_typing: Option<Task<()>>,
+    /// A notice of a change done at once, and its timer.
+    toast: Option<Toast>,
+    toast_task: Option<Task<()>>,
     /// Diff rows picked for staging, all in one file.
     line_selection: Option<(usize, Vec<usize>)>,
     line_anchor: Option<usize>,
@@ -648,6 +687,9 @@ pub struct RepoView {
     /// The commit header's height over a snapshot's file, as dragged; and
     /// where a drag of its edge began, with the height then.
     snapshot_header_height: Option<f32>,
+    /// How tall the commit header over a diff may stand, as dragged; `None`
+    /// fits its content.
+    commit_header_height: Option<f32>,
     header_drag: Option<(f32, f32)>,
     dragging: Option<Border>,
     commits_width: f32,
@@ -688,6 +730,7 @@ impl RepoView {
             graph: None,
             commits: 300.,
             snapshot_header: None,
+            commit_header: None,
         });
         Self {
             focus,
@@ -788,6 +831,15 @@ impl RepoView {
             stacked_files: Vec::new(),
             worktree_split: None,
             submodules_inside: Vec::new(),
+            picking: false,
+            pick_places: Vec::new(),
+            pick_branches: Vec::new(),
+            pick_generation: 0,
+            plan: None,
+            plan_focus: cx.focus_handle(),
+            plan_typing: None,
+            toast: None,
+            toast_task: None,
             line_selection: None,
             line_anchor: None,
             line_drag: None,
@@ -849,6 +901,7 @@ impl RepoView {
             terminal: None,
             graph_height: sizes.graph,
             snapshot_header_height: sizes.snapshot_header,
+            commit_header_height: sizes.commit_header,
             header_drag: None,
             dragging: None,
             commits_width: sizes.commits,
@@ -1435,6 +1488,17 @@ impl RepoView {
         }
         self.graph = graph;
         self.graph_layout.take();
+        // Plans live as long as the app: a progress branch with none open
+        // is left from a run before, and goes.
+        let wip = wtf_core::plan::REWRITE_BRANCH;
+        if self.plan.is_none()
+            && let Some(repo) = self.repo_path.clone()
+            && self.graph.branches.iter().any(|branch| branch.name == wip)
+        {
+            cx.background_executor()
+                .spawn(async move { wtf_core::plan::mark_wip(&repo, wip, None) })
+                .detach();
+        }
         // Drafts of worktrees the graph no longer has go, so a new one at
         // the same path starts empty.
         let worktrees: HashSet<&str> = self
@@ -1795,6 +1859,10 @@ impl RepoView {
     fn set_selection(&mut self, selected: Vec<usize>, cx: &mut Context<Self>) {
         // A selection made gives up one waiting to come back.
         self.restore_keys.clear();
+        // Anything else selected takes the middle back from a plan's merge.
+        if let Some(view) = self.plan.as_mut() {
+            view.middle = false;
+        }
         // The last worktree among those selected becomes the current one.
         if let Some(path) =
             selected
@@ -2062,17 +2130,17 @@ impl RepoView {
         let load = cx.background_executor().spawn(async move {
             if let Some(stash) = stash {
                 return wtf_core::stash_files(&repo_path, &stash)
-                    .map(|(files, split)| (files, Some(split), Vec::new()));
+                    .map(|(files, split)| (files, Some(split), (Vec::new(), false)));
             }
             match worktree {
                 Some(path) => wtf_core::worktree_status(&path).map(|status| {
                     let split = status.unstaged.len();
                     let mut files = status.unstaged;
                     files.extend(status.staged);
-                    (files, Some(split), status.inside)
+                    (files, Some(split), (status.inside, status.picking))
                 }),
                 None => wtf_core::changed_files(&repo_path, base.as_deref(), &tip)
-                    .map(|files| (files, None, Vec::new())),
+                    .map(|files| (files, None, (Vec::new(), false))),
             }
         });
         self.files_task = Some(cx.spawn(async move |this, cx| {
@@ -2080,11 +2148,12 @@ impl RepoView {
             this.update(cx, |this, cx| {
                 this.files_task = None;
                 match result {
-                    Ok((files, split, inside)) => {
+                    Ok((files, split, (inside, picking))) => {
                         this.files = files;
                         this.note_wrapped_files();
                         this.worktree_split = split;
                         this.submodules_inside = inside;
+                        this.picking = picking;
                         this.error_message = None;
                         let kept = keep.and_then(|path| {
                             this.files.iter().position(|file| file.path() == path)
@@ -2279,9 +2348,11 @@ impl RepoView {
 
     /// The panels open, by name, for the session to bring back.
     pub fn open_panels(&self) -> Vec<String> {
-        let side = self.side_panel.map(|panel| match panel {
-            SidePanel::Attention => "attention",
-            SidePanel::Files => "files",
+        // A plan is worked out anew, so its panel is not brought back.
+        let side = self.side_panel.and_then(|panel| match panel {
+            SidePanel::Attention => Some("attention"),
+            SidePanel::Files => Some("files"),
+            SidePanel::Plan => None,
         });
         let console = self.console_open.then_some("console");
         side.into_iter()
@@ -2366,6 +2437,13 @@ impl RepoView {
                     self.snapshot_header_height = Some((start + y - from).clamp(2. * lines, max));
                 }
             }
+            Border::CommitHeader => {
+                if let Some((from, start)) = self.header_drag {
+                    let lines = HEADER_LINE * preferences::ui_size();
+                    let least = 2. * HEADER_PADDING + 2. * lines;
+                    self.commit_header_height = Some((start + y - from).clamp(least, max));
+                }
+            }
             Border::Dock => self.dock_height = (height - y).clamp(MIN_PANEL_HEIGHT, max),
             Border::Graph => {
                 let top = workspace::TAB_BAR_HEIGHT;
@@ -2413,6 +2491,7 @@ impl RepoView {
             graph: self.graph_height,
             commits: self.commits_width,
             snapshot_header: self.snapshot_header_height,
+            commit_header: self.commit_header_height,
         }
     }
 
@@ -2545,6 +2624,10 @@ impl RepoView {
         if self.repo_path.is_none() {
             let hint = "Open a Git repository to review its commits.";
             return placeholder("No repository", Some(hint.into()), theme);
+        }
+        // A plan's step: its conflicts, message or files.
+        if let Some(step) = self.plan_middle_view(theme, window, cx) {
+            return step;
         }
         if self.snapshot_mode {
             let view = self.snapshot_view(theme, window, cx);
@@ -2679,7 +2762,10 @@ impl RepoView {
                 .on_scroll_wheel(cx.listener(Self::scroll_diff_sideways))
                 .when(
                     self.worktree_split.is_some() && self.stash_view.is_none(),
-                    |pane| pane.child(self.commit_box(theme, window, cx)),
+                    |pane| {
+                        pane.children(self.picking_bar(theme, cx))
+                            .child(self.commit_box(theme, window, cx))
+                    },
                 )
                 .child(self.under_header(
                     list.into_any_element(),
@@ -2846,6 +2932,7 @@ impl RepoView {
                     })
                     .into_any_element(),
             ),
+            Some(SidePanel::Plan) => Some(self.plan_panel_view(theme, cx)),
             None => None,
         };
         div()
@@ -2907,6 +2994,7 @@ impl RepoView {
             })
             .child(tab(SidePanel::Attention, "Attention"))
             .child(tab(SidePanel::Files, "Files"))
+            .child(tab(SidePanel::Plan, "Rewrite"))
             .child(div().w(px(16.)).h(px(1.)).bg(theme.separator))
             .child(self.view_toggles(theme, window, cx))
             .child(div().flex_1())
@@ -2991,7 +3079,7 @@ type DiffRange = (Option<String>, Revision);
 impl Render for RepoView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // An open prompt's caret blinks, from when it opened or was typed in.
-        if self.prompt.is_some() && self.blink_task.is_none() {
+        if (self.prompt.is_some() || self.plan_editing()) && self.blink_task.is_none() {
             self.blink(cx);
         }
         let theme = Theme::for_appearance(window.appearance());
@@ -3126,7 +3214,9 @@ impl Render for RepoView {
                 .any(|focus| focus.is_focused(window));
                 // ⌘C copies picked diff lines' code, while no text field has
                 // the keys.
-                let editing = typing || this.commit_focus.is_focused(window);
+                let editing = typing
+                    || this.commit_focus.is_focused(window)
+                    || this.plan_focus.is_focused(window);
                 if keystroke.key == "c"
                     && keystroke.modifiers.platform
                     && !keystroke.modifiers.shift
@@ -3285,6 +3375,7 @@ impl Render for RepoView {
             })
             .children(self.context_menu_view(&theme, cx))
             .children(self.notice_view(&theme, cx))
+            .children(self.toast_view(&theme, cx))
             .children(self.dropdown_view(&theme, cx))
             .children(self.prompt_view(&theme, window, cx))
             .children(self.goto_view(&theme, window, cx))
