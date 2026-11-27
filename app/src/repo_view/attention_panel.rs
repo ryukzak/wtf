@@ -755,15 +755,20 @@ impl RepoView {
                     self.one_column.get(),
                     self.diff_mode == DiffMode::Structural,
                     self.diff_mode == DiffMode::Text,
-                    self.wrap_lines,
-                    !self.wrap_lines,
+                    self.wrap == WrapMode::Wrap,
+                    self.wrap == WrapMode::Auto,
+                    self.wrap == WrapMode::NoWrap,
                 ];
+                // Where each pair's first mode is among the checks.
+                let first = |pair: usize| -> usize {
+                    header::STRIP_PAIRS[..pair].iter().map(|names| names.len()).sum()
+                };
                 for (pair, names) in header::STRIP_PAIRS.iter().enumerate().skip(*shown) {
                     if pair > *shown {
                         menu = menu.child(div().my(px(4.)).h(px(1.)).bg(theme.separator));
                     }
                     for (k, name) in names.iter().enumerate() {
-                        let at = pair * 2 + k;
+                        let at = first(pair) + k;
                         menu =
                             menu.child(item(("mode", at), checks[at], name.to_string()).on_click(
                                 cx.listener(move |this, _, window, cx| {
@@ -773,7 +778,9 @@ impl RepoView {
                                         2 | 3 => this.set_unified(at == 3, window, cx),
                                         4 => this.set_diff_mode(DiffMode::Structural, cx),
                                         5 => this.set_diff_mode(DiffMode::Text, cx),
-                                        _ => this.set_wrap_lines(at == 6, window, cx),
+                                        6 => this.set_wrap(WrapMode::Wrap, window, cx),
+                                        7 => this.set_wrap(WrapMode::Auto, window, cx),
+                                        _ => this.set_wrap(WrapMode::NoWrap, window, cx),
                                     }
                                     cx.notify();
                                 }),

@@ -256,6 +256,18 @@ enum Border {
     SnapshotHeader,
 }
 
+/// How long diff lines show.
+#[derive(Clone, Copy, PartialEq)]
+enum WrapMode {
+    /// Every file's wrap.
+    Wrap,
+    /// Those of the files Settings always wrap, such as Markdown, wrap;
+    /// others run on and scroll sideways.
+    Auto,
+    /// None wrap: all run on.
+    NoWrap,
+}
+
 /// The panels the strip at the right edge opens, one at a time.
 #[derive(Clone, Copy, PartialEq)]
 enum SidePanel {
@@ -459,7 +471,7 @@ pub struct RepoView {
     selected_file: Option<usize>,
     diff_mode: DiffMode,
     /// Long diff lines wrap; otherwise they run on and scroll sideways.
-    wrap_lines: bool,
+    wrap: WrapMode,
     /// Diffs in one column or split, as chosen by hand; `None` to go by
     /// the room there is.
     unified: Option<bool>,
@@ -477,6 +489,8 @@ pub struct RepoView {
     /// holds, which the wrapped all-files view is laid out at.
     diff_width: Cell<(f32, f32)>,
     wrap_cols: Option<usize>,
+    /// Files whose lines wrap whatever is chosen, by their place in `files`.
+    wrapped_files: Vec<bool>,
     stacked: Vec<StackItem>,
     /// The longest line among the rows the stack shows, in characters: as
     /// far as its code scrolls sideways.
@@ -720,7 +734,7 @@ impl RepoView {
             diff: None,
             selected_file: None,
             diff_mode: DiffMode::Text,
-            wrap_lines: false,
+            wrap: WrapMode::Auto,
             unified: None,
             one_column_by_room: Cell::new(None),
             one_column: Cell::new(false),
@@ -729,6 +743,7 @@ impl RepoView {
             scroll_room: Cell::new((0., 0.)),
             diff_width: Cell::new((-1., -1.)),
             wrap_cols: None,
+            wrapped_files: Vec::new(),
             stacked: Vec::new(),
             stacked_widest: 0,
             stacked_diffs: Vec::new(),
@@ -1919,6 +1934,7 @@ impl RepoView {
                 match result {
                     Ok((files, split, inside)) => {
                         this.files = files;
+                        this.note_wrapped_files();
                         this.worktree_split = split;
                         this.submodules_inside = inside;
                         this.error_message = None;
@@ -2542,7 +2558,12 @@ impl RepoView {
             Some(diff) if !self.shown_rows(diff).is_empty() => {
                 let spacers = self.header_rows();
                 let width = self.diff_scroll.0.borrow().base_handle.bounds().size.width;
-                let cols = self.wrap_cols_for(f32::from(width), false, window);
+                let cols = self
+                    .wrap_cols_for(f32::from(width), false, window)
+                    .filter(|_| match self.selected_file {
+                        Some(file) => self.wraps_file(file),
+                        None => self.wrap == WrapMode::Wrap,
+                    });
                 let widest = diff_view::widest_changed(self.shown_rows(diff));
                 let one = self.one_column.get();
                 self.track_widest(widest, f32::from(width), false, window);
@@ -4273,7 +4294,7 @@ mod tests {
             Some(2),
             [false; 2],
             false,
-            None,
+            &|_| None,
             false,
         )
         .iter()
@@ -4296,7 +4317,7 @@ mod tests {
             Some(2),
             [true, false],
             false,
-            None,
+            &|_| None,
             false,
         )
         .iter()
@@ -4315,7 +4336,7 @@ mod tests {
             Some(0),
             [false; 2],
             false,
-            None,
+            &|_| None,
             false,
         )
         .iter()
@@ -4337,7 +4358,7 @@ mod tests {
 
         // Too many files to open at once: a note says why, and every file
         // keeps its header, folded.
-        let many = stack_items(&diffs, &[true; 3], Some(2), [false; 2], true, None, false);
+        let many = stack_items(&diffs, &[true; 3], Some(2), [false; 2], true, &|_| None, false);
         assert!(matches!(&many[0], StackItem::Note(note) if note.starts_with("3 files")));
         let headers = many
             .iter()
@@ -4352,7 +4373,7 @@ mod tests {
             Some(1),
             [false; 2],
             false,
-            None,
+            &|_| None,
             false,
         );
         assert!(matches!(
@@ -4402,7 +4423,7 @@ mod tests {
             Err("binary".to_string()),
         ];
         let kinds = |folded: &[bool]| -> Vec<String> {
-            stack_items(&diffs, folded, None, [false; 2], false, None, false)
+            stack_items(&diffs, folded, None, [false; 2], false, &|_| None, false)
                 .iter()
                 .map(|item| match item {
                     StackItem::Section(staged, count) => format!("S{staged}:{count}"),

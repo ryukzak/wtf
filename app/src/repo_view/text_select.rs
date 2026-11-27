@@ -37,6 +37,7 @@ impl RepoView {
     /// In `pane`, when given, wherever the mouse is.
     fn column_at(
         &self,
+        file: usize,
         position: Point<Pixels>,
         pane: Option<Pane>,
     ) -> Option<(Pane, f32)> {
@@ -55,7 +56,7 @@ impl RepoView {
         if self.scroll_room.get().1 <= 0. {
             return None;
         }
-        Some((pane, (x - left + self.shift()) / self.char_width()))
+        Some((pane, (x - left + self.shift(file)) / self.char_width()))
     }
 
     /// The byte of `row`'s line in `pane` nearest column `column` of
@@ -64,7 +65,7 @@ impl RepoView {
         let Some(text) = self.row_text(file, row, pane) else {
             return 0;
         };
-        let start = match self.wrap_cols {
+        let start = match self.file_cols(file) {
             Some(cols) => diff_view::wrap_starts(text, cols)
                 .get(part)
                 .copied()
@@ -84,13 +85,13 @@ impl RepoView {
 
     /// Whether a press at `position` on a row lands on its code, not on
     /// the line numbers, where lines are picked.
-    pub(super) fn on_code(&self, position: Point<Pixels>) -> bool {
-        self.column_at(position, None)
-            .is_some_and(|(_, column)| column + self.shift() / self.char_width() >= 0.)
+    pub(super) fn on_code(&self, file: usize, position: Point<Pixels>) -> bool {
+        self.column_at(file, position, None)
+            .is_some_and(|(_, column)| column + self.shift(file) / self.char_width() >= 0.)
     }
 
-    fn shift(&self) -> f32 {
-        match self.wrap_cols {
+    fn shift(&self, file: usize) -> f32 {
+        match self.file_cols(file) {
             Some(_) => 0.,
             None => self.diff_x.get(),
         }
@@ -112,7 +113,7 @@ impl RepoView {
         modifiers: Modifiers,
         cx: &mut Context<Self>,
     ) {
-        let Some((pane, column)) = self.column_at(position, None) else {
+        let Some((pane, column)) = self.column_at(file, position, None) else {
             return;
         };
         let byte = self.byte_at(file, row, part, pane, column);
@@ -167,7 +168,7 @@ impl RepoView {
             return;
         }
         let pane = selection.pane;
-        let Some((_, column)) = self.column_at(position, Some(pane)) else {
+        let Some((_, column)) = self.column_at(file, position, Some(pane)) else {
             return;
         };
         let byte = self.byte_at(file, row, part, pane, column);

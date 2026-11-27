@@ -421,6 +421,9 @@ pub fn appearance() -> Appearance {
 /// that are code around data, where its structure tells nothing.
 pub const TEXT_DIFF: &str = "*.snap\n*.lock\npackage-lock.json\n*-lock.yaml\n*.min.js\n*.min.css";
 
+/// Files whose lines wrap in diffs on Auto: prose, a paragraph a line.
+pub const WRAP: &str = "*.md\n*.mdx\n*.markdown\n*.rst\n*.adoc\n*.txt\n*.org\n*.tex";
+
 /// Which of the app's commands the terminal prints; with `all`, every one.
 pub fn terminal_shown(all: bool) -> crate::console_view::Shown {
     let settings = read();
@@ -461,6 +464,20 @@ pub fn text_diff_rule(repo: &str) -> wtf_core::TextDiff {
             0 => usize::MAX,
             kb => kb * 1024,
         },
+    }
+}
+
+/// Which files of `repo` wrap their lines in diffs on Auto.
+pub fn wrap_rule(repo: &str) -> wtf_core::TextDiff {
+    wtf_core::TextDiff {
+        patterns: ProjectSetting::Wrap
+            .value(&Scope::Repo(repo.to_string()))
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect(),
+        max_bytes: usize::MAX,
     }
 }
 
@@ -526,6 +543,7 @@ struct Own {
     message: Option<String>,
     text_diff: Option<String>,
     text_diff_above: Option<String>,
+    wrap: Option<String>,
     idle_days: Option<String>,
     fetch_minutes: Option<String>,
     prune: Option<String>,
@@ -567,6 +585,7 @@ fn own(scope: &Scope) -> Own {
         message: value(ProjectSetting::Message),
         text_diff: lines(ProjectSetting::TextDiff.key()),
         text_diff_above: value(ProjectSetting::TextDiffAbove),
+        wrap: lines(ProjectSetting::Wrap.key()),
         idle_days: value(ProjectSetting::IdleDays),
         fetch_minutes: value(ProjectSetting::FetchMinutes),
         prune: value(ProjectSetting::Prune).map(|on| git_bool(&on).to_string()),
@@ -670,6 +689,7 @@ enum ProjectSetting {
     Message,
     TextDiff,
     TextDiffAbove,
+    Wrap,
     IdleDays,
     FetchMinutes,
     Prune,
@@ -688,6 +708,7 @@ impl ProjectSetting {
             ProjectSetting::Message => "wtf.messageTemplate",
             ProjectSetting::TextDiff => "wtf.textDiff",
             ProjectSetting::TextDiffAbove => "wtf.textDiffAboveKb",
+            ProjectSetting::Wrap => "wtf.wrap",
             ProjectSetting::IdleDays => "wtf.idleDays",
             ProjectSetting::FetchMinutes => "wtf.fetchMinutes",
             ProjectSetting::Prune => "fetch.prune",
@@ -705,6 +726,7 @@ impl ProjectSetting {
             ProjectSetting::Message => wtf_core::MESSAGE_PROMPT.to_string(),
             ProjectSetting::TextDiff => TEXT_DIFF.to_string(),
             ProjectSetting::TextDiffAbove => DEFAULT_TEXT_DIFF_ABOVE.to_string(),
+            ProjectSetting::Wrap => WRAP.to_string(),
             ProjectSetting::IdleDays => DEFAULT_IDLE_DAYS.to_string(),
             ProjectSetting::FetchMinutes => DEFAULT_FETCH_MINUTES.to_string(),
             // Fetches prune, where git's own default would not, so
@@ -726,6 +748,7 @@ impl ProjectSetting {
             ProjectSetting::Message => own.message,
             ProjectSetting::TextDiff => own.text_diff,
             ProjectSetting::TextDiffAbove => own.text_diff_above,
+            ProjectSetting::Wrap => own.wrap,
             ProjectSetting::IdleDays => own.idle_days,
             ProjectSetting::FetchMinutes => own.fetch_minutes,
             ProjectSetting::Prune => own.prune,
@@ -761,7 +784,7 @@ impl ProjectSetting {
             .map(|option| crate::sync::label(true, option));
         let values: Vec<&str> = match (&text, self) {
             (None, _) => Vec::new(),
-            (Some(text), ProjectSetting::TextDiff) => text
+            (Some(text), ProjectSetting::TextDiff | ProjectSetting::Wrap) => text
                 .lines()
                 .map(str::trim)
                 .filter(|line| !line.is_empty())
@@ -781,7 +804,7 @@ impl ProjectSetting {
         }
         forget(scope);
         // The graph reads idle days as it refreshes.
-        if self == ProjectSetting::IdleDays {
+        if matches!(self, ProjectSetting::IdleDays | ProjectSetting::Wrap) {
             reload_tabs(scope, cx);
         }
         cx.refresh_windows();
@@ -1032,8 +1055,8 @@ pub fn open(cx: &mut App) {
                 section: Section::Appearance,
                 font_menu: None,
                 font_query: Default::default(),
-                prompts: vec![Field::default(); PROJECT_FIELDS + 5],
-                prompt_focus: (0..PROJECT_FIELDS + 5).map(|_| cx.focus_handle()).collect(),
+                prompts: vec![Field::default(); PROJECT_FIELDS + 6],
+                prompt_focus: (0..PROJECT_FIELDS + 6).map(|_| cx.focus_handle()).collect(),
                 dragging: None,
                 tracks: Default::default(),
                 scope: Scope::Global,
@@ -2162,6 +2185,10 @@ impl Preferences {
         let (label, k) = match setting {
             ProjectSetting::Summary => ("Summary template", PROJECT_FIELDS + 1),
             ProjectSetting::Message => ("Commit message template", PROJECT_FIELDS + 2),
+            ProjectSetting::Wrap => (
+                "Wrap on Auto: these files, a pattern a line",
+                PROJECT_FIELDS + 5,
+            ),
             _ => (
                 "Text diff for these files, a pattern a line",
                 PROJECT_FIELDS,
@@ -2426,6 +2453,7 @@ impl Render for Preferences {
                 PROJECT_FIELDS + 2,
                 ProjectSetting::Message.value(&self.scope),
             ),
+            (PROJECT_FIELDS + 5, ProjectSetting::Wrap.value(&self.scope)),
         ];
         for (k, text) in fields {
             if !self.prompt_focus[k].is_focused(window) && self.prompts[k].text() != text {
@@ -2684,6 +2712,7 @@ impl Render for Preferences {
                         &theme,
                     ))
                     .child(self.project_field(ProjectSetting::TextDiff, &theme, window, cx))
+                    .child(self.project_field(ProjectSetting::Wrap, &theme, window, cx))
             }
             Section::Messages => div()
                 .child(self.scope_note(&theme))
@@ -3020,6 +3049,17 @@ model reads about 6000 characters at most: put {{diff}} last.";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prose_wraps_by_default() {
+        let rule = wtf_core::TextDiff {
+            patterns: WRAP.lines().map(str::to_string).collect(),
+            max_bytes: usize::MAX,
+        };
+        assert!(rule.takes("docs/README.md", 0));
+        assert!(rule.takes("notes.txt", 0));
+        assert!(!rule.takes("src/main.rs", 0));
+    }
 
     #[test]
     fn settings_survive_saving_and_loading() {

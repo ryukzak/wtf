@@ -422,14 +422,21 @@ impl RepoView {
                 .child(mode("Structural", DiffMode::Structural))
                 .child(mode("Text", DiffMode::Text))
                 .into_any_element(),
-            // Long lines wrap, or run on and scroll sideways.
+            // Long lines wrap, run on and scroll sideways, or wrap in the
+            // files Settings always wrap.
             group()
-                .child(option("Wrap", self.wrap_lines).on_click(
-                    cx.listener(|this, _, window, cx| this.set_wrap_lines(true, window, cx)),
-                ))
-                .child(option("No Wrap", !self.wrap_lines).on_click(
-                    cx.listener(|this, _, window, cx| this.set_wrap_lines(false, window, cx)),
-                ))
+                .children(
+                    [
+                        ("Wrap", WrapMode::Wrap),
+                        ("Auto", WrapMode::Auto),
+                        ("No Wrap", WrapMode::NoWrap),
+                    ]
+                    .map(|(label, wrap)| {
+                        option(label, self.wrap == wrap).on_click(
+                            cx.listener(move |this, _, window, cx| this.set_wrap(wrap, window, cx)),
+                        )
+                    }),
+                )
                 .into_any_element(),
         ];
         let more = (shown < STRIP_PAIRS.len()).then(|| {
@@ -1180,11 +1187,11 @@ impl RepoView {
 }
 
 /// The strip's pairs of modes, top down, by their buttons' names.
-pub(super) const STRIP_PAIRS: [[&str; 2]; 4] = [
-    ["Diff", "Tree"],
-    ["Split", "Unified"],
-    ["Structural", "Text"],
-    ["Wrap", "No Wrap"],
+pub(super) const STRIP_PAIRS: [&[&str]; 4] = [
+    &["Diff", "Tree"],
+    &["Split", "Unified"],
+    &["Structural", "Text"],
+    &["Wrap", "Auto", "No Wrap"],
 ];
 
 /// How wide the header is before the facts stand on its right, and how

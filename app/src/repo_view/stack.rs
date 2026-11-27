@@ -64,7 +64,22 @@ impl RepoView {
         cx.notify();
     }
 
+    /// Notes which of the files Settings always wrap.
+    pub(super) fn note_wrapped_files(&mut self) {
+        let rule = self
+            .repo_path
+            .as_deref()
+            .map(preferences::wrap_rule)
+            .unwrap_or_default();
+        self.wrapped_files = self
+            .files
+            .iter()
+            .map(|file| rule.takes(file.path(), 0))
+            .collect();
+    }
+
     pub(super) fn restack(&mut self) {
+        self.note_wrapped_files();
         let folded: Vec<bool> = self
             .files
             .iter()
@@ -76,7 +91,7 @@ impl RepoView {
             self.worktree_split,
             self.folded_sections,
             self.many_files(),
-            self.wrap_cols,
+            &|file| self.file_cols(file),
             self.one_column.get(),
         );
         // Only changed rows shown count: folded files, the lines between
@@ -85,6 +100,8 @@ impl RepoView {
             .stacked
             .iter()
             .filter_map(|item| match *item {
+                // Wrapped, a file's lines never scroll sideways.
+                StackItem::Row(file, _, _) if self.wraps_file(file) => None,
                 StackItem::Row(file, row, 0) => match self.stacked_diffs.get(file) {
                     Some(Ok(diff)) => self.shown_rows(diff).get(row),
                     _ => None,
@@ -126,14 +143,30 @@ impl RepoView {
         split < below as f32
     }
 
-    /// Wraps long diff lines, or lets them run on to scroll sideways.
-    pub(super) fn set_wrap_lines(
+    /// Where file `file`'s lines wrap, if they do: everywhere with Wrap
+    /// chosen, with Auto in the files Settings always wrap, nowhere with
+    /// No Wrap.
+    pub(super) fn file_cols(&self, file: usize) -> Option<usize> {
+        self.wrap_cols.filter(|_| self.wraps_file(file))
+    }
+
+    pub(super) fn wraps_file(&self, file: usize) -> bool {
+        match self.wrap {
+            WrapMode::Wrap => true,
+            WrapMode::NoWrap => false,
+            WrapMode::Auto => self.wrapped_files.get(file).copied().unwrap_or(false),
+        }
+    }
+
+    /// Wraps long diff lines, lets them run on to scroll sideways, or, on
+    /// Auto, wraps those of the files Settings name.
+    pub(super) fn set_wrap(
         &mut self,
-        wrap: bool,
+        wrap: WrapMode,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.wrap_lines = wrap;
+        self.wrap = wrap;
         self.diff_x.set(0.);
         self.sync_wrap(window, cx);
         cx.notify();
@@ -181,15 +214,15 @@ impl RepoView {
         }
     }
 
-    /// The characters a side of the diff holds, in a list `width` wide, when
-    /// lines wrap.
+    /// The characters a side of the diff holds, in a list `width` wide, for
+    /// lines that wrap.
     pub(super) fn wrap_cols_for(
         &self,
         width: f32,
         stacked: bool,
         window: &Window,
     ) -> Option<usize> {
-        if !self.wrap_lines || width <= 0. {
+        if width <= 0. {
             return None;
         }
         let cols = self.code_width(width, stacked) / code_char_width(window);
@@ -260,7 +293,7 @@ impl RepoView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.wrap_lines {
+        if self.wrap == WrapMode::Wrap {
             return;
         }
         let dx = f32::from(event.delta.pixel_delta(px(diff_view::row_height())).x);
@@ -708,7 +741,7 @@ impl RepoView {
                     .into_any_element()
             }
             &StackItem::Row(file, index, part) => {
-                let fit = self.fit(self.wrap_cols, part);
+                let fit = self.fit(self.file_cols(file), part);
                 let colors = self.diff_colors(Some(file), theme, cx);
                 match &self.stacked_diffs[file] {
                     // Lines of any diff are picked: to copy, and in a worktree
@@ -719,7 +752,7 @@ impl RepoView {
                         // Picked lines are framed, as one box per run: its
                         // top on the run's first line, its bottom on the last
                         // part of its last line.
-                        let parts = self.wrap_cols.map_or(1, |cols| {
+                        let parts = self.file_cols(file).map_or(1, |cols| {
                             diff_view::parts(&self.shown_rows(diff)[index], cols)
                         });
                         let top = selected && part == 0 && (index == 0 || !picked(index - 1));
@@ -738,7 +771,7 @@ impl RepoView {
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                    match this.on_code(event.position) {
+                                    match this.on_code(file, event.position) {
                                         true => this.press_text(
                                             file,
                                             index,
@@ -904,13 +937,13 @@ pub(super) fn stack_items(
     split: Option<usize>,
     folded_sections: [bool; 2],
     many: bool,
-    cols: Option<usize>,
+    cols: &dyn Fn(usize) -> Option<usize>,
     one: bool,
 ) -> Vec<StackItem> {
     let mut items = Vec::new();
     // A row, as many times as it has lines when they wrap at `cols`.
     let lines = |file: usize, row: usize| {
-        let parts = match (cols, &diffs[file]) {
+        let parts = match (cols(file), &diffs[file]) {
             (Some(cols), Ok(diff)) => diff_view::parts(&diff_view::shown(diff, one)[row], cols),
             _ => 1,
         };
