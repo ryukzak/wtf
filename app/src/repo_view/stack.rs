@@ -168,12 +168,7 @@ impl RepoView {
 
     /// Wraps long diff lines, lets them run on to scroll sideways, or, on
     /// Auto, wraps those of the files Settings name.
-    pub(super) fn set_wrap(
-        &mut self,
-        wrap: WrapMode,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(super) fn set_wrap(&mut self, wrap: WrapMode, window: &mut Window, cx: &mut Context<Self>) {
         self.wrap = wrap;
         self.diff_x.set(0.);
         self.snapshot_x.set(0.);
@@ -346,7 +341,9 @@ impl RepoView {
             .stacked_diffs
             .get(file)
             .and_then(|diff| diff.as_ref().ok())
-            .map_or(0, |diff| diff_view::shown(diff, self.one_column.get()).len());
+            .map_or(0, |diff| {
+                diff_view::shown(diff, self.one_column.get()).len()
+            });
         let (above, below) = (start > 0, end < rows);
         let count = end - start;
         let button = |id: &str, label: &'static str, range: std::ops::Range<usize>| {
@@ -877,21 +874,21 @@ impl RepoView {
                             // its code, text is selected.
                             .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                    match this.on_code(file, event.position) {
-                                        true => this.press_text(
-                                            file,
-                                            index,
-                                            part,
-                                            event.position,
-                                            event.click_count,
-                                            event.modifiers,
-                                            cx,
-                                        ),
-                                        false => {
-                                            this.text_selection = None;
-                                            this.press_line(file, index, event.modifiers, cx)
-                                        }
+                                cx.listener(move |this, event: &MouseDownEvent, _, cx| match this
+                                    .on_code(file, event.position)
+                                {
+                                    true => this.press_text(
+                                        file,
+                                        index,
+                                        part,
+                                        event.position,
+                                        event.click_count,
+                                        event.modifiers,
+                                        cx,
+                                    ),
+                                    false => {
+                                        this.text_selection = None;
+                                        this.press_line(file, index, event.modifiers, cx)
                                     }
                                 }),
                             )
@@ -1038,6 +1035,7 @@ impl RepoView {
 /// to open at once.
 const NOT_LOADED: &str = "Loading…";
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn stack_items(
     diffs: &[Result<FileDiff, String>],
     folded: &[bool],
@@ -1090,11 +1088,9 @@ pub(super) fn stack_items(
             continue;
         }
         let shown = match diff {
-            Ok(diff) => diff_view::shown_rows(
-                diff_view::shown(diff, one),
-                CONTEXT_ROWS,
-                &revealed(file),
-            ),
+            Ok(diff) => {
+                diff_view::shown_rows(diff_view::shown(diff, one), CONTEXT_ROWS, &revealed(file))
+            }
             Err(error) => {
                 items.push(StackItem::Note(error.clone()));
                 continue;

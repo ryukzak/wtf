@@ -827,6 +827,7 @@ impl Workspace {
         if !self.tabs_menu {
             return None;
         }
+        #[allow(clippy::type_complexity)]
         let mut tabs: Vec<(usize, String, Vec<(String, Option<String>)>)> = self
             .tabs
             .iter()
@@ -883,7 +884,13 @@ impl Workspace {
                             let path = reveal.clone();
                             this.tabs[index].update(cx, |tab, cx| tab.reveal_file(path, cx));
                         }))
-                        .child(div().flex_1().min_w_0().truncate().child(folder_name(&path)))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .child(folder_name(&path)),
+                        )
                         .child(
                             div()
                                 .flex_none()

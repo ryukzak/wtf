@@ -773,7 +773,10 @@ impl RepoView {
                 ];
                 // Where each pair's first mode is among the checks.
                 let first = |pair: usize| -> usize {
-                    header::STRIP_PAIRS[..pair].iter().map(|names| names.len()).sum()
+                    header::STRIP_PAIRS[..pair]
+                        .iter()
+                        .map(|names| names.len())
+                        .sum()
                 };
                 for (pair, names) in header::STRIP_PAIRS.iter().enumerate().skip(*shown) {
                     if pair > *shown {

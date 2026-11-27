@@ -73,7 +73,9 @@ impl RepoView {
             None => 0,
         };
         let column = start + column.round().max(0.) as usize;
-        text.char_indices().nth(column).map_or(text.len(), |(i, _)| i)
+        text.char_indices()
+            .nth(column)
+            .map_or(text.len(), |(i, _)| i)
     }
 
     /// The line of a file's diff row in `pane`.
@@ -103,6 +105,7 @@ impl RepoView {
 
     /// A press on the code: starts a selection there, a word's on a double
     /// click, the line's on a triple; ⇧ extends the one there is.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn press_text(
         &mut self,
         file: usize,
@@ -188,9 +191,7 @@ impl RepoView {
         if row < from.row || row > to.row {
             return None;
         }
-        let len = self
-            .row_text(file, row, selection.pane)
-            .map_or(0, str::len);
+        let len = self.row_text(file, row, selection.pane).map_or(0, str::len);
         let start = if row == from.row { from.byte } else { 0 };
         let end = if row == to.row { to.byte } else { len };
         Some((selection.pane, start.min(len)..end.min(len)))
@@ -234,11 +235,17 @@ impl RepoView {
         let column = (x / width).round().max(0.) as usize;
         let row = self.snapshot_rows.borrow().get(shown).copied();
         let Some(super::SnapshotRow { line, start, end }) = row else {
-            return TextAt { row: shown, byte: 0 };
+            return TextAt {
+                row: shown,
+                byte: 0,
+            };
         };
         let text = self.snapshot_line(line).unwrap_or_default();
         let part = text.get(start..end).unwrap_or_default();
-        let byte = part.char_indices().nth(column).map_or(end, |(i, _)| start + i);
+        let byte = part
+            .char_indices()
+            .nth(column)
+            .map_or(end, |(i, _)| start + i);
         TextAt { row: line, byte }
     }
 
@@ -267,11 +274,8 @@ impl RepoView {
                     2 => word_around(text, byte),
                     _ => (0, text.len()),
                 };
-                self.snapshot_selection = Some((
-                    path,
-                    TextAt { row, byte: start },
-                    TextAt { row, byte: end },
-                ));
+                self.snapshot_selection =
+                    Some((path, TextAt { row, byte: start }, TextAt { row, byte: end }));
             }
         }
         cx.notify();

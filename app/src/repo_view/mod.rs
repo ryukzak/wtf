@@ -1711,9 +1711,9 @@ impl RepoView {
     /// Whether the graph has a worktree at `path`.
     pub fn has_worktree(&self, path: &str) -> bool {
         let path = path.trim_end_matches('/');
-        self.graph.nodes.iter().any(|node| {
-            matches!(&node.tip, Revision::Worktree(p) if p.trim_end_matches('/') == path)
-        })
+        self.graph.nodes.iter().any(
+            |node| matches!(&node.tip, Revision::Worktree(p) if p.trim_end_matches('/') == path),
+        )
     }
 
     fn apply_reveal_file(&mut self, cx: &mut Context<Self>) {
@@ -2709,12 +2709,12 @@ impl RepoView {
             Some(diff) if !self.shown_rows(diff).is_empty() => {
                 let spacers = self.header_rows();
                 let width = self.diff_scroll.0.borrow().base_handle.bounds().size.width;
-                let cols = self
-                    .wrap_cols_for(f32::from(width), false, window)
-                    .filter(|_| match self.selected_file {
-                        Some(file) => self.wraps_file(file),
-                        None => self.wrap == WrapMode::Wrap,
-                    });
+                let cols =
+                    self.wrap_cols_for(f32::from(width), false, window)
+                        .filter(|_| match self.selected_file {
+                            Some(file) => self.wraps_file(file),
+                            None => self.wrap == WrapMode::Wrap,
+                        });
                 let widest = diff_view::widest_changed(self.shown_rows(diff));
                 let one = self.one_column.get();
                 self.track_widest(widest, f32::from(width), false, window);
@@ -4177,7 +4177,15 @@ impl RepoView {
             WrapMode::NoWrap => false,
             WrapMode::Auto => self.wrap_rule.takes(&path, 0),
         };
-        let width = f32::from(self.snapshot_scroll.0.borrow().base_handle.bounds().size.width);
+        let width = f32::from(
+            self.snapshot_scroll
+                .0
+                .borrow()
+                .base_handle
+                .bounds()
+                .size
+                .width,
+        );
         let char_width = stack::code_char_width(window).max(1.);
         let room = (width - diff_view::gutter_width()).max(0.);
         let cols = (wraps && room > 0.).then(|| ((room / char_width).floor() as usize).max(1));
@@ -4185,7 +4193,11 @@ impl RepoView {
         self.snapshot_rows.replace(rows.clone());
         let widest = match cols {
             Some(_) => 0,
-            None => lines.iter().map(|line| line.chars().count()).max().unwrap_or(0),
+            None => lines
+                .iter()
+                .map(|line| line.chars().count())
+                .max()
+                .unwrap_or(0),
         };
         let max_x = (widest as f32 * char_width - room + 8.).max(0.);
         self.snapshot_max_x.set(max_x);
@@ -4200,7 +4212,9 @@ impl RepoView {
                     let y = at as f32 * diff_view::row_height() + within;
                     handle.set_offset(point(offset.x, px(-y)));
                 }
-                None => self.snapshot_scroll.scroll_to_item(at, ScrollStrategy::Center),
+                None => self
+                    .snapshot_scroll
+                    .scroll_to_item(at, ScrollStrategy::Center),
             }
         }
         uniform_list(
@@ -4209,7 +4223,11 @@ impl RepoView {
             cx.processor(move |_, range: std::ops::Range<usize>, _, cx| {
                 range
                     .map(|k| {
-                        let SnapshotRow { line: i, start, end } = rows[k];
+                        let SnapshotRow {
+                            line: i,
+                            start,
+                            end,
+                        } = rows[k];
                         let whole = &lines[i];
                         let line = &whole[start..end];
                         let spans = colors.right.get(&(i as u32 + 1));
@@ -4275,17 +4293,11 @@ impl RepoView {
                                     .text_color(secondary)
                                     .when(start == 0, |gutter| gutter.child((i + 1).to_string())),
                             )
-                            .child(
-                                div().flex_1().min_w_0().overflow_hidden().child(
-                                    div()
-                                        .ml(px(-x))
-                                        .text_color(foreground)
-                                        .child(
-                                            StyledText::new(line.to_string())
-                                                .with_highlights(highlights),
-                                        ),
+                            .child(div().flex_1().min_w_0().overflow_hidden().child(
+                                div().ml(px(-x)).text_color(foreground).child(
+                                    StyledText::new(line.to_string()).with_highlights(highlights),
                                 ),
-                            )
+                            ))
                     })
                     .collect()
             }),
@@ -4386,7 +4398,10 @@ mod tests {
         assert_eq!(rows(None), [(0, 0, 5), (1, 0, lines[1].len())]);
         // "один " is 9 bytes; "два три", 7 characters, fits in the rest.
         assert_eq!(rows(Some(8)), [(0, 0, 5), (1, 0, 9), (1, 9, 22)]);
-        assert_eq!(rows(Some(5)), [(0, 0, 5), (1, 0, 9), (1, 9, 16), (1, 16, 22)]);
+        assert_eq!(
+            rows(Some(5)),
+            [(0, 0, 5), (1, 0, 9), (1, 9, 16), (1, 16, 22)]
+        );
     }
 
     fn diff(changed: &[bool]) -> FileDiff {
@@ -4614,7 +4629,16 @@ mod tests {
 
         // Too many files to open at once: a note says why, and every file
         // keeps its header, folded.
-        let many = stack_items(&diffs, &[true; 3], Some(2), [false; 2], true, &|_| None, &|_| Vec::new(), false);
+        let many = stack_items(
+            &diffs,
+            &[true; 3],
+            Some(2),
+            [false; 2],
+            true,
+            &|_| None,
+            &|_| Vec::new(),
+            false,
+        );
         assert!(matches!(&many[0], StackItem::Note(note) if note.starts_with("3 files")));
         let headers = many
             .iter()
@@ -4680,18 +4704,27 @@ mod tests {
             Err("binary".to_string()),
         ];
         let kinds = |folded: &[bool]| -> Vec<String> {
-            stack_items(&diffs, folded, None, [false; 2], false, &|_| None, &|_| Vec::new(), false)
-                .iter()
-                .map(|item| match item {
-                    StackItem::Section(staged, count) => format!("S{staged}:{count}"),
-                    StackItem::Header(file) => format!("H{file}"),
-                    StackItem::Row(file, row, _) => format!("{file}:{row}"),
-                    StackItem::Hunk(..) => "@".to_string(),
-                    StackItem::Gap(..) => "…".to_string(),
-                    StackItem::Note(text) => text.clone(),
-                    StackItem::HeaderPad => " ".to_string(),
-                })
-                .collect()
+            stack_items(
+                &diffs,
+                folded,
+                None,
+                [false; 2],
+                false,
+                &|_| None,
+                &|_| Vec::new(),
+                false,
+            )
+            .iter()
+            .map(|item| match item {
+                StackItem::Section(staged, count) => format!("S{staged}:{count}"),
+                StackItem::Header(file) => format!("H{file}"),
+                StackItem::Row(file, row, _) => format!("{file}:{row}"),
+                StackItem::Hunk(..) => "@".to_string(),
+                StackItem::Gap(..) => "…".to_string(),
+                StackItem::Note(text) => text.clone(),
+                StackItem::HeaderPad => " ".to_string(),
+            })
+            .collect()
         };
         assert_eq!(
             kinds(&[true, true, false]),

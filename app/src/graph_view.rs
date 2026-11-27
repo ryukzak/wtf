@@ -2937,7 +2937,11 @@ mod tests {
         rows.dedup();
         let row = |i: usize| rows.iter().position(|&y| y == layout.nodes[i].2);
         assert!(row(0) < row(4), "the side line under main");
-        assert_eq!(row(5), row(4).map(|row| row + 1), "the merged branch right under it");
+        assert_eq!(
+            row(5),
+            row(4).map(|row| row + 1),
+            "the merged branch right under it"
+        );
     }
 
     #[test]

@@ -656,6 +656,7 @@ impl RepoView {
     /// that deletes the ticked ones.
     /// A prune dialog section's heading, folding its section on a click;
     /// its checkbox ticks all its rows, or clears them when all are.
+    #[allow(clippy::too_many_arguments)]
     fn prune_header(
         &self,
         fold: PruneFold,
@@ -668,26 +669,34 @@ impl RepoView {
     ) -> AnyElement {
         let folded = self.prune_folds.contains(&fold);
         let list = self.prune.as_deref().unwrap_or_default();
-        let picked = group.iter().filter(|&&k| list.get(k).is_some_and(|item| item.on)).count();
+        let picked = group
+            .iter()
+            .filter(|&&k| list.get(k).is_some_and(|item| item.on))
+            .count();
         let state = match picked {
             0 => Some(false),
             n if n == group.len() => Some(true),
             _ => None,
         };
         let checkbox = (!group.is_empty()).then(|| {
-            attention_checkbox(SharedString::from(format!("prune-all-{fold:?}")), state, true, theme)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    cx.stop_propagation();
-                    let on = state != Some(true);
-                    if let Some(list) = this.prune.as_mut() {
-                        for &k in &group {
-                            if let Some(item) = list.get_mut(k) {
-                                item.on = on;
-                            }
+            attention_checkbox(
+                SharedString::from(format!("prune-all-{fold:?}")),
+                state,
+                true,
+                theme,
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                let on = state != Some(true);
+                if let Some(list) = this.prune.as_mut() {
+                    for &k in &group {
+                        if let Some(item) = list.get_mut(k) {
+                            item.on = on;
                         }
                     }
-                    cx.notify();
-                }))
+                }
+                cx.notify();
+            }))
         });
         let kind_level = fold.1.is_none();
         div()

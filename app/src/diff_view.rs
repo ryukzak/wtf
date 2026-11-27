@@ -422,6 +422,7 @@ pub fn with_selection(
 
 /// A side's code, tinted as `line` when changed, after its line number
 /// when `numbered`.
+#[allow(clippy::too_many_arguments)]
 fn side_cell(
     side: Option<&DiffSide>,
     code: Option<&Spans>,
@@ -611,7 +612,11 @@ mod tests {
         };
         assert_eq!(gaps(&[]), [(0, 8), (13, 23), (28, 30)]);
         assert_eq!(gaps(&[13..18, 5..8, 28..40]), [(0, 5), (18, 23)]);
-        assert_eq!(gaps(&[13..23]), [(0, 8), (28, 30)], "a gap shown whole joins its hunks");
+        assert_eq!(
+            gaps(&[13..23_usize; 1]),
+            [(0, 8), (28, 30)],
+            "a gap shown whole joins its hunks"
+        );
     }
 
     #[test]

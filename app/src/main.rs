@@ -33,8 +33,7 @@ use crate::workspace::{
 
 use crate::repo_view::{
     CommandPalette, Fetch, GoTo, Minimize, OpenRepository, StashChanges, StructuralDiff, TextDiff,
-    ToggleConsole,
-    ToggleSidePanel, ToggleSnapshot,
+    ToggleConsole, ToggleSidePanel, ToggleSnapshot,
 };
 
 fn main() {
