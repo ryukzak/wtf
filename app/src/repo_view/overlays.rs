@@ -644,17 +644,41 @@ impl RepoView {
 
     /// The prune list: each stale branch with why, ticked to go, and a button
     /// that deletes the ticked ones.
-    /// A prune dialog section's heading, folding its section on a click.
+    /// A prune dialog section's heading, folding its section on a click;
+    /// its checkbox ticks all its rows, or clears them when all are.
     fn prune_header(
         &self,
         fold: PruneFold,
         title: String,
         count: String,
         top: bool,
+        group: Vec<usize>,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let folded = self.prune_folds.contains(&fold);
+        let list = self.prune.as_deref().unwrap_or_default();
+        let picked = group.iter().filter(|&&k| list.get(k).is_some_and(|item| item.on)).count();
+        let state = match picked {
+            0 => Some(false),
+            n if n == group.len() => Some(true),
+            _ => None,
+        };
+        let checkbox = (!group.is_empty()).then(|| {
+            attention_checkbox(SharedString::from(format!("prune-all-{fold:?}")), state, true, theme)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    let on = state != Some(true);
+                    if let Some(list) = this.prune.as_mut() {
+                        for &k in &group {
+                            if let Some(item) = list.get_mut(k) {
+                                item.on = on;
+                            }
+                        }
+                    }
+                    cx.notify();
+                }))
+        });
         let kind_level = fold.1.is_none();
         div()
             .id(SharedString::from(format!("prune-fold-{fold:?}")))
@@ -684,6 +708,7 @@ impl RepoView {
                 cx.notify();
             }))
             .child(panel_chevron(!folded, theme))
+            .children(checkbox)
             .child(div().flex_1().child(title))
             .child(div().text_color(theme.secondary).child(count))
             .into_any_element()
@@ -819,7 +844,15 @@ impl RepoView {
                 0 => of_kind.len().to_string(),
                 picked => format!("{picked} of {}", of_kind.len()),
             };
-            rows.push(self.prune_header((kind, None), title.to_string(), count, n == 0, theme, cx));
+            rows.push(self.prune_header(
+                (kind, None),
+                title.to_string(),
+                count,
+                n == 0,
+                of_kind.clone(),
+                theme,
+                cx,
+            ));
             if self.prune_folds.contains(&(kind, None)) {
                 continue;
             }
@@ -865,6 +898,7 @@ impl RepoView {
                     title.to_string(),
                     of_status.len().to_string(),
                     false,
+                    of_status.clone(),
                     theme,
                     cx,
                 ));
