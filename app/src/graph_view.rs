@@ -439,10 +439,18 @@ pub fn layout(graph: &WorkflowGraph, order: WorktreeOrder) -> Layout {
         if node.kind == NodeKind::Uncommitted {
             continue;
         }
+        // A rail from another lane's commit drops at that commit and turns
+        // into this row a curve later; one into another lane's leaves this
+        // row a curve before. So a branch merged into a commit and one
+        // forking from it can share a row.
+        let curve = style().curve;
         let start = node
             .parents
             .iter()
-            .map(|&p| xs[p].1)
+            .map(|&p| match lane_of[p] == lane_of[i] {
+                true => xs[p].1,
+                false => xs[p].1 + curve,
+            })
             .fold(xs[i].0, f32::min);
         let leads_on = !worktrees[i].is_empty()
             || framed
@@ -456,7 +464,7 @@ pub fn layout(graph: &WorkflowGraph, order: WorktreeOrder) -> Layout {
         // A merge rail runs in the merged lane's row up to the merge.
         for &p in node.parents.iter().skip(1) {
             if let Some(span) = &mut spans[lane_of[p]] {
-                span.1 = span.1.max(xs[i].0);
+                span.1 = span.1.max(xs[i].0 - curve);
             }
         }
     }
@@ -2899,6 +2907,22 @@ mod tests {
         let layout = layout(&graph, WorktreeOrder::LastCommit);
         assert_eq!(layout.nodes[5].2, layout.nodes[6].2);
         assert_ne!(layout.nodes[5].2, layout.nodes[0].2);
+    }
+
+    #[test]
+    fn a_branch_merged_into_a_commit_shares_a_row_with_one_forking_from_it() {
+        // Main 0-2-4; one branch from 0 merged at 2, another from 2 merged
+        // at 4.
+        let graph = graph(vec![
+            node(0, &[], 1, 0),
+            node(1, &[0], 1, 1),
+            node(0, &[0, 1], 1, 2),
+            node(2, &[2], 1, 3),
+            node(0, &[2, 3], 1, 4),
+        ]);
+        let layout = layout(&graph, WorktreeOrder::LastCommit);
+        assert_eq!(layout.nodes[1].2, layout.nodes[3].2);
+        assert_ne!(layout.nodes[1].2, layout.nodes[0].2);
     }
 
     #[test]
