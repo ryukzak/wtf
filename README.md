@@ -15,17 +15,26 @@ Sources of ideas:
 - [Difftastic](https://github.com/wilfred/difftastic) (Structured diff)
 - Original (working with worktrees from above)
 
+## What it does
+
+- **Workflow graph**: branches as lanes, runs of commits as nodes, with worktrees, stashes and tags drawn on it.
+- **Review**: structural ([difftastic](https://difftastic.wilfred.me.uk)) or text diffs; select and copy text, show more lines around a change, browse any commit's files in Snapshot.
+- **Commit**: stage files and commit; Apple Intelligence writes commit messages and summaries of commits on your Mac, from prompt templates you can edit.
+- **Attention**: choose what the graph shows; channels group agents' branches.
+- **Prune**: delete merged branches, branches whose remote is gone and stale worktrees.
+- **Project settings in git config**: prompts, text-diff files, idle time, fetch interval, prune, pull and push, author name and email; the Global project writes them to `~/.gitconfig`.
+
 ## Install
 
 With [Homebrew](https://brew.sh), which builds the app on your Mac, so the first install takes several minutes:
 
     brew install --cask ryukzak/tap/wtf
 
-It also puts the `wtf` command on your PATH: `wtf .` opens the repository you are in. Update with `brew upgrade --cask wtf`.
+It also puts the `wtf` command on your PATH: `wtf .` opens the repository you are in, and `wtf path/to/file` shows the file in its worktree. Update with `brew upgrade --cask wtf`.
 
 ## Run
 
-macOS only; needs Rust and Git. Structural diffs need [difftastic](https://difftastic.wilfred.me.uk) (`brew install difftastic`):
+macOS only; needs Rust and Git. Structural diffs need [difftastic](https://difftastic.wilfred.me.uk) (`brew install difftastic`); commit messages and summaries need macOS 26 with Apple Intelligence:
 
     scripts/build.sh
     open build/wtf.app --args /path/to/repo
@@ -73,9 +82,15 @@ To open repositories from a terminal, choose **wtf › Install 'wtf' Command…*
 | ⇧⌘P         | Command palette                                                         |
 | ⌘R          | Toggle the side panel                                                   |
 | ⌘J, ⌃`      | Toggle the terminal                                                     |
+| ⌘↩          | Commit                                                                  |
+| ⌘S          | Stash changes                                                           |
+| ⌥⌘F         | Fetch                                                                   |
 | ⌥⌘1, ⌥⌘2    | Structural or text diff                                                 |
+| ⌥⌘3         | Toggle Snapshot                                                         |
 | ⌘T, ⌘W, ⇧⌘T | New, close, reopen tab (⌃⇧T too)                                        |
 | ⌘1…⌘9       | Switch tab                                                              |
+| ⇧⌘[, ⇧⌘]    | Previous or next tab (⌃⇧⇥, ⌃⇥ too)                                      |
+| ⇧⌘N         | New window                                                              |
 | ⌘O          | Open a repository                                                       |
 | ⌘,          | Settings                                                                |
 
@@ -92,7 +107,7 @@ Before sending a change, run what CI runs:
     cargo clippy --workspace --all-targets -- -D warnings
     cargo test --workspace
 
-The app icon is drawn in `app/icon/icon.svg`; `scripts/icon.sh` renders it into `wtf.icns`.
+The app icon is drawn in `app/icon/icon.svg`; `scripts/icon.sh` renders it into `wtf.icns` and `icon.png`, which the About window shows.
 
 ## License
 
