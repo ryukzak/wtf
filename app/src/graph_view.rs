@@ -253,6 +253,24 @@ pub fn layout(graph: &WorkflowGraph, order: WorktreeOrder) -> Layout {
             step_from[lane] = Some(lane_of[p]);
         }
     }
+    // A branch merged into another branch, not the main line, goes right
+    // below that one too: it rises into it, crossing no row between.
+    for (i, node) in graph.nodes.iter().enumerate() {
+        let lane = lane_of[i];
+        for &p in node.parents.iter().skip(1) {
+            let merged = lane_of[p];
+            if node.kind != NodeKind::Uncommitted
+                && lane != 0
+                && merged != 0
+                && merged != lane
+                && step_from[merged].is_none()
+                && step_from[lane] != Some(merged)
+                && !graph.nodes[p].channel
+            {
+                step_from[merged] = Some(lane);
+            }
+        }
+    }
 
     // A clean worktree is a frame around its HEAD commit. A changed one is a
     // square right after that commit when nothing follows it; otherwise later
@@ -2853,6 +2871,33 @@ mod tests {
             }
         }
         assert!(failures.is_empty());
+    }
+
+    #[test]
+    fn a_branch_merged_into_a_side_line_sits_right_under_it() {
+        // Main 0-1-2-3; a side line off 3 takes in a branch off 1 at 6; a
+        // long branch off 2 runs on.
+        let named = |mut node: GraphNode, name: &str| {
+            node.refs = vec![name.to_string()];
+            node
+        };
+        let graph = graph(vec![
+            node(0, &[], 1, 0),
+            node(0, &[0], 1, 1),
+            node(0, &[1], 1, 2),
+            named(node(0, &[2], 1, 3), "main"),
+            node(1, &[3], 1, 4),
+            node(3, &[1], 1, 5),
+            named(node(1, &[4, 5], 1, 6), "setup"),
+            named(node(2, &[2], 8, 7), "long"),
+        ]);
+        let layout = layout(&graph, WorktreeOrder::LastCommit);
+        let mut rows: Vec<f32> = layout.nodes.iter().map(|node| node.2).collect();
+        rows.sort_by(f32::total_cmp);
+        rows.dedup();
+        let row = |i: usize| rows.iter().position(|&y| y == layout.nodes[i].2);
+        assert!(row(0) < row(4), "the side line under main");
+        assert_eq!(row(5), row(4).map(|row| row + 1), "the merged branch right under it");
     }
 
     #[test]
