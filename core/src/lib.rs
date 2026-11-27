@@ -305,9 +305,16 @@ const MAX_SNAPSHOT_FILE: usize = 2 * 1024 * 1024;
 /// The submodules of the repository as it is at `revision`, by path.
 pub fn snapshot_submodules(repo: &str, revision: &Revision) -> Vec<String> {
     let text = match revision {
-        Revision::Commit(id) => {
-            console::as_refresh(|| git::show(repo, &format!("{id}:.gitmodules"))).ok()
-        }
+        // Asked first whether the commit has the file, so one without it
+        // shows no failed command.
+        Revision::Commit(id) => console::as_refresh(|| {
+            let listed = git::run(repo, &["ls-tree", "--name-only", id, "--", ".gitmodules"])?;
+            match listed.trim().is_empty() {
+                true => Ok(Vec::new()),
+                false => git::show(repo, &format!("{id}:.gitmodules")),
+            }
+        })
+        .ok(),
         Revision::Worktree(path) => std::fs::read(Path::new(path).join(".gitmodules")).ok(),
     };
     text.map_or_else(Vec::new, |text| {
