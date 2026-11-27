@@ -997,8 +997,8 @@ fn note_width(note: &str) -> f32 {
 /// label.
 fn extras_width(graph: &WorkflowGraph, name: &str) -> f32 {
     let dot = match remote_of(graph, name) {
-        Some(_) => REMOTE_DOT + NOTE_GAP,
-        None => 0.,
+        Some(Remote::Local) | None => 0.,
+        Some(_) => CLOUD.0 + NOTE_GAP,
     };
     let counts = match remote_of(graph, name) {
         Some(Remote::Apart(counts)) => note_width(&counts),
@@ -1007,20 +1007,18 @@ fn extras_width(graph: &WorkflowGraph, name: &str) -> f32 {
     dot + counts + idle_age(graph, name).map_or(0., |age| note_width(&age))
 }
 
-/// The remote dot's size.
-const REMOTE_DOT: f32 = 7.;
-
-/// Where a local branch stands against the remote, as the dot after its
+/// Where a local branch stands against the remote, as the cloud after its
 /// label shows it.
 #[derive(Clone, PartialEq, Debug)]
 enum Remote {
-    /// On the remote, at the same commit: a filled dot.
+    /// On the remote, at the same commit: a cloud.
     InStep,
-    /// Ahead or behind it, by the counts: a half-filled dot and `↑2 ↓1`.
+    /// Ahead or behind it, by the counts: a cloud and `↑2 ↓1`.
     Apart(String),
-    /// Never pushed: a hollow dot.
+    /// Never pushed: no cloud.
     Local,
-    /// Its remote branch is gone, as after a merged pull request: a red ring.
+    /// Its remote branch is gone, as after a merged pull request: a red
+    /// cloud, struck out.
     Gone,
 }
 
@@ -1057,32 +1055,67 @@ fn idle_age(graph: &WorkflowGraph, name: &str) -> Option<String> {
         .then(|| format!("{days}d"))
 }
 
-/// The dot after a local branch's label.
-fn remote_dot(remote: &Remote, color: Hsla, theme: &Theme) -> gpui::Div {
-    let dot = div()
-        .flex_none()
-        .size(px(REMOTE_DOT))
-        .ml(px(NOTE_GAP))
-        .rounded_full();
-    match remote {
-        Remote::InStep => dot.bg(color),
-        Remote::Apart(_) => dot.relative().border_1().border_color(color).child(
-            div()
-                .absolute()
-                .left_0()
-                .top_0()
-                .bottom_0()
-                .w(px(REMOTE_DOT / 2.))
-                .rounded_l_full()
-                .bg(color),
-        ),
-        Remote::Local => dot.border_1().border_color(theme.secondary),
-        Remote::Gone => dot.border_1().border_color(theme.error),
-    }
+/// The cloud after a local branch's label: there when the branch is on
+/// the remote, struck out in red when its remote branch is gone, none when
+/// it was never pushed.
+fn remote_cloud(remote: &Remote, color: Hsla, theme: &Theme) -> Option<gpui::Div> {
+    let (color, struck) = match remote {
+        Remote::InStep | Remote::Apart(_) => (color, false),
+        Remote::Gone => (theme.error, true),
+        Remote::Local => return None,
+    };
+    Some(
+        div()
+            .flex_none()
+            .w(px(CLOUD.0))
+            .h(px(CLOUD.1))
+            .ml(px(NOTE_GAP))
+            .child(cloud(color, struck)),
+    )
+}
+
+/// A cloud's size, and how wide its stroke is.
+const CLOUD: (f32, f32) = (14., 10.5);
+const CLOUD_STROKE: f32 = 1.3;
+
+/// An outlined cloud filling its box, `struck` through.
+fn cloud(color: Hsla, struck: bool) -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            // Drawn in a 16 by 12 box, scaled to the one given.
+            let (sx, sy) = (
+                f32::from(bounds.size.width) / 16.,
+                f32::from(bounds.size.height) / 12.,
+            );
+            let at = |x: f32, y: f32| bounds.origin + point(px(x * sx), px(y * sy));
+            let mut path = PathBuilder::stroke(px(CLOUD_STROKE));
+            path.move_to(at(4.5, 11.));
+            path.line_to(at(12., 11.));
+            for (to, control) in [
+                ((14.6, 7.6), (15.6, 11.)),
+                ((11., 5.2), (14., 4.6)),
+                ((5.8, 2.8), (9.4, 0.9)),
+                ((4., 6.), (3.6, 3.6)),
+                ((1.4, 9.), (0.8, 6.6)),
+                ((4.5, 11.), (2., 11.)),
+            ] {
+                path.curve_to(at(to.0, to.1), at(control.0, control.1));
+            }
+            if struck {
+                path.move_to(at(1.5, 0.8));
+                path.line_to(at(14.5, 11.6));
+            }
+            if let Ok(path) = path.build() {
+                window.paint_path(path, color);
+            }
+        },
+    )
+    .size_full()
 }
 
 /// A branch's label: filled when a worktree has it checked out. After its
-/// name, a dot for where it stands against the remote, and how far apart
+/// name, a cloud when it is on the remote, and how far apart
 /// they are. Left behind, merged or its remote gone, it fades, in italics,
 /// struck through when the remote is gone; idle long, its age follows. A
 /// branch only on the remote is outlined, dashed, with no fill.
@@ -1110,7 +1143,7 @@ fn branch_tag(
     }
     let remote = remote_of(graph, name);
     let faded = stale_note(graph, name).is_some();
-    // On a filled label, the dot takes the label's text colour, to show.
+    // On a filled label, the cloud takes the label's text colour, to show.
     let dot_color = match (faded, filled) {
         (true, _) => theme.secondary,
         (false, true) => theme.tag_head_text,
@@ -1118,7 +1151,7 @@ fn branch_tag(
     };
     let dot = remote
         .as_ref()
-        .map(|remote| remote_dot(remote, dot_color, theme));
+        .and_then(|remote| remote_cloud(remote, dot_color, theme));
     let counts = match &remote {
         Some(Remote::Apart(counts)) => Some(
             div()
