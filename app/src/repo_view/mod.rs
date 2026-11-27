@@ -1695,6 +1695,19 @@ impl RepoView {
         }
     }
 
+    /// The repository's worktrees: each folder, with its branch unless
+    /// detached.
+    pub fn worktrees(&self) -> Vec<(String, Option<String>)> {
+        self.graph
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.tip {
+                Revision::Worktree(path) => Some((path.clone(), node.branch.clone())),
+                Revision::Commit(_) => None,
+            })
+            .collect()
+    }
+
     /// Whether the graph has a worktree at `path`.
     pub fn has_worktree(&self, path: &str) -> bool {
         let path = path.trim_end_matches('/');
@@ -1729,7 +1742,9 @@ impl RepoView {
             Some((node, _, rel)) => {
                 let moved = self.selected_nodes != [node] || self.outside_graph;
                 if moved {
-                    self.pending_file = Some(rel.clone());
+                    // A worktree alone, with no file in it, picks none.
+                    self.pending_file = (!rel.is_empty() && !std::path::Path::new(&path).is_dir())
+                        .then(|| rel.clone());
                     self.set_selection(vec![node], cx);
                 }
                 self.reveal.set(Some(node));

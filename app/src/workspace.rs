@@ -63,6 +63,11 @@ pub struct Workspace {
     /// A menu closed by the press that began a click, so the click on its
     /// chevron does not open it again.
     sync_menu_closed: Option<(bool, std::time::Instant)>,
+    /// The list of every tab and its worktrees, open; and when a click
+    /// outside it last closed it, so the click on its button does not open
+    /// it again.
+    tabs_menu: bool,
+    tabs_menu_closed: Option<std::time::Instant>,
 }
 
 /// How many closed tabs the window can reopen.
@@ -175,6 +180,8 @@ impl Workspace {
             held_still: false,
             sync_menu: None,
             sync_menu_closed: None,
+            tabs_menu: false,
+            tabs_menu_closed: None,
         };
         workspace.activate(active, window, cx);
         workspace
@@ -462,6 +469,13 @@ impl Workspace {
                         .child(self.fetch_button(theme, cx)),
                 )
             },
+        )
+        .child(
+            div()
+                .h_full()
+                .flex()
+                .items_center()
+                .child(self.tabs_button(theme, cx)),
         )
     }
 
@@ -759,6 +773,161 @@ impl Workspace {
                 gpui::anchored()
                     .anchor(gpui::Corner::TopRight)
                     .position(point(px(width - 8.), px(TAB_BAR_HEIGHT)))
+                    .child(panel),
+            )
+            .with_priority(3)
+            .into_any_element(),
+        )
+    }
+}
+
+impl Workspace {
+    /// The button in the tab bar's right corner that lists every tab.
+    fn tabs_button(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("tabs-menu-button")
+            .flex()
+            .items_center()
+            .h(px(TAB_HEIGHT))
+            .px(px(6.))
+            .rounded(px(4.))
+            .text_color(theme.secondary)
+            .when(self.tabs_menu, |button| button.bg(theme.selection))
+            .hover(|button| button.bg(theme.selection))
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.tab_pressed = true),
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                let just_closed = this
+                    .tabs_menu_closed
+                    .take()
+                    .is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(500));
+                this.tabs_menu = !this.tabs_menu && !just_closed;
+                cx.notify();
+            }))
+            .child(crate::repo_view::chevron(
+                true,
+                theme.secondary,
+                (crate::preferences::ui_size() * 0.75).round(),
+            ))
+    }
+
+    /// Every tab of the window by name, each with its worktrees and their
+    /// branches, from A to Z: a click shows the tab, or the worktree
+    /// selected in it.
+    fn tabs_menu(
+        &self,
+        theme: &Theme,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !self.tabs_menu {
+            return None;
+        }
+        let mut tabs: Vec<(usize, String, Vec<(String, Option<String>)>)> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(index, tab)| {
+                let view = tab.read(cx);
+                let title = view.tab_title().unwrap_or_else(|| "New Tab".to_string());
+                let mut worktrees = view.worktrees();
+                worktrees.sort_by_key(|(path, _)| folder_name(path).to_lowercase());
+                (index, title, worktrees)
+            })
+            .collect();
+        tabs.sort_by_key(|(_, title, _)| title.to_lowercase());
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for (index, title, worktrees) in tabs {
+            let active = index == self.active;
+            rows.push(
+                div()
+                    .id(("tabs-menu-tab", index))
+                    .flex()
+                    .items_center()
+                    .px(px(10.))
+                    .py(px(4.))
+                    .mt(px(2.))
+                    .rounded(px(4.))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .cursor_pointer()
+                    .hover(|row| row.bg(theme.selection))
+                    .when(active, |row| row.bg(theme.selection.opacity(0.5)))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.tabs_menu = false;
+                        this.activate(index, window, cx);
+                    }))
+                    .child(title)
+                    .into_any_element(),
+            );
+            for (k, (path, branch)) in worktrees.into_iter().enumerate() {
+                let reveal = path.clone();
+                rows.push(
+                    div()
+                        .id(SharedString::from(format!("tabs-menu-{index}-{k}")))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .pl(px(24.))
+                        .pr(px(10.))
+                        .py(px(3.))
+                        .rounded(px(4.))
+                        .cursor_pointer()
+                        .hover(|row| row.bg(theme.selection))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.tabs_menu = false;
+                            this.activate(index, window, cx);
+                            let path = reveal.clone();
+                            this.tabs[index].update(cx, |tab, cx| tab.reveal_file(path, cx));
+                        }))
+                        .child(div().flex_1().min_w_0().truncate().child(folder_name(&path)))
+                        .child(
+                            div()
+                                .flex_none()
+                                .px(px(5.))
+                                .rounded(px(3.))
+                                .bg(theme.tag_background)
+                                .text_xs()
+                                .child(branch.unwrap_or_else(|| "detached".to_string())),
+                        )
+                        .into_any_element(),
+                );
+            }
+        }
+        let height = f32::from(window.viewport_size().height);
+        let panel = div()
+            .id("tabs-menu")
+            .occlude()
+            .flex()
+            .flex_col()
+            .min_w(px(260.))
+            .max_w(px(480.))
+            .max_h(px((height - TAB_BAR_HEIGHT - 24.).max(120.)))
+            .overflow_y_scroll()
+            .p(px(4.))
+            .rounded(px(6.))
+            .border_1()
+            .border_color(theme.separator)
+            .bg(theme.background)
+            .shadow_lg()
+            .text_sm()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.tabs_menu = false;
+                this.tabs_menu_closed = Some(std::time::Instant::now());
+                cx.notify();
+            }))
+            .children(rows);
+        // Its right edge under the button's, in the bar's corner.
+        let right = f32::from(window.viewport_size().width) - 8.;
+        Some(
+            gpui::deferred(
+                gpui::anchored()
+                    .anchor(gpui::Corner::TopRight)
+                    .position(point(px(right), px(TAB_BAR_HEIGHT)))
+                    .snap_to_window()
                     .child(panel),
             )
             .with_priority(3)
@@ -1072,7 +1241,11 @@ impl Render for Workspace {
                 }
             }))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
-                if event.keystroke.key == "escape" && this.sync_menu.take().is_some() {
+                if event.keystroke.key != "escape" {
+                    return;
+                }
+                let tabs_menu = std::mem::take(&mut this.tabs_menu);
+                if this.sync_menu.take().is_some() || tabs_menu {
                     cx.stop_propagation();
                     cx.notify();
                 }
@@ -1080,6 +1253,7 @@ impl Render for Workspace {
             .child(self.tab_bar(&theme, window, cx))
             .child(div().flex_1().min_h_0().child(active))
             .children(self.sync_menu(&theme, window, cx))
+            .children(self.tabs_menu(&theme, window, cx))
     }
 }
 
