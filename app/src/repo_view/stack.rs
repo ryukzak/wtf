@@ -93,6 +93,13 @@ impl RepoView {
             self.folded_sections,
             self.many_files(),
             &|file| self.file_cols(file),
+            &|file| {
+                self.files
+                    .get(file)
+                    .and_then(|file| self.revealed_rows.get(file.path()))
+                    .cloned()
+                    .unwrap_or_default()
+            },
             self.one_column.get(),
         );
         // Only changed rows shown count: folded files, the lines between
@@ -206,6 +213,8 @@ impl RepoView {
         if one != self.one_column.get() {
             self.one_column.set(one);
             self.line_selection = None;
+            // Rows count differently in one column than in two.
+            self.revealed_rows.clear();
             self.restack();
             cx.notify();
         }
@@ -320,6 +329,86 @@ impl RepoView {
             self.snapshot_x.set(x);
             cx.notify();
         }
+    }
+
+    /// Rows a diff skips, with buttons that show more of them: the next
+    /// lines down from the hunk above, or up from the one below; all at
+    /// once when few are left.
+    fn gap_row(
+        &self,
+        file: usize,
+        start: usize,
+        end: usize,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let rows = self
+            .stacked_diffs
+            .get(file)
+            .and_then(|diff| diff.as_ref().ok())
+            .map_or(0, |diff| diff_view::shown(diff, self.one_column.get()).len());
+        let (above, below) = (start > 0, end < rows);
+        let count = end - start;
+        let button = |id: &str, label: &'static str, range: std::ops::Range<usize>| {
+            div()
+                .id(SharedString::from(format!("gap-{id}-{file}-{start}")))
+                .flex()
+                .items_center()
+                .justify_center()
+                .w(px(22.))
+                .h_full()
+                .rounded(px(3.))
+                .cursor_pointer()
+                .text_color(theme.accent)
+                .hover(|button| button.bg(theme.selection))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.reveal_rows(file, range.clone(), cx);
+                }))
+                .child(label)
+        };
+        let down = || button("down", "↓", start..start + REVEAL_ROWS);
+        let up = || button("up", "↑", end - REVEAL_ROWS..end);
+        // Past the last hunk only more down, before the first only up.
+        let buttons = match (count <= REVEAL_ROWS, above, below) {
+            (true, _, _) => vec![button("all", "↕", start..end)],
+            (false, true, false) => vec![down()],
+            (false, false, true) => vec![up()],
+            _ => vec![down(), up()],
+        };
+        div()
+            .flex()
+            .items_center()
+            .w_full()
+            .h(px(diff_view::row_height()))
+            .bg(theme.filler)
+            .text_color(theme.secondary)
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .justify_center()
+                    .gap(px(2.))
+                    .h_full()
+                    .w(px(diff_view::gutter_width()))
+                    .children(buttons),
+            )
+            .child(format!(
+                "⋯ {count} unchanged line{}",
+                if count == 1 { "" } else { "s" }
+            ))
+            .into_any_element()
+    }
+
+    /// Shows rows `range` of a file's diff, kept until the selection
+    /// changes.
+    fn reveal_rows(&mut self, file: usize, range: std::ops::Range<usize>, cx: &mut Context<Self>) {
+        let Some(path) = self.files.get(file).map(|file| file.path().to_string()) else {
+            return;
+        };
+        self.revealed_rows.entry(path).or_default().push(range);
+        self.restack();
+        cx.notify();
     }
 
     fn toggle_section(&mut self, staged: bool, cx: &mut Context<Self>) {
@@ -930,7 +1019,7 @@ impl RepoView {
                     })
                     .into_any_element()
             }
-            StackItem::Gap => diff_view::gap(theme).into_any_element(),
+            &StackItem::Gap(file, start, end) => self.gap_row(file, start, end, theme, cx),
             StackItem::HeaderPad => row().into_any_element(),
             StackItem::Note(text) => row()
                 .pl(px(48.))
@@ -956,6 +1045,7 @@ pub(super) fn stack_items(
     folded_sections: [bool; 2],
     many: bool,
     cols: &dyn Fn(usize) -> Option<usize>,
+    revealed: &dyn Fn(usize) -> Vec<std::ops::Range<usize>>,
     one: bool,
 ) -> Vec<StackItem> {
     let mut items = Vec::new();
@@ -999,29 +1089,39 @@ pub(super) fn stack_items(
         if folded.get(file).copied().unwrap_or(false) {
             continue;
         }
-        let hunks = match diff {
-            Ok(diff) => diff_view::hunks(diff_view::shown(diff, one), CONTEXT_ROWS),
+        let shown = match diff {
+            Ok(diff) => diff_view::shown_rows(
+                diff_view::shown(diff, one),
+                CONTEXT_ROWS,
+                &revealed(file),
+            ),
             Err(error) => {
                 items.push(StackItem::Note(error.clone()));
                 continue;
             }
         };
-        if hunks.is_empty() {
+        if shown.is_empty() {
             items.push(StackItem::Note("No visible changes".to_string()));
         }
-        if split.is_none() {
-            for row in hunks {
-                match row {
-                    Some(row) => items.extend(lines(file, row)),
-                    None => items.push(StackItem::Gap),
-                }
+        let mut k = 0;
+        while k < shown.len() {
+            if let diff_view::Shown::Gap(start, end) = shown[k] {
+                items.push(StackItem::Gap(file, start, end));
+                k += 1;
+                continue;
             }
-            continue;
-        }
-        // A worktree file's hunks each get a header to stage them by.
-        for hunk in hunks.split(Option::is_none).filter(|hunk| !hunk.is_empty()) {
-            let rows: Vec<usize> = hunk.iter().flatten().copied().collect();
-            items.push(StackItem::Hunk(file, rows[0], rows[rows.len() - 1] + 1));
+            let rows: Vec<usize> = shown[k..]
+                .iter()
+                .map_while(|shown| match *shown {
+                    diff_view::Shown::Row(row) => Some(row),
+                    diff_view::Shown::Gap(..) => None,
+                })
+                .collect();
+            k += rows.len();
+            // A worktree file's hunks each get a header to stage them by.
+            if split.is_some() {
+                items.push(StackItem::Hunk(file, rows[0], rows[rows.len() - 1] + 1));
+            }
             items.extend(rows.into_iter().flat_map(|row| lines(file, row)));
         }
     }

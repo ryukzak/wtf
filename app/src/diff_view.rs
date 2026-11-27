@@ -29,34 +29,64 @@ pub fn first_change(rows: &[DiffRow]) -> Option<usize> {
 
 /// The rows to show around changes, keeping `context` rows on each side; `None`
 /// marks skipped rows.
+#[cfg(test)]
 pub fn hunks(rows: &[DiffRow], context: usize) -> Vec<Option<usize>> {
-    let mut keep = vec![false; rows.len()];
-    for (i, _) in rows.iter().enumerate().filter(|(_, row)| is_change(row)) {
-        let end = (i + context + 1).min(rows.len());
-        keep[i.saturating_sub(context)..end].fill(true);
-    }
-    let mut shown = Vec::new();
-    for (i, &kept) in keep.iter().enumerate() {
-        if kept {
-            shown.push(Some(i));
-        } else if shown.last().is_some_and(Option::is_some) || (i == 0) {
-            shown.push(None);
-        }
-    }
+    let mut shown: Vec<Option<usize>> = shown_rows(rows, context, &[])
+        .into_iter()
+        .map(|shown| match shown {
+            Shown::Row(row) => Some(row),
+            Shown::Gap(..) => None,
+        })
+        .collect();
     if shown.last() == Some(&None) {
         shown.pop();
     }
     shown
 }
 
-pub fn gap(theme: &Theme) -> Div {
-    div()
-        .w_full()
-        .h(px(row_height()))
-        .pl(px(gutter_width()))
-        .bg(theme.filler)
-        .text_color(theme.secondary)
-        .child("⋯")
+/// A row a diff shows, or the rows `start..end` it skips.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Shown {
+    Row(usize),
+    Gap(usize, usize),
+}
+
+/// The rows to show: `context` rows on each side of changes, and those
+/// `revealed` by hand; the rest skipped, before, between and after them.
+/// A file with no changes shows nothing.
+pub fn shown_rows(
+    rows: &[DiffRow],
+    context: usize,
+    revealed: &[std::ops::Range<usize>],
+) -> Vec<Shown> {
+    let mut keep = vec![false; rows.len()];
+    for (i, _) in rows.iter().enumerate().filter(|(_, row)| is_change(row)) {
+        let end = (i + context + 1).min(rows.len());
+        keep[i.saturating_sub(context)..end].fill(true);
+    }
+    if !keep.contains(&true) {
+        return Vec::new();
+    }
+    for range in revealed {
+        let end = range.end.min(rows.len());
+        keep[range.start.min(end)..end].fill(true);
+    }
+    let mut shown = Vec::new();
+    let mut i = 0;
+    while i < keep.len() {
+        match keep[i] {
+            true => {
+                shown.push(Shown::Row(i));
+                i += 1;
+            }
+            false => {
+                let end = (i..keep.len()).find(|&k| keep[k]).unwrap_or(keep.len());
+                shown.push(Shown::Gap(i, end));
+                i = end;
+            }
+        }
+    }
+    shown
 }
 
 /// How a diff row's code fits its side: cut at the edge and moved left by
@@ -563,6 +593,25 @@ mod tests {
         assert_eq!(parts(&empty, 3), 1);
         // Only changed lines count: `row` is unchanged, `empty` has none.
         assert_eq!(widest_changed(&[row, empty]), 0);
+    }
+
+    #[test]
+    fn rows_revealed_by_hand_narrow_the_gaps() {
+        let mut rows: Vec<DiffRow> = (0..30).map(|_| line(false)).collect();
+        rows[10] = line(true);
+        rows[25] = line(true);
+        let gaps = |revealed: &[std::ops::Range<usize>]| -> Vec<(usize, usize)> {
+            shown_rows(&rows, 2, revealed)
+                .into_iter()
+                .filter_map(|shown| match shown {
+                    Shown::Gap(start, end) => Some((start, end)),
+                    Shown::Row(_) => None,
+                })
+                .collect()
+        };
+        assert_eq!(gaps(&[]), [(0, 8), (13, 23), (28, 30)]);
+        assert_eq!(gaps(&[13..18, 5..8, 28..40]), [(0, 5), (18, 23)]);
+        assert_eq!(gaps(&[13..23]), [(0, 8), (28, 30)], "a gap shown whole joins its hunks");
     }
 
     #[test]

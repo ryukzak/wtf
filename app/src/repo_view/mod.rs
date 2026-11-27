@@ -56,6 +56,8 @@ pub use time::{now_seconds, short_age};
 pub use widgets::chevron;
 
 const CONTEXT_ROWS: usize = 3;
+/// How many skipped diff rows a click on a gap shows.
+const REVEAL_ROWS: usize = 10;
 const REFRESH: Duration = Duration::from_secs(2);
 /// How often the tab in front refreshes while its window is not: often
 /// enough to follow agents at work from another screen.
@@ -238,7 +240,9 @@ enum StackItem {
     Row(usize, usize, usize),
     /// A hunk of a worktree file: its first row and the row after its last.
     Hunk(usize, usize, usize),
-    Gap,
+    /// Rows `start..end` of a file skipped between, before or after its
+    /// hunks.
+    Gap(usize, usize, usize),
     Note(String),
     /// The row a section's or file's header reaches up into: headers are
     /// two rows tall.
@@ -512,6 +516,9 @@ pub struct RepoView {
     wrap_cols: Option<usize>,
     /// Files whose lines wrap whatever is chosen, by their place in `files`.
     wrapped_files: Vec<bool>,
+    /// Rows of files' diffs shown by hand beyond the context of changes, by
+    /// path, until the selection changes.
+    revealed_rows: HashMap<String, Vec<std::ops::Range<usize>>>,
     stacked: Vec<StackItem>,
     /// The longest line among the rows the stack shows, in characters: as
     /// far as its code scrolls sideways.
@@ -774,6 +781,7 @@ impl RepoView {
             diff_width: Cell::new((-1., -1.)),
             wrap_cols: None,
             wrapped_files: Vec::new(),
+            revealed_rows: HashMap::new(),
             stacked: Vec::new(),
             stacked_widest: 0,
             stacked_diffs: Vec::new(),
@@ -1794,6 +1802,7 @@ impl RepoView {
         }
         self.worktree_split = None;
         self.line_selection = None;
+        self.revealed_rows.clear();
         self.outside_graph = false;
         self.stash_view = None;
         self.range = self.graph.range(&selected);
@@ -4524,6 +4533,7 @@ mod tests {
             [false; 2],
             false,
             &|_| None,
+            &|_| Vec::new(),
             false,
         )
         .iter()
@@ -4547,6 +4557,7 @@ mod tests {
             [true, false],
             false,
             &|_| None,
+            &|_| Vec::new(),
             false,
         )
         .iter()
@@ -4566,6 +4577,7 @@ mod tests {
             [false; 2],
             false,
             &|_| None,
+            &|_| Vec::new(),
             false,
         )
         .iter()
@@ -4587,7 +4599,7 @@ mod tests {
 
         // Too many files to open at once: a note says why, and every file
         // keeps its header, folded.
-        let many = stack_items(&diffs, &[true; 3], Some(2), [false; 2], true, &|_| None, false);
+        let many = stack_items(&diffs, &[true; 3], Some(2), [false; 2], true, &|_| None, &|_| Vec::new(), false);
         assert!(matches!(&many[0], StackItem::Note(note) if note.starts_with("3 files")));
         let headers = many
             .iter()
@@ -4603,6 +4615,7 @@ mod tests {
             [false; 2],
             false,
             &|_| None,
+            &|_| Vec::new(),
             false,
         );
         assert!(matches!(
@@ -4652,14 +4665,14 @@ mod tests {
             Err("binary".to_string()),
         ];
         let kinds = |folded: &[bool]| -> Vec<String> {
-            stack_items(&diffs, folded, None, [false; 2], false, &|_| None, false)
+            stack_items(&diffs, folded, None, [false; 2], false, &|_| None, &|_| Vec::new(), false)
                 .iter()
                 .map(|item| match item {
                     StackItem::Section(staged, count) => format!("S{staged}:{count}"),
                     StackItem::Header(file) => format!("H{file}"),
                     StackItem::Row(file, row, _) => format!("{file}:{row}"),
                     StackItem::Hunk(..) => "@".to_string(),
-                    StackItem::Gap => "…".to_string(),
+                    StackItem::Gap(..) => "…".to_string(),
                     StackItem::Note(text) => text.clone(),
                     StackItem::HeaderPad => " ".to_string(),
                 })
