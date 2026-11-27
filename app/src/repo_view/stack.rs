@@ -76,6 +76,7 @@ impl RepoView {
             .iter()
             .map(|file| rule.takes(file.path(), 0))
             .collect();
+        self.wrap_rule = rule;
     }
 
     pub(super) fn restack(&mut self) {
@@ -168,6 +169,7 @@ impl RepoView {
     ) {
         self.wrap = wrap;
         self.diff_x.set(0.);
+        self.snapshot_x.set(0.);
         self.sync_wrap(window, cx);
         cx.notify();
     }
@@ -300,6 +302,22 @@ impl RepoView {
         let x = (self.diff_x.get() - dx).clamp(0., self.diff_max_x.get());
         if x != self.diff_x.get() {
             self.diff_x.set(x);
+            cx.notify();
+        }
+    }
+
+    /// A sideways scroll, or ⇧ with a wheel, moves the Snapshot file's
+    /// code while its lines run on.
+    pub(super) fn scroll_snapshot_sideways(
+        &mut self,
+        event: &gpui::ScrollWheelEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let dx = f32::from(event.delta.pixel_delta(px(diff_view::row_height())).x);
+        let x = (self.snapshot_x.get() - dx).clamp(0., self.snapshot_max_x.get());
+        if x != self.snapshot_x.get() {
+            self.snapshot_x.set(x);
             cx.notify();
         }
     }

@@ -147,9 +147,8 @@ impl RepoView {
     /// Scrolls the open file to the line found in it, once its text is in.
     pub(super) fn scroll_to_found(&mut self) {
         if let Some((_, line)) = &self.snapshot.found_line {
-            let row = (*line as usize).saturating_sub(1);
-            self.snapshot_scroll
-                .scroll_to_item(row, ScrollStrategy::Center);
+            self.snapshot_goto
+                .set(Some(((*line as usize).saturating_sub(1), None)));
         }
     }
 

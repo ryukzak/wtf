@@ -224,15 +224,22 @@ impl RepoView {
         text.as_ref().ok()?.lines().nth(row)
     }
 
-    /// The byte of the Snapshot file's line `row` the mouse at `position`
-    /// is nearest.
-    fn snapshot_byte(&self, row: usize, position: Point<Pixels>, window: &Window) -> usize {
+    /// Where in the Snapshot file the mouse at `position` over its row
+    /// `shown` is nearest: the line, and the byte in it.
+    fn snapshot_at(&self, shown: usize, position: Point<Pixels>, window: &Window) -> TextAt {
         let bounds = self.snapshot_scroll.0.borrow().base_handle.bounds();
-        let x = f32::from(position.x - bounds.origin.x) - diff_view::gutter_width();
+        let x = f32::from(position.x - bounds.origin.x) - diff_view::gutter_width()
+            + self.snapshot_x.get();
         let width = stack::code_char_width(window).max(1.);
         let column = (x / width).round().max(0.) as usize;
-        let text = self.snapshot_line(row).unwrap_or_default();
-        text.char_indices().nth(column).map_or(text.len(), |(i, _)| i)
+        let row = self.snapshot_rows.borrow().get(shown).copied();
+        let Some(super::SnapshotRow { line, start, end }) = row else {
+            return TextAt { row: shown, byte: 0 };
+        };
+        let text = self.snapshot_line(line).unwrap_or_default();
+        let part = text.get(start..end).unwrap_or_default();
+        let byte = part.char_indices().nth(column).map_or(end, |(i, _)| start + i);
+        TextAt { row: line, byte }
     }
 
     /// A press on the Snapshot file: starts a selection there, a word's on
@@ -247,7 +254,7 @@ impl RepoView {
         let Some(path) = self.snapshot.path.clone() else {
             return;
         };
-        let byte = self.snapshot_byte(row, event.position, window);
+        let TextAt { row, byte } = self.snapshot_at(row, event.position, window);
         self.selecting_snapshot = true;
         match &mut self.snapshot_selection {
             Some((shown, _, head)) if event.modifiers.shift && *shown == path => {
@@ -286,10 +293,7 @@ impl RepoView {
             self.selecting_snapshot = false;
             return;
         }
-        let head = TextAt {
-            row,
-            byte: self.snapshot_byte(row, event.position, window),
-        };
+        let head = self.snapshot_at(row, event.position, window);
         if let Some((_, _, at)) = &mut self.snapshot_selection
             && *at != head
         {

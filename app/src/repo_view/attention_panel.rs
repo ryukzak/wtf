@@ -59,7 +59,10 @@ impl RepoView {
             .flex_1()
             .min_h_0()
             .pb(px(8.))
+            .track_scroll(&self.attention_scroll)
             .overflow_y_scroll();
+        // The rows put in the list so far, to find the stash shown by.
+        let mut rows = 0usize;
         let groups = [
             (Section::Worktrees, "WORKTREES", None),
             (
@@ -120,6 +123,7 @@ impl RepoView {
                 Section::Remote => Some(Target::Group { remote: true }),
                 _ => None,
             };
+            rows += 1;
             body = body.child(
                 div()
                     .id(("attention-section", section as usize))
@@ -176,6 +180,7 @@ impl RepoView {
             let branches: Vec<&wtf_core::Branch> = branches.into_iter().filter(found).collect();
             if section == Section::Worktrees {
                 for branch in branches {
+                    rows += 1;
                     body = body.child(self.attention_row(branch, None, 1, now, theme, cx));
                 }
                 continue;
@@ -199,6 +204,7 @@ impl RepoView {
             for row in name_tree(&names, &folded, false) {
                 match row {
                     NameRow::Leaf { index, name, depth } => {
+                        rows += 1;
                         body = body.child(self.attention_row(
                             branches[index],
                             Some(name),
@@ -225,6 +231,7 @@ impl RepoView {
                         };
                         let key = format!("{prefix}{path}");
                         let folded = folded.contains(&path);
+                        rows += 1;
                         body = body.child(
                             div()
                                 .id(SharedString::from(format!("attention-dir-{key}")))
@@ -288,6 +295,10 @@ impl RepoView {
                         id: stash.id.clone(),
                     };
                     let shown = self.stash_view.as_ref().is_some_and(|s| s.name == name);
+                    if shown && self.reveal_attention_stash.take() {
+                        self.attention_scroll.scroll_to_item(rows);
+                    }
+                    rows += 1;
                     body = body.child(
                         div()
                             .id(SharedString::from(format!("attention-{name}")))
@@ -327,6 +338,7 @@ impl RepoView {
                 }
             }
             for tag in tags.into_iter().filter(|tag| matches(tag)) {
+                rows += 1;
                 body = body.child(
                     div()
                         .flex()

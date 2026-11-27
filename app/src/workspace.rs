@@ -836,8 +836,37 @@ pub fn repository_path(path: &str) -> String {
 /// icon: in the window that has it open already, else in the front window,
 /// or in a new one when there is none. The window comes to the front, on
 /// whichever Space it is.
+///
+/// A path inside a repository, such as a file, opens the tab of the
+/// repository with a worktree there, as one opened from another worktree
+/// has, and shows it: the worktree selected, the file picked among its
+/// changes or opened in a snapshot.
 pub fn open_paths(paths: Vec<String>, cx: &mut App) {
-    let roots: Vec<String> = paths.iter().map(|path| repository_path(path)).collect();
+    let mut reveals: Vec<(String, String)> = Vec::new();
+    let roots: Vec<String> = paths
+        .iter()
+        .map(|path| {
+            let root = repository_path(path);
+            let full = std::fs::canonicalize(path)
+                .map(|full| full.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| path.clone());
+            // A tab showing the worktree already, else one of its own.
+            let tab = repo_views(cx)
+                .into_iter()
+                .filter_map(|tab| {
+                    let tab = tab.read(cx);
+                    let repo = tab.repo_path()?.to_string();
+                    (repo == root || tab.has_worktree(&root)).then_some(repo)
+                })
+                .min_by_key(|repo| *repo != root)
+                .unwrap_or(root.clone());
+            // A worktree opened in another's tab is selected there too.
+            if full.trim_end_matches('/') != root.trim_end_matches('/') || tab != root {
+                reveals.push((tab.clone(), full));
+            }
+            tab
+        })
+        .collect();
     let front = cx.active_window().or_else(|| cx.windows().first().copied());
     let mut missing = Vec::new();
     for path in roots {
@@ -865,6 +894,19 @@ pub fn open_paths(paths: Vec<String>, cx: &mut App) {
     }
     if !missing.is_empty() {
         open_window(missing, cx);
+    }
+    // Once the tabs are open.
+    if !reveals.is_empty() {
+        cx.defer(move |cx| {
+            for (repo, path) in reveals {
+                let tab = repo_views(cx)
+                    .into_iter()
+                    .find(|tab| tab.read(cx).repo_path() == Some(repo.as_str()));
+                if let Some(tab) = tab {
+                    tab.update(cx, |tab, cx| tab.reveal_file(path, cx));
+                }
+            }
+        });
     }
 }
 

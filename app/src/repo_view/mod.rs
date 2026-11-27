@@ -358,6 +358,10 @@ pub struct RepoView {
     combine_commits: bool,
     attention: Attention,
     graph_scroll: ScrollHandle,
+    /// The attention panel's list, and whether it is yet to scroll to the
+    /// stash shown, as one just made is.
+    attention_scroll: ScrollHandle,
+    reveal_attention_stash: Cell<bool>,
     /// What the menu bar was last built from.
     menus_for: Option<MenuState>,
     worktree_names: WorktreeNames,
@@ -391,6 +395,18 @@ pub struct RepoView {
     /// Reading the files, the open file, and its history.
     snapshot_tasks: [Option<Task<()>>; 4],
     snapshot_scroll: UniformListScrollHandle,
+    /// The Snapshot file's rows as drawn: each a line's bytes, many to a
+    /// line that wraps.
+    snapshot_rows: RefCell<Rc<Vec<SnapshotRow>>>,
+    /// How far the Snapshot file's code is scrolled sideways, and how far
+    /// it can go, while its lines run on.
+    snapshot_x: Cell<f32>,
+    snapshot_max_x: Cell<f32>,
+    /// A line to scroll the Snapshot file to once its rows are laid out:
+    /// to the top, so far into it, or to the middle.
+    snapshot_goto: Cell<Option<(usize, Option<f32>)>>,
+    /// The Settings' files that wrap on Auto, as last read.
+    wrap_rule: wtf_core::TextDiff,
     snapshot_search_focus: FocusHandle,
     /// The commit list's, for ↑ and ↓ through it and its ⌘A.
     commit_list_focus: FocusHandle,
@@ -426,6 +442,11 @@ pub struct RepoView {
     reveal_stash: bool,
     /// A branch shown from Go To, selected once the graph draws it.
     reveal_branch: Option<String>,
+    /// A file handed to the app from outside, as `wtf path/to/file` does,
+    /// by its full path, waiting for the graph to show its worktree.
+    reveal_file: Option<String>,
+    /// That file, in its worktree, to pick once the changes load.
+    pending_file: Option<String>,
     /// Code colors of the diffs shown, by file, appearance and view.
     syntax: RefCell<HashMap<ColorKey, Rc<syntax::Colors>>>,
     /// Colors being made, and how many times the made ones were dropped:
@@ -670,6 +691,8 @@ impl RepoView {
             combine_commits: true,
             attention: Attention::default(),
             graph_scroll: ScrollHandle::new(),
+            attention_scroll: ScrollHandle::new(),
+            reveal_attention_stash: Cell::new(false),
             menus_for: None,
             worktree_names: WorktreeNames::FolderAndBranch,
             worktree_order: WorktreeOrder::ForkPoint,
@@ -687,6 +710,11 @@ impl RepoView {
             snapshot: Snapshot::default(),
             snapshot_tasks: [None, None, None, None],
             snapshot_scroll: UniformListScrollHandle::new(),
+            snapshot_rows: RefCell::new(Rc::new(Vec::new())),
+            snapshot_x: Cell::new(0.),
+            snapshot_max_x: Cell::new(0.),
+            snapshot_goto: Cell::new(None),
+            wrap_rule: wtf_core::TextDiff::default(),
             snapshot_search_focus: cx.focus_handle(),
             commit_list_focus: cx.focus_handle(),
             prune: None,
@@ -710,6 +738,8 @@ impl RepoView {
             stash_view: None,
             reveal_stash: false,
             reveal_branch: None,
+            reveal_file: None,
+            pending_file: None,
             syntax: RefCell::new(HashMap::new()),
             syntax_making: RefCell::new(HashSet::new()),
             syntax_generation: Cell::new(0),
@@ -960,6 +990,9 @@ impl RepoView {
                 let took = started.elapsed();
                 let interval = this.update(cx, |this, cx| {
                     this.apply_graph(result, cx);
+                    if !this.graph.nodes.is_empty() {
+                        this.apply_reveal_file(cx);
+                    }
                     this.fetch_when_due(cx);
                     // The terminal prints the refresh's commands itself; the
                     // view is not redrawn for them.
@@ -1452,6 +1485,10 @@ impl RepoView {
                 Some((id, name)) if Some(&id) != before.as_ref() => {
                     self.awaiting_stash = None;
                     self.collapsed_sections.remove(&Section::Stashes);
+                    self.side_panel = Some(SidePanel::Attention);
+                    self.last_panel = SidePanel::Attention;
+                    self.reveal_attention_stash.set(true);
+                    self.update_menus(cx);
                     self.show_stash(&name, cx);
                     cx.notify();
                     return;
@@ -1639,6 +1676,89 @@ impl RepoView {
             self.change_attention(|attention| attention.stashes = true, cx);
         }
         cx.notify();
+    }
+
+    /// Shows a file handed to the app from outside: its worktree selected,
+    /// and the file picked among the changes, or opened in a snapshot.
+    pub fn reveal_file(&mut self, path: String, cx: &mut Context<Self>) {
+        self.reveal_file = Some(path);
+        if !self.graph.nodes.is_empty() {
+            self.apply_reveal_file(cx);
+        }
+    }
+
+    /// Whether the graph has a worktree at `path`.
+    pub fn has_worktree(&self, path: &str) -> bool {
+        let path = path.trim_end_matches('/');
+        self.graph.nodes.iter().any(|node| {
+            matches!(&node.tip, Revision::Worktree(p) if p.trim_end_matches('/') == path)
+        })
+    }
+
+    fn apply_reveal_file(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.reveal_file.take() else {
+            return;
+        };
+        let inside = |root: &str| -> Option<String> {
+            let root = root.trim_end_matches('/');
+            match path.strip_prefix(root)? {
+                "" => Some(String::new()),
+                rest => rest.strip_prefix('/').map(str::to_string),
+            }
+        };
+        // The deepest worktree holding it, as one may sit inside another.
+        let worktree = self
+            .graph
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, node)| match &node.tip {
+                Revision::Worktree(root) => Some((i, root.len(), inside(root)?)),
+                Revision::Commit(_) => None,
+            })
+            .max_by_key(|(_, len, _)| *len);
+        let (rel, moved) = match worktree {
+            Some((node, _, rel)) => {
+                let moved = self.selected_nodes != [node] || self.outside_graph;
+                if moved {
+                    self.pending_file = Some(rel.clone());
+                    self.set_selection(vec![node], cx);
+                }
+                self.reveal.set(Some(node));
+                (rel, moved)
+            }
+            // A clean worktree has no node: the file is found in what is
+            // selected.
+            None => match self.repo_path.as_deref().and_then(inside) {
+                Some(rel) => (rel, false),
+                None => return,
+            },
+        };
+        let is_file = !rel.is_empty() && !std::path::Path::new(&path).is_dir();
+        if !is_file {
+            self.pending_file = None;
+        } else if self.snapshot_mode {
+            self.pending_file = None;
+            self.open_found(rel, None, cx);
+        } else if moved || self.files_task.is_some() {
+            self.pending_file = Some(rel);
+        } else {
+            self.pending_file = None;
+            match self.files.iter().position(|file| file.path() == rel) {
+                Some(index) => self.select_file(Some(index), cx),
+                None => self.open_in_tree(rel, cx),
+            }
+        }
+        cx.notify();
+    }
+
+    /// Opens a file in the snapshot, switching to it, as one not changed
+    /// has nothing to show among the changes.
+    fn open_in_tree(&mut self, path: String, cx: &mut Context<Self>) {
+        self.snapshot_mode = true;
+        self.side_panel = Some(SidePanel::Files);
+        self.update_menus(cx);
+        self.open_found(path, None, cx);
     }
 
     /// The node a stash was made on, when the graph reaches back to it.
@@ -1907,6 +2027,10 @@ impl RepoView {
             return;
         };
         let keep_place = std::mem::take(&mut self.keep_place);
+        // A file handed from outside is picked over the one kept; with no
+        // changes, it opens in a snapshot.
+        let handed = self.pending_file.take();
+        let keep = handed.clone().or(keep);
         self.load_totals(&repo_path, base.clone(), tip.clone(), cx);
         // A selected worktree alone shows its changes split for staging.
         let worktree = self.staging_worktree();
@@ -1941,6 +2065,9 @@ impl RepoView {
                         let kept = keep.and_then(|path| {
                             this.files.iter().position(|file| file.path() == path)
                         });
+                        if let Some(path) = handed.filter(|_| kept.is_none()) {
+                            this.open_in_tree(path, cx);
+                        }
                         if split.is_some() {
                             this.suggest_message(cx);
                         }
@@ -2396,7 +2523,7 @@ impl RepoView {
             return placeholder("No repository", Some(hint.into()), theme);
         }
         if self.snapshot_mode {
-            let view = self.snapshot_view(theme, cx);
+            let view = self.snapshot_view(theme, window, cx);
             // The message keeps one height, four lines unless dragged, so
             // the file under it stays put from version to version.
             let height = self
@@ -3587,14 +3714,19 @@ impl RepoView {
         if shown != path || old == new {
             return;
         }
-        let handle = &self.snapshot_scroll.0.borrow().base_handle;
-        let offset = handle.offset();
+        let offset = self.snapshot_scroll.0.borrow().base_handle.offset();
         let row = diff_view::row_height();
         let scrolled = f32::from(-offset.y).max(0.);
         let top = (scrolled / row) as usize;
         let within = scrolled - top as f32 * row;
-        let carried = wtf_core::carry_line(old, new, top);
-        handle.set_offset(point(offset.x, px(-(carried as f32 * row + within))));
+        // Rows are lines, or parts of them where lines wrap.
+        let line = self
+            .snapshot_rows
+            .borrow()
+            .get(top)
+            .map_or(top, |row| row.line);
+        let carried = wtf_core::carry_line(old, new, line);
+        self.snapshot_goto.set(Some((carried, Some(within))));
     }
 
     /// Opens a file in the snapshot, with the folders on the way to it.
@@ -3915,7 +4047,7 @@ impl RepoView {
 
     /// The open file, whole, as it is in the snapshot; while another state
     /// is read, the last one read stays.
-    fn snapshot_view(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    fn snapshot_view(&self, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(revision) = self.snapshot_revision() else {
             return placeholder("Nothing selected", None, theme);
         };
@@ -4015,25 +4147,61 @@ impl RepoView {
             .as_ref()
             .filter(|(shown, _, _)| *shown == path)
             .map(|&(_, anchor, head)| (anchor.min(head), anchor.max(head)));
+        // Long lines wrap at the view's edge, or run on and scroll sideways.
+        let wraps = match self.wrap {
+            WrapMode::Wrap => true,
+            WrapMode::NoWrap => false,
+            WrapMode::Auto => self.wrap_rule.takes(&path, 0),
+        };
+        let width = f32::from(self.snapshot_scroll.0.borrow().base_handle.bounds().size.width);
+        let char_width = stack::code_char_width(window).max(1.);
+        let room = (width - diff_view::gutter_width()).max(0.);
+        let cols = (wraps && room > 0.).then(|| ((room / char_width).floor() as usize).max(1));
+        let rows: Rc<Vec<SnapshotRow>> = Rc::new(snapshot_rows(&lines, cols));
+        self.snapshot_rows.replace(rows.clone());
+        let widest = match cols {
+            Some(_) => 0,
+            None => lines.iter().map(|line| line.chars().count()).max().unwrap_or(0),
+        };
+        let max_x = (widest as f32 * char_width - room + 8.).max(0.);
+        self.snapshot_max_x.set(max_x);
+        let x = self.snapshot_x.get().min(max_x);
+        self.snapshot_x.set(x);
+        if let Some((line, within)) = self.snapshot_goto.take() {
+            let at = rows.partition_point(|row| row.line < line);
+            match within {
+                Some(within) => {
+                    let handle = &self.snapshot_scroll.0.borrow().base_handle;
+                    let offset = handle.offset();
+                    let y = at as f32 * diff_view::row_height() + within;
+                    handle.set_offset(point(offset.x, px(-y)));
+                }
+                None => self.snapshot_scroll.scroll_to_item(at, ScrollStrategy::Center),
+            }
+        }
         uniform_list(
             "snapshot-text",
-            lines.len(),
+            rows.len(),
             cx.processor(move |_, range: std::ops::Range<usize>, _, cx| {
                 range
-                    .map(|i| {
-                        let line = &lines[i];
+                    .map(|k| {
+                        let SnapshotRow { line: i, start, end } = rows[k];
+                        let whole = &lines[i];
+                        let line = &whole[start..end];
                         let spans = colors.right.get(&(i as u32 + 1));
                         let highlights: Vec<_> = spans
                             .into_iter()
                             .flatten()
                             .filter(|(range, _)| {
-                                range.end <= line.len()
-                                    && line.is_char_boundary(range.start)
-                                    && line.is_char_boundary(range.end)
+                                range.end <= whole.len()
+                                    && whole.is_char_boundary(range.start)
+                                    && whole.is_char_boundary(range.end)
+                                    && range.end > start
+                                    && range.start < end
                             })
                             .map(|(range, color)| {
                                 (
-                                    range.clone(),
+                                    range.start.max(start) - start..range.end.min(end) - start,
                                     HighlightStyle {
                                         color: Some(*color),
                                         ..Default::default()
@@ -4043,9 +4211,9 @@ impl RepoView {
                             .collect();
                         let picked = selected.and_then(|(from, to)| {
                             (from.row..=to.row).contains(&i).then(|| {
-                                let start = if i == from.row { from.byte } else { 0 };
-                                let end = if i == to.row { to.byte } else { line.len() };
-                                start.min(line.len())..end.min(line.len())
+                                let a = if i == from.row { from.byte } else { 0 };
+                                let b = if i == to.row { to.byte } else { whole.len() };
+                                a.clamp(start, end) - start..b.clamp(start, end) - start
                             })
                         });
                         let highlights = diff_view::with_selection(
@@ -4054,7 +4222,7 @@ impl RepoView {
                             selection,
                         );
                         div()
-                            .id(("snapshot-line", i))
+                            .id(("snapshot-line", k))
                             .flex()
                             .w_full()
                             .h(px(diff_view::row_height()))
@@ -4062,12 +4230,12 @@ impl RepoView {
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                                    this.press_snapshot(i, event, window, cx)
+                                    this.press_snapshot(k, event, window, cx)
                                 }),
                             )
                             .on_mouse_move(cx.listener(
                                 move |this, event: &gpui::MouseMoveEvent, window, cx| {
-                                    this.drag_snapshot(i, event, window, cx)
+                                    this.drag_snapshot(k, event, window, cx)
                                 },
                             ))
                             .whitespace_nowrap()
@@ -4081,11 +4249,17 @@ impl RepoView {
                                     .pr(px(8.))
                                     .text_right()
                                     .text_color(secondary)
-                                    .child((i + 1).to_string()),
+                                    .when(start == 0, |gutter| gutter.child((i + 1).to_string())),
                             )
                             .child(
-                                div().text_color(foreground).child(
-                                    StyledText::new(line.clone()).with_highlights(highlights),
+                                div().flex_1().min_w_0().overflow_hidden().child(
+                                    div()
+                                        .ml(px(-x))
+                                        .text_color(foreground)
+                                        .child(
+                                            StyledText::new(line.to_string())
+                                                .with_highlights(highlights),
+                                        ),
                                 ),
                             )
                     })
@@ -4094,12 +4268,52 @@ impl RepoView {
         )
         .track_scroll(self.snapshot_scroll.clone())
         .size_full()
+        .on_scroll_wheel(cx.listener(Self::scroll_snapshot_sideways))
         .font_family(preferences::code_font())
         .font_weight(preferences::code_weight())
         .text_size(px(preferences::code_size()))
         .line_height(px(diff_view::row_height()))
         .into_any_element()
     }
+}
+
+/// A row of the Snapshot file: line `line`'s bytes `start..end`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct SnapshotRow {
+    pub line: usize,
+    pub start: usize,
+    pub end: usize,
+}
+
+/// The rows `lines` show in: one a line, or wrapped at `cols` characters,
+/// as many as each needs.
+fn snapshot_rows(lines: &[String], cols: Option<usize>) -> Vec<SnapshotRow> {
+    let mut rows = Vec::with_capacity(lines.len());
+    for (line, text) in lines.iter().enumerate() {
+        let Some(cols) = cols.filter(|&cols| text.len() > cols) else {
+            rows.push(SnapshotRow {
+                line,
+                start: 0,
+                end: text.len(),
+            });
+            continue;
+        };
+        let bytes: Vec<usize> = text
+            .char_indices()
+            .map(|(at, _)| at)
+            .chain([text.len()])
+            .collect();
+        let starts = diff_view::wrap_starts(text, cols);
+        for (k, &from) in starts.iter().enumerate() {
+            let to = starts.get(k + 1).map_or(text.len(), |&to| bytes[to]);
+            rows.push(SnapshotRow {
+                line,
+                start: bytes[from],
+                end: to,
+            });
+        }
+    }
+    rows
 }
 
 /// Right-click on a changed file, in the diff or the file tree: its menu.
@@ -4135,6 +4349,21 @@ mod tests {
 
     use super::stack::stack_items;
     use super::*;
+
+    #[test]
+    fn snapshot_lines_wrap_at_spaces_into_rows_of_their_bytes() {
+        let lines = vec!["short".to_string(), "один два три".to_string()];
+        let rows = |cols| -> Vec<(usize, usize, usize)> {
+            snapshot_rows(&lines, cols)
+                .into_iter()
+                .map(|row| (row.line, row.start, row.end))
+                .collect()
+        };
+        assert_eq!(rows(None), [(0, 0, 5), (1, 0, lines[1].len())]);
+        // "один " is 9 bytes; "два три", 7 characters, fits in the rest.
+        assert_eq!(rows(Some(8)), [(0, 0, 5), (1, 0, 9), (1, 9, 22)]);
+        assert_eq!(rows(Some(5)), [(0, 0, 5), (1, 0, 9), (1, 9, 16), (1, 16, 22)]);
+    }
 
     fn diff(changed: &[bool]) -> FileDiff {
         let rows = changed
